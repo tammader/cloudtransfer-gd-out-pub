@@ -115,7 +115,7 @@ PUT_MAX_SECS = 1800       # 单个文件上传总时长上限(慢但有进展的
 class Progress(object):
     def __init__(self, fh, total, label, every=10):
         self.fh, self.total, self.label = fh, total, label
-        self.n, self.t0, self.last, self.every = 0, time.time(), 0.0, every
+        self.n, self.t0, self.last, self.every = 0, time.time(), time.time(), every
         self.last_byte = time.time()
 
     def read(self, n=-1):
@@ -289,10 +289,29 @@ def main():
                             "--stats-one-line"], timeout=1500)
                 if r.returncode != 0 or os.path.getsize(lp) != size:
                     raise RuntimeError("下载失败/大小不符 :: %s" % (r.stderr or "")[:120])
-                secs = alist_put(TY_DIR.rstrip("/") + "/" + name, lp, size, os.path.basename(name)[:26])
-                got = alist_get(TY_DIR.rstrip("/") + "/" + name)
-                if got != size:
-                    raise RuntimeError("上传后校验不过: 目标 %s 期望 %s" % (got, size))
+                # 上传: 189/OpenList 侧会间歇性"零进展"卡死(收完首个包后不再读 body),
+                #   socket 超时 6 分钟兜住。因为它时好时坏 -> 同一文件多试几次;
+                #   每次失败都重下? 不用, 本地文件还在, 直接重传即可。
+                dst = TY_DIR.rstrip("/") + "/" + name
+                secs, last_err = 0.0, ""
+                for att in range(1, 4):
+                    try:
+                        secs = alist_put(dst, lp, size, os.path.basename(name)[:26])
+                        got = alist_get(dst)
+                        if got != size:
+                            raise RuntimeError("上传后校验不过: 目标 %s 期望 %s" % (got, size))
+                        last_err = ""
+                        break
+                    except Exception as e:
+                        last_err = str(e)[:120]
+                        over = (time.time() - t0) / 60 > a.budget_min
+                        if att >= 3 or over:
+                            raise RuntimeError("重试 %d 次仍失败: %s" % (att, last_err))
+                        print("   ↻ 第 %d 次失败(%s) -> %d 秒后重试"
+                              % (att, last_err, 20 * att))
+                        time.sleep(20 * att)
+                if last_err:
+                    raise RuntimeError(last_err)
                 ty_ok = True
                 up_n += 1
                 total_up += size
