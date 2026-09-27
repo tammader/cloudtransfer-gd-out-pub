@@ -1,0 +1,88 @@
+name: gen-manifest
+
+# 天翼编号清单 · 云端生成 (替代/兜底本机 worker 的「导出比对清单」)
+#   产出(都在 onedrive2:dbqd/):
+#     compare_stems.txt  天翼个人/out2 + 天翼家庭/out2 的编号(供 ty-transfer / out-sync 比对)
+#     ty_out.tsv         天翼个人/out2 名字+大小
+#     ty_tg.tsv          天翼个人/TelegramVideos 名字+大小
+#     gen_manifest_report.txt  本轮报告
+#   跑法: runner 现装 OpenList 挂天翼(189CloudTV), 列目录走 alist /api/fs/list,
+#         上传走 rclone(onedrive2)。不依赖本机 alist。
+
+on:
+  # 每 3 小时 (UTC 0/3/.../21 = 北京 8/11/14/17/20/23/次日 2/5)
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      openlist_version:
+        description: "OpenList 版本 tag"
+        required: false
+        default: "v4.2.6"
+
+concurrency:
+  group: gen-manifest
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 装 OpenList(挂天翼)
+        run: |
+          V="${{ inputs.openlist_version || 'v4.2.6' }}"
+          curl -sL "https://github.com/OpenListTeam/OpenList/releases/download/$V/openlist-linux-amd64.tar.gz" -o /tmp/ol.tar.gz
+          mkdir -p /opt/openlist && tar -xzf /tmp/ol.tar.gz -C /opt/openlist
+          chmod +x /opt/openlist/openlist
+          /opt/openlist/openlist version 2>&1 | head -3 || true
+
+      - name: 初始化并启动 OpenList
+        run: |
+          cd /opt/openlist
+          PW="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          echo "ALIST_PW=$PW" >> $GITHUB_ENV
+          ./openlist admin set "$PW" --data /opt/openlist/data 2>&1 | tail -3
+          nohup ./openlist server --data /opt/openlist/data > /opt/openlist/alist.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s -m 3 http://127.0.0.1:5244/api/public/settings >/dev/null && { echo "alist 就绪"; break; }
+            sleep 2
+          done
+
+      - name: 注入天翼存储(天翼个人 + 天翼家庭)
+        env:
+          S_TY: ${{ secrets.ALIST_STORAGES_TY }}
+        run: |
+          printf '%s' "$S_TY" > /tmp/storages.json
+          python3 tools/alist_bootstrap.py --data-dir /opt/openlist/data \
+            --password "$ALIST_PW" --storages-file /tmp/storages.json --emit-env \
+            --verify-mount /天翼个人/out2
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: 生成并上传清单 -> onedrive2:dbqd
+        env:
+          ALIST_URL: "http://127.0.0.1:5244"
+        run: python3 tools/gen_manifest.py
+
+      - name: 出错时贴 alist 日志
+        if: failure()
+        run: tail -60 /opt/openlist/alist.log || true
