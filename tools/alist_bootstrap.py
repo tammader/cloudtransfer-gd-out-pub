@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """在 CI 里给跑起来的 alist/OpenList 灌存储配置, 并取一个管理 token
 
-背景: /dbjm 是本机 alist 上的 Crypt 盘(底层 豆包网盘), GitHub runner 连不到本机,
-      所以改成"在 runner 上装一份 OpenList, 用它挂同样的豆包 + Crypt, 再上传"。
+背景: /归档挂载 是本机 alist 上的 Crypt 盘(底层 上游网盘), GitHub runner 连不到本机,
+      所以改成"在 runner 上装一份 OpenList, 用它挂同样的上游网盘 + Crypt, 再上传"。
       存储定义(含 cookie/密码/salt)从本机 alist 的 x_storages 导出, 通过 Secret 带过去。
 
 用法(在 alist 数据目录初始化之后跑):
@@ -114,7 +114,7 @@ def main():
     ap.add_argument("--emit-env", action="store_true")
     ap.add_argument("--force-db", action="store_true")
     ap.add_argument("--login-only", action="store_true", help="只登录拿 token, 不碰存储")
-    ap.add_argument("--verify-mount", default="/dbjm", help="建完后列一下这个挂载点验证凭证可用")
+    ap.add_argument("--verify-mount", default="", help="验证用的挂载点; 留空=自动取第一个存储的挂载点(不把路径写进命令行/日志)")
     ap.add_argument("--url", default=DEFAULT_URL)
     ap.add_argument("--override", nargs="*", default=[],
                     help="覆盖 addition 字段, 如 upload_thread=8 (可多个)")
@@ -185,12 +185,16 @@ def main():
         except Exception as e:
             print("   !! 列 %s 失败: %s" % (st["mount_path"], str(e)[:150]))
 
-    if a.verify_mount:
-        d = api("POST", "/api/fs/list",
-                {"path": a.verify_mount, "page": 1, "per_page": 0, "refresh": True})
-        got = (d.get("data") or {}).get("content") or []
-        print("[验证] %s -> %d 个条目: %s"
-              % (a.verify_mount, len(got), [x["name"] for x in got[:5]]))
+    # 验证挂载点: 路径不写死(日志会公开), 留空则取第一个存储的挂载点; 只报数量不报条目名
+    vm = a.verify_mount or (storages[0].get("mount_path", "") if storages else "")
+    if vm:
+        try:
+            d = api("POST", "/api/fs/list",
+                    {"path": vm, "page": 1, "per_page": 0, "refresh": True})
+            got = (d.get("data") or {}).get("content") or []
+            print("[验证] 挂载点 -> %d 个条目 (code=%s)" % (len(got), d.get("code")))
+        except Exception as e:
+            print("[验证] 列目录失败: %s" % str(e)[:120])
 
     if a.emit_env and token:
         gh = os.environ.get("GITHUB_ENV")
@@ -205,4 +209,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import logmask          # 日志脱敏: 文件名/路径 -> 短哈希(见 logmask.py)
+    logmask.install()
     sys.exit(main())
