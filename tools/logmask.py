@@ -50,6 +50,9 @@ _MEDIA_EXT = r"(?:mp4|mkv|avi|wmv|mov|flv|m4v|rmvb|ts|mpg|mpeg|webm|3gp|part\d*)
 _RE_MEDIA = re.compile(
     r"[\w\u4e00-\u9fff（(【\[][^\s\"'|,;<>]*?\.%s\b" % _MEDIA_EXT, re.I)
 
+# 1.5) 全角方括号块(常做文件名前缀, 如 【 5d86.shop】) —— 媒体名正则遇到中间的空格就断了, 得单独兜
+_RE_BRACKET = re.compile(r"【[^】\n]{0,60}】")
+
 # 2) rclone 远端:  name:path   例 remote1:out2 / remote2:dir/x.txt
 _RE_REMOTE = re.compile(r"(?<!<)\b[A-Za-z0-9_\-]{2,}:[\w\u4e00-\u9fff][\w\u4e00-\u9fff/.\-]*")
 
@@ -58,8 +61,11 @@ _RE_TOKEN = re.compile(r"\b(?:ya29\.[\w\-]{8,}|1//[\w\-]{10,}"
                        r"|GOCSPX-[\w\-]{6,}"
                        r"|Ew[A-Z][\w\-.]{18,}|0\.A[\w\-.]{18,}|M\.C[\w\-.]{18,})")
 
+# 2.7) 个人身份信息: 手机号 / 邮箱 —— 云盘的账号就是手机号, 绝不能进日志
+_RE_PII = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)|[\w.+\-]+@[\w\-]+\.[\w.\-]+")
+
 # 3) 绝对路径: /a/b/c 与 X:/a/b   (URL 里的 // 和 127.0.0.1:5244/api 由 lookbehind 排除)
-_RE_PATH = re.compile(r"(?<![A-Za-z0-9:/\\])/[^\s\"'|,;)\]}\u3002\uff0c]*")
+_RE_PATH = re.compile(r"(?<![A-Za-z0-9:/\\])/[^\s\"'|,;)\]}\u3002\uff0c]+")
 
 
 def _tag(kind, s):
@@ -80,13 +86,13 @@ def scrub(text):
                 text = text.replace(k, v)
 
         spans = []
-        for pat, kind in ((_RE_MEDIA, "file"), (_RE_REMOTE, "remote"),
-                         (_RE_PATH, "path"), (_RE_TOKEN, "tok")):
+        for pat, kind in ((_RE_MEDIA, "file"), (_RE_BRACKET, "brk"), (_RE_REMOTE, "remote"),
+                         (_RE_PATH, "path"), (_RE_TOKEN, "tok"), (_RE_PII, "pii")):
             for m in pat.finditer(text):
                 spans.append((m.start(), m.end(), m.group(0), kind))
         if not spans:
             return text
-        prio = {"tok": 0, "file": 0, "remote": 1, "path": 2}      # 起点相同时 file 更具体, 优先
+        prio = {"tok": 0, "pii": 0, "file": 0, "brk": 0, "remote": 1, "path": 2}   # 同起点时更具体的优先
         spans.sort(key=lambda x: (x[0], prio[x[3]], -(x[1] - x[0])))
         out, last = [], 0
         for s, e, raw, kind in spans:
