@@ -21,17 +21,17 @@ on:
         required: false
         default: "true"
       max_total_gb:
-        description: "本轮处理文件总量上限(GB), 到了就收工"
+        description: "本轮处理文件总量上限(GB), 到了就收工(放开后基本由时间决定)"
         required: false
-        default: "5"
+        default: "100"
       min_total_gb:
         description: "本轮总量目标下限(GB); 凑不到(文件不够)会在报告里提示"
         required: false
-        default: "4"
+        default: "30"
       max_ops:
         description: "本轮最多处理多少个源文件(个数硬上限)"
         required: false
-        default: "200"
+        default: "1000"
       threshold_mb:
         description: "超过多少 MB 就对半切"
         required: false
@@ -45,9 +45,9 @@ on:
         required: false
         default: "2"
       budget_min:
-        description: "本轮时间预算(分钟), 到点收工下次继续"
+        description: "本轮时间预算(分钟), 到点收工下次继续(350 是 job 上限, 310 留余量优雅收工)"
         required: false
-        default: "170"
+        default: "310"
       only:
         description: "只处理这一个文件名(留空=按顺序批量); 调试用"
         required: false
@@ -103,13 +103,13 @@ jobs:
       - name: 跑 gd-out2
         env:
           APPLY: ${{ inputs.apply || 'true' }}
-          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '5' }}
-          MIN_TOTAL_GB: ${{ inputs.min_total_gb || '4' }}
-          MAX_OPS: ${{ inputs.max_ops || '200' }}
+          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '100' }}
+          MIN_TOTAL_GB: ${{ inputs.min_total_gb || '30' }}
+          MAX_OPS: ${{ inputs.max_ops || '1000' }}
           THRESHOLD_MB: ${{ inputs.threshold_mb || '300' }}
           DISK_BUDGET_GB: ${{ inputs.disk_budget_gb || '0' }}
           RESERVE_GB: ${{ inputs.reserve_gb || '2' }}
-          BUDGET_MIN: ${{ inputs.budget_min || '170' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '310' }}
           ONLY: ${{ inputs.only || '' }}
         run: |
           set -x
