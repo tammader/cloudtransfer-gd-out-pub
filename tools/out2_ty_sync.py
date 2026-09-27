@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
-"""gdrive2:out2 -> 天翼个人/out2 单向同步 + 两处齐全后归档到 gdrive2:out3
+"""源远端:out2 -> 目标网盘/out2 单向同步 + 两处齐全后归档到 源远端:out3
 
 规则:
-  1) 单向同步: 把 gdrive2:out2 里的文件传到 天翼个人/out2 (同名同大小则跳过, 源文件不动)
-  2) 完成判定: 同一个文件在 **天翼个人/out2** 和 **/dbjm** 都齐了, 就把 gdrive2:out2 里的它
-     `moveto` 到 **gdrive2:out3** (同盘服务端移动, 秒完成) —— 等于"这条文件走完了全流程"
+  1) 单向同步: 把 源远端:out2 里的文件传到 目标网盘/out2 (同名同大小则跳过, 源文件不动)
+  2) 完成判定: 同一个文件在 **目标网盘/out2** 和 **/归档挂载** 都齐了, 就把 源远端:out2 里的它
+     `moveto` 到 **源远端:out3** (同盘服务端移动, 秒完成) —— 等于"这条文件走完了全流程"
   3) dbjm 里是 gd-out2 切过的分片, 所以判定要分两种:
        <= 阈值(默认300MB): dbjm 里有同名同大小
        >  阈值          : dbjm 里有 <名字去扩展>.part001.<ext> 和 .part002.<ext> 两片
      (若 dbjm 里直接有同名同大小, 也算齐 —— 兼容老数据)
 
-跑法: runner 上现装 OpenList 挂「天翼个人」, 上传走 /api/fs/put; gdrive2 走 rclone。
-默认演练(--dry); --apply 才真动。报告 onedrive2:dbqd/out2_ty_report.txt
+跑法: runner 上现装 OpenList 挂「目标网盘」, 上传走 /api/fs/put; 源远端 走 rclone。
+默认演练(--dry); --apply 才真动。报告 中转远端:报告区/out2_ty_report.txt
 """
 import argparse
 import glob
@@ -28,13 +28,14 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-SRC = os.environ.get("OT_SRC", "gdrive2:out2")
-TY_DIR = os.environ.get("OT_TY", "/天翼个人/out2")
-DBJM_DIR = os.environ.get("OT_DBJM", "/dbjm")
-ARCH = os.environ.get("OT_ARCH", "gdrive2:out3")
+import pathcfg          # 路径真值来自配置: CI=Secret PATHS_JSON, 本机=paths.local.json
+SRC = pathcfg.require("OT_SRC")
+TY_DIR = pathcfg.require("OT_TY")
+DBJM_DIR = pathcfg.require("OT_DBJM")
+ARCH = pathcfg.require("OT_ARCH")
 ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
 WORK = os.environ.get("OT_WORK", "/tmp/out2ty")
-REPORT = os.environ.get("OT_REPORT", "onedrive2:dbqd/out2_ty_report.txt")
+REPORT = pathcfg.require("OT_REPORT")
 GB = 1024 ** 3
 RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
 OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -177,20 +178,20 @@ def main():
     t0 = time.time()
     os.makedirs(WORK, exist_ok=True)
 
-    lines = ["# gdrive2:out2 -> 天翼个人/out2 同步 + 归档 gdrive2:out3 报告  %s  [%s]"
+    lines = ["# 源远端:out2 -> 目标网盘/out2 同步 + 归档 源远端:out3 报告  %s  [%s]"
              % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练")]
 
-    # 刷 gdrive2 token
+    # 刷 源远端 token
     try:
         import gd_token
-        log("刷 gdrive2 token: %s" % ("OK" if gd_token.main() == 0 else "失败"))
+        log("刷 源远端 token: %s" % ("OK" if gd_token.main() == 0 else "失败"))
     except Exception as e:
         log("!! gd_token 异常: %s" % str(e)[:120])
 
     src = lsjson(SRC)
     ty = alist_list(TY_DIR)
     db = alist_list(DBJM_DIR)
-    log("源 %s: %d 个文件 | 天翼 %s: %d | dbjm: %d" % (SRC, len(src), TY_DIR, len(ty), len(db)))
+    log("源 %s: %d 个文件 | 云盘 %s: %d | dbjm: %d" % (SRC, len(src), TY_DIR, len(ty), len(db)))
     lines.append("源 %s %d 个 | %s %d 个 | %s %d 个" % (SRC, len(src), TY_DIR, len(ty), DBJM_DIR, len(db)))
 
     if a.apply:
@@ -220,13 +221,13 @@ def main():
             break
         head = "[%s] %s" % (human(size), name)
 
-        # --- 1) 天翼侧 ---
+        # --- 1) 云盘侧 ---
         ty_hit = ty.get(name)
         ty_ok = bool(ty_hit and not ty_hit[1] and ty_hit[0] == size)
         note = ""
         if ty_ok:
             skip_n += 1
-            note = "天翼已有(同名同大小)"
+            note = "云盘已有(同名同大小)"
         elif not a.apply:
             note = "(演练) 将上传到 %s" % TY_DIR
             ty_ok = True                      # 演练: 假装成功, 好把后面归档逻辑也演出来
@@ -249,7 +250,7 @@ def main():
                 up_n += 1
                 total_up += size
                 ty[name] = (size, False)
-                note = "上传天翼 OK (%.1f MB/s)" % (size / max(secs, 1e-6) / 1048576)
+                note = "上传云盘 OK (%.1f MB/s)" % (size / max(secs, 1e-6) / 1048576)
             except Exception as e:
                 fail_n += 1
                 note = "上传失败(%.1fmin): %s" % ((time.time() - ft0) / 60, str(e)[:120])
@@ -272,18 +273,18 @@ def main():
                                 "--retries", "3", "--low-level-retries", "10"])
                     if r.returncode == 0:
                         arch_n += 1
-                        arch_note = "| 天翼+dbjm 都有 -> 已归档到 %s" % ARCH
+                        arch_note = "| 云盘+dbjm 都有 -> 已归档到 %s" % ARCH
                     else:
                         arch_note = "| !! 归档失败: %s" % (r.stderr or "")[:90]
                 else:
-                    arch_note = "| (演练) 天翼+dbjm 都有 -> 将归档到 %s" % ARCH
+                    arch_note = "| (演练) 云盘+dbjm 都有 -> 将归档到 %s" % ARCH
             else:
                 arch_note = "| dbjm 还没有(等 od2-dbjm)"
         print("%s %s %s" % (head, note, arch_note))
         lines.append("%s | %s %s" % (head, note, arch_note))
 
     lines.append("---")
-    lines.append("本轮: 上传天翼 %d 个 (%s) | 归档 out3 %d 个 | 天翼已有 %d 个 | 失败 %d"
+    lines.append("本轮: 上传云盘 %d 个 (%s) | 归档 out3 %d 个 | 云盘已有 %d 个 | 失败 %d"
                  % (up_n, human(total_up), arch_n, skip_n, fail_n))
     lines.append("源目录剩余 %d 个" % max(len(src) - arch_n, 0))
     print("\n合计: 上传 %d (%s) | 归档 %d | 已在 %d | 失败 %d"
@@ -305,4 +306,6 @@ def finish(lines, a):
 
 
 if __name__ == "__main__":
+    import logmask          # 日志脱敏: 文件名/路径 -> 短哈希(见 logmask.py)
+    logmask.install()
     sys.exit(main())
