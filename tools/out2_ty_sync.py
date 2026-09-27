@@ -108,22 +108,35 @@ def lsjson(remote, timeout=1800):
     return {x["Name"]: int(x.get("Size") or 0) for x in json.loads(r.stdout or "[]")}
 
 
+STALL_SECS = 300          # 连续多久没有任何字节推进 -> 判定停滞, 主动断开(原来只能等 socket 超时 3600s)
+PUT_MAX_SECS = 1800       # 单个文件上传总时长上限(慢但有进展的也不许无限拖)
+
+
 class Progress(object):
     def __init__(self, fh, total, label, every=10):
         self.fh, self.total, self.label = fh, total, label
         self.n, self.t0, self.last, self.every = 0, time.time(), 0.0, every
+        self.last_byte = time.time()
 
     def read(self, n=-1):
         b = self.fh.read(n)
+        now = time.time()
         if b:
             self.n += len(b)
-            now = time.time()
+            self.last_byte = now
             if now - self.last >= self.every:
                 self.last = now
                 sys.stdout.write("\r    ⬆ %s %5.1f%%  %s/%s  %.1f MB/s   "
                                  % (self.label, 100.0 * self.n / max(self.total, 1), human(self.n),
                                     human(self.total), self.n / max(now - self.t0, 1e-6) / 1048576))
                 sys.stdout.flush()
+        # 停滞/超时硬闸(raise 会让 http 层直接中断本次 PUT, 不用等 socket 超时)
+        if self.n < self.total and now - self.last_byte > STALL_SECS:
+            raise RuntimeError("上传停滞 %.0f 分钟无进展(已传 %s / %s)"
+                               % ((now - self.last_byte) / 60, human(self.n), human(self.total)))
+        if now - self.t0 > PUT_MAX_SECS:
+            raise RuntimeError("上传超过 %.0f 分钟上限(已传 %s / %s)"
+                               % (PUT_MAX_SECS / 60.0, human(self.n), human(self.total)))
         return b
 
     @property
@@ -139,7 +152,8 @@ def alist_put(dst_path, local_file, size, label):
                                               "File-Path": urllib.parse.quote(dst_path),
                                               "Content-Type": "application/octet-stream",
                                               "Content-Length": str(size)})
-        d = json.loads(OP.open(req, timeout=3600).read().decode("utf-8", "replace"))
+        # socket 超时压到 STALL_SECS: 服务器收包卡住时 5 分钟就断开, 不再干等 1 小时
+        d = json.loads(OP.open(req, timeout=STALL_SECS + 60).read().decode("utf-8", "replace"))
     sys.stdout.write("\n")
     if d.get("code") != 200:
         raise RuntimeError("上传失败: %s %s" % (d.get("code"), d.get("message")))
@@ -229,6 +243,19 @@ def main():
     up_n = arch_n = skip_n = fail_n = 0
     total_up = 0
     lines.append("---")
+
+    def checkpoint():
+        """增量落盘(报告 + 日账本): 运行被取消/超时/强杀也不丢已完成的账"""
+        if not a.apply:
+            return
+        snap = list(lines)
+        snap.append("---")
+        snap.append("(进行中) 上传 %d 个 (%s) | 归档 %d | 已有 %d | 失败 %d | 已用 %.1f 分钟"
+                    % (up_n, human(total_up), arch_n, skip_n, fail_n, (time.time() - t0) / 60))
+        finish(snap, a, quiet=True)
+        if total_up > 0:
+            save_daily(today, d_gb + total_up / GB)
+
     for name, size in todo:
         if up_n + arch_n + fail_n >= a.max_ops:
             lines.append("达本轮个数上限 %d, 收工" % a.max_ops)
@@ -302,6 +329,7 @@ def main():
                 arch_note = "| dbjm 还没有(等 od2-dbjm)"
         print("%s %s %s" % (head, note, arch_note))
         lines.append("%s | %s %s" % (head, note, arch_note))
+        checkpoint()
 
     lines.append("---")
     lines.append("本轮: 上传云盘 %d 个 (%s) | 归档 out3 %d 个 | 云盘已有 %d 个 | 失败 %d"
@@ -341,7 +369,7 @@ def save_daily(date, gb):
         log("!! 日配额账本写入失败: %s" % str(e)[:80])
 
 
-def finish(lines, a):
+def finish(lines, a, quiet=False):
     text = "\n".join(lines) + "\n"
     rp = os.path.join(WORK, "out2_ty_report.txt")
     try:
