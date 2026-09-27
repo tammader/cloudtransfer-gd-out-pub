@@ -72,12 +72,24 @@ def alist(method, path, payload, timeout=180):
     return d.get("data")
 
 
-def alist_list(path):
-    d = alist("POST", "/api/fs/list", {"path": path, "page": 1, "per_page": 0, "refresh": True})
-    out = {}
-    for x in (d or {}).get("content") or []:
-        out[x["name"]] = (int(x.get("size") or 0), bool(x.get("is_dir")))
-    return out
+def alist_list(path, tries=3):
+    """列目录。跨境链路抖动时 alist 会回 500 (`failed get dir: object not found`) ——
+    那不是目录真没了, 而是上游 189 listFiles 超时后的兜底报错, 所以这里先重试几次。
+    重试仍失败就抛给上层: 上层会判定"本轮跳过", 不会把整轮打成 failure。"""
+    last = None
+    for i in range(tries):
+        try:
+            d = alist("POST", "/api/fs/list", {"path": path, "page": 1, "per_page": 0, "refresh": True})
+            out = {}
+            for x in (d or {}).get("content") or []:
+                out[x["name"]] = (int(x.get("size") or 0), bool(x.get("is_dir")))
+            return out
+        except Exception as e:
+            last = e
+            log("!! 列目录失败(第 %d/%d 次): %s" % (i + 1, tries, str(e)[:160]))
+            if i + 1 < tries:
+                time.sleep(15 * (i + 1))
+    raise last
 
 
 def alist_get(path):
@@ -367,9 +379,19 @@ def main():
     except Exception as e:
         log("!! gd_token 异常: %s" % str(e)[:120])
 
-    src = lsjson(SRC)
-    ty = alist_list(TY_DIR)
-    db = alist_list(DBJM_DIR)
+    # 列目录(源 / 目标网盘 / 归档区)。跨境链路抖动是常态(189 listFiles 超时 -> alist 回 500),
+    # 列不动就本轮优雅跳过: 不处理任何文件、不动任何源文件, 正常退出, 交给下一轮自动重试。
+    try:
+        src = lsjson(SRC)
+        ty = alist_list(TY_DIR)
+        db = alist_list(DBJM_DIR)
+    except Exception as e:
+        lines.append("[跳过] 列目录失败(链路抖动?): %s" % str(e)[:200])
+        lines.append("本轮不处理任何文件、不动任何源文件, 等下一轮自动重试。")
+        print(lines[-2], flush=True)
+        print(lines[-1], flush=True)
+        finish(lines, a)
+        return 0
     log("源 %s: %d 个文件 | 云盘 %s: %d | dbjm: %d" % (SRC, len(src), TY_DIR, len(ty), len(db)))
     lines.append("源 %s %d 个 | %s %d 个 | %s %d 个" % (SRC, len(src), TY_DIR, len(ty), DBJM_DIR, len(db)))
 
