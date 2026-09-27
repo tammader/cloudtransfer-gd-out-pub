@@ -179,6 +179,12 @@ def main():
     thresh = a.thresh_mb * 1024 ** 2
     max_total = int(a.max_total_gb * GB)
 
+    t0 = time.time()
+    os.makedirs(WORK, exist_ok=True)
+
+    lines = ["# 源远端:out2 -> 目标网盘/out2 同步 + 归档 源远端:out3 报告  %s  [%s]"
+             % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练")]
+
     # --- 云盘日配额保护: 该网盘按北京自然日重置, 这里累计封顶, 免得撞日配额 ---
     today = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
     d_date, d_gb = load_daily()
@@ -194,11 +200,6 @@ def main():
     max_total = int(eff_gb * GB)
     lines.append("日配额: 今日已用 %.1fGB / 上限 %.1fGB -> 本轮最多再传 %.1fGB"
                  % (d_gb, a.daily_limit_gb, eff_gb))
-    t0 = time.time()
-    os.makedirs(WORK, exist_ok=True)
-
-    lines = ["# 源远端:out2 -> 目标网盘/out2 同步 + 归档 源远端:out3 报告  %s  [%s]"
-             % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练")]
 
     # 刷 源远端 token
     try:
