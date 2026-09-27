@@ -7,7 +7,7 @@ name: out2-ty-sync
 #   跑法: runner 上现装 OpenList, 注入「目标网盘」+「上游网盘/Crypt(/归档挂载)」两个挂载,
 #         源远端 与报告走 rclone。
 #   ⚠️ 上传卡死的真因(2026-09-27 读 OpenList 源码 + alist 日志后更正):
-#       * `upload_thread` 在 189CloudTV 驱动里**只被解析、从未被使用**(死配置) -> 调它没有任何作用。
+#       * `upload_thread` 在该驱动里**只被解析、从未被使用**(死配置) -> 调它没有任何作用。
 #       * 该驱动的上传 = createUploadFile -> 单流 PUT(带 ResumePolicy:1 续传) -> getUploadFileStatus 循环 -> commit,
 #         **服务端自己合成, 不需要我们拆包/合并**。
 #       * 真正的问题: 驱动那个 PUT 走 base.HttpClient **没有超时**, 189 侧一挂就是好几分钟且不报错,
@@ -46,7 +46,7 @@ on:
         required: false
         default: "170"
       upload_thread:
-        description: "云盘上传线程数; 该驱动(189CloudTV)里是死配置, 调了没用, 留着仅为兼容"
+        description: "云盘上传线程数; 该驱动里是死配置, 调了没用, 留着仅为兼容"
         required: false
         default: "3"
       only:
@@ -147,6 +147,7 @@ jobs:
           BUDGET_MIN: ${{ inputs.budget_min || '170' }}
           ONLY: ${{ inputs.only || '' }}
           ALIST_URL: "http://127.0.0.1:5244"
+          ALIST_STORAGES_TY: ${{ secrets.ALIST_STORAGES_TY }}
         run: |
           set -x
           ARGS="--max-ops $MAX_OPS --max-total-gb $MAX_TOTAL_GB --daily-limit-gb $DAILY_LIMIT_GB --thresh-mb $THRESH_MB --budget-min $BUDGET_MIN"
