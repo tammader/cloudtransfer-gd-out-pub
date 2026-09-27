@@ -1,0 +1,308 @@
+# -*- coding: utf-8 -*-
+"""gdrive2:out2 -> 天翼个人/out2 单向同步 + 两处齐全后归档到 gdrive2:out3
+
+规则:
+  1) 单向同步: 把 gdrive2:out2 里的文件传到 天翼个人/out2 (同名同大小则跳过, 源文件不动)
+  2) 完成判定: 同一个文件在 **天翼个人/out2** 和 **/dbjm** 都齐了, 就把 gdrive2:out2 里的它
+     `moveto` 到 **gdrive2:out3** (同盘服务端移动, 秒完成) —— 等于"这条文件走完了全流程"
+  3) dbjm 里是 gd-out2 切过的分片, 所以判定要分两种:
+       <= 阈值(默认300MB): dbjm 里有同名同大小
+       >  阈值          : dbjm 里有 <名字去扩展>.part001.<ext> 和 .part002.<ext> 两片
+     (若 dbjm 里直接有同名同大小, 也算齐 —— 兼容老数据)
+
+跑法: runner 上现装 OpenList 挂「天翼个人」, 上传走 /api/fs/put; gdrive2 走 rclone。
+默认演练(--dry); --apply 才真动。报告 onedrive2:dbqd/out2_ty_report.txt
+"""
+import argparse
+import glob
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+SRC = os.environ.get("OT_SRC", "gdrive2:out2")
+TY_DIR = os.environ.get("OT_TY", "/天翼个人/out2")
+DBJM_DIR = os.environ.get("OT_DBJM", "/dbjm")
+ARCH = os.environ.get("OT_ARCH", "gdrive2:out3")
+ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
+WORK = os.environ.get("OT_WORK", "/tmp/out2ty")
+REPORT = os.environ.get("OT_REPORT", "onedrive2:dbqd/out2_ty_report.txt")
+GB = 1024 ** 3
+RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
+OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def log(msg):
+    print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+def human(b):
+    return "%.1f MB" % (b / 1048576) if b < GB else "%.2f GB" % (b / GB)
+
+
+def alist_token():
+    t = os.environ.get("ALIST_TOKEN", "").strip()
+    if not t:
+        raise SystemExit("!! 需要 ALIST_TOKEN")
+    return t
+
+
+def alist(method, path, payload, timeout=180):
+    req = urllib.request.Request(ALIST + path, data=json.dumps(payload).encode(), method=method,
+                                 headers={"Authorization": alist_token(),
+                                          "Content-Type": "application/json"})
+    d = json.loads(OP.open(req, timeout=timeout).read().decode("utf-8", "replace"))
+    if d.get("code") != 200:
+        raise RuntimeError("alist %s -> %s %s" % (path, d.get("code"), d.get("message")))
+    return d.get("data")
+
+
+def alist_list(path):
+    d = alist("POST", "/api/fs/list", {"path": path, "page": 1, "per_page": 0, "refresh": True})
+    out = {}
+    for x in (d or {}).get("content") or []:
+        out[x["name"]] = (int(x.get("size") or 0), bool(x.get("is_dir")))
+    return out
+
+
+def alist_get(path):
+    try:
+        d = alist("POST", "/api/fs/get", {"path": path})
+    except Exception:
+        return None
+    return int((d or {}).get("size") or 0)
+
+
+def rclone(args, timeout=1500):
+    env = dict(os.environ)
+    return subprocess.run([RCLONE] + args + ["--config", CONF], capture_output=True,
+                          text=True, errors="replace", timeout=timeout, env=env)
+
+
+def _find_conf():
+    for c in (os.environ.get("RCLONE_CONF_PATH", ""),
+              os.path.expanduser("~/.config/rclone/rclone.conf"),
+              os.path.join(os.environ.get("APPDATA", ""), "rclone", "rclone.conf")):
+        if c and os.path.exists(c):
+            return c
+    return os.path.expanduser("~/.config/rclone/rclone.conf")
+
+
+CONF = _find_conf()
+
+
+def lsjson(remote, timeout=1800):
+    r = rclone(["lsjson", remote, "--files-only"], timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError("列 %s 失败: %s" % (remote, (r.stderr or "")[:160]))
+    return {x["Name"]: int(x.get("Size") or 0) for x in json.loads(r.stdout or "[]")}
+
+
+class Progress(object):
+    def __init__(self, fh, total, label, every=10):
+        self.fh, self.total, self.label = fh, total, label
+        self.n, self.t0, self.last, self.every = 0, time.time(), 0.0, every
+
+    def read(self, n=-1):
+        b = self.fh.read(n)
+        if b:
+            self.n += len(b)
+            now = time.time()
+            if now - self.last >= self.every:
+                self.last = now
+                sys.stdout.write("\r    ⬆ %s %5.1f%%  %s/%s  %.1f MB/s   "
+                                 % (self.label, 100.0 * self.n / max(self.total, 1), human(self.n),
+                                    human(self.total), self.n / max(now - self.t0, 1e-6) / 1048576))
+                sys.stdout.flush()
+        return b
+
+    @property
+    def secs(self):
+        return time.time() - self.t0
+
+
+def alist_put(dst_path, local_file, size, label):
+    with open(local_file, "rb") as fh:
+        body = Progress(fh, size, label)
+        req = urllib.request.Request(ALIST + "/api/fs/put", data=body, method="PUT",
+                                     headers={"Authorization": alist_token(),
+                                              "File-Path": urllib.parse.quote(dst_path),
+                                              "Content-Type": "application/octet-stream",
+                                              "Content-Length": str(size)})
+        d = json.loads(OP.open(req, timeout=3600).read().decode("utf-8", "replace"))
+    sys.stdout.write("\n")
+    if d.get("code") != 200:
+        raise RuntimeError("上传失败: %s %s" % (d.get("code"), d.get("message")))
+    return body.secs
+
+
+def split_parts(name, thresh):
+    """>阈值时 gd-out2 切出来的两个分片名"""
+    stem, ext = os.path.splitext(name)
+    return stem + ".part001" + ext, stem + ".part002" + ext
+
+
+def dbjm_done(name, size, dbjm, thresh):
+    """dbjm 里算不算齐了"""
+    hit = dbjm.get(name)
+    if hit and not hit[1] and hit[0] == size:
+        return True
+    if size > thresh:
+        a, b = split_parts(name, thresh)
+        x, y = dbjm.get(a), dbjm.get(b)
+        return bool(x and y and not x[1] and not y[1])
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--max-ops", type=int, default=60, help="本轮最多处理几个文件")
+    ap.add_argument("--max-total-gb", type=float, default=6.0, help="本轮上传总量上限(GB)")
+    ap.add_argument("--thresh-mb", type=int, default=300, help="gd-out2 的切分阈值(判定分片用)")
+    ap.add_argument("--budget-min", type=int, default=170)
+    ap.add_argument("--only", default="")
+    ap.add_argument("--keep-local", action="store_true")
+    a = ap.parse_args()
+    thresh = a.thresh_mb * 1024 ** 2
+    max_total = int(a.max_total_gb * GB)
+    t0 = time.time()
+    os.makedirs(WORK, exist_ok=True)
+
+    lines = ["# gdrive2:out2 -> 天翼个人/out2 同步 + 归档 gdrive2:out3 报告  %s  [%s]"
+             % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练")]
+
+    # 刷 gdrive2 token
+    try:
+        import gd_token
+        log("刷 gdrive2 token: %s" % ("OK" if gd_token.main() == 0 else "失败"))
+    except Exception as e:
+        log("!! gd_token 异常: %s" % str(e)[:120])
+
+    src = lsjson(SRC)
+    ty = alist_list(TY_DIR)
+    db = alist_list(DBJM_DIR)
+    log("源 %s: %d 个文件 | 天翼 %s: %d | dbjm: %d" % (SRC, len(src), TY_DIR, len(ty), len(db)))
+    lines.append("源 %s %d 个 | %s %d 个 | %s %d 个" % (SRC, len(src), TY_DIR, len(ty), DBJM_DIR, len(db)))
+
+    if a.apply:
+        r = rclone(["mkdir", ARCH])
+        log("确保 %s 存在: %s" % (ARCH, "OK" if r.returncode == 0 else (r.stderr or "")[:80]))
+
+    todo = sorted(src.items(), key=lambda kv: kv[1])
+    if a.only:
+        todo = [(n, s) for n, s in todo if n == a.only]
+        if not todo:
+            lines.append("源里没有 %s" % a.only)
+            finish(lines, a)
+            return 1
+
+    up_n = arch_n = skip_n = fail_n = 0
+    total_up = 0
+    lines.append("---")
+    for name, size in todo:
+        if up_n + arch_n + fail_n >= a.max_ops:
+            lines.append("达本轮个数上限 %d, 收工" % a.max_ops)
+            break
+        if total_up >= max_total:
+            lines.append("达本轮总量上限 %.1f GB, 收工" % a.max_total_gb)
+            break
+        if time.time() - t0 > a.budget_min * 60:
+            lines.append("到时间预算, 收工")
+            break
+        head = "[%s] %s" % (human(size), name)
+
+        # --- 1) 天翼侧 ---
+        ty_hit = ty.get(name)
+        ty_ok = bool(ty_hit and not ty_hit[1] and ty_hit[0] == size)
+        note = ""
+        if ty_ok:
+            skip_n += 1
+            note = "天翼已有(同名同大小)"
+        elif not a.apply:
+            note = "(演练) 将上传到 %s" % TY_DIR
+            ty_ok = True                      # 演练: 假装成功, 好把后面归档逻辑也演出来
+        else:
+            lp = os.path.join(WORK, name)
+            try:
+                ft0 = time.time()
+                r = rclone(["copyto", "%s/%s" % (SRC, name), lp, "--retries", "3",
+                            "--low-level-retries", "10", "--transfers", "1",
+                            "--multi-thread-streams", "1", "--timeout", "5m",
+                            "--contimeout", "1m", "--stats", "15s",
+                            "--stats-one-line"], timeout=1500)
+                if r.returncode != 0 or os.path.getsize(lp) != size:
+                    raise RuntimeError("下载失败/大小不符 :: %s" % (r.stderr or "")[:120])
+                secs = alist_put(TY_DIR.rstrip("/") + "/" + name, lp, size, os.path.basename(name)[:26])
+                got = alist_get(TY_DIR.rstrip("/") + "/" + name)
+                if got != size:
+                    raise RuntimeError("上传后校验不过: 目标 %s 期望 %s" % (got, size))
+                ty_ok = True
+                up_n += 1
+                total_up += size
+                ty[name] = (size, False)
+                note = "上传天翼 OK (%.1f MB/s)" % (size / max(secs, 1e-6) / 1048576)
+            except Exception as e:
+                fail_n += 1
+                note = "上传失败(%.1fmin): %s" % ((time.time() - ft0) / 60, str(e)[:120])
+                lines.append("%s | ❌ %s" % (head, note))
+                print("%s ❌ %s" % (head, note))
+            finally:
+                if not a.keep_local and os.path.exists(lp):
+                    try:
+                        os.remove(lp)
+                    except OSError:
+                        pass
+
+        # --- 2) 完成判定 -> 归档 out3 ---
+        arch_note = ""
+        if ty_ok:
+            db_ok = dbjm_done(name, size, db, thresh)
+            if db_ok:
+                if a.apply:
+                    r = rclone(["moveto", "%s/%s" % (SRC, name), "%s/%s" % (ARCH, name),
+                                "--retries", "3", "--low-level-retries", "10"])
+                    if r.returncode == 0:
+                        arch_n += 1
+                        arch_note = "| 天翼+dbjm 都有 -> 已归档到 %s" % ARCH
+                    else:
+                        arch_note = "| !! 归档失败: %s" % (r.stderr or "")[:90]
+                else:
+                    arch_note = "| (演练) 天翼+dbjm 都有 -> 将归档到 %s" % ARCH
+            else:
+                arch_note = "| dbjm 还没有(等 od2-dbjm)"
+        print("%s %s %s" % (head, note, arch_note))
+        lines.append("%s | %s %s" % (head, note, arch_note))
+
+    lines.append("---")
+    lines.append("本轮: 上传天翼 %d 个 (%s) | 归档 out3 %d 个 | 天翼已有 %d 个 | 失败 %d"
+                 % (up_n, human(total_up), arch_n, skip_n, fail_n))
+    lines.append("源目录剩余 %d 个" % max(len(src) - arch_n, 0))
+    print("\n合计: 上传 %d (%s) | 归档 %d | 已在 %d | 失败 %d"
+          % (up_n, human(total_up), arch_n, skip_n, fail_n))
+    finish(lines, a)
+    return 0
+
+
+def finish(lines, a):
+    text = "\n".join(lines) + "\n"
+    rp = os.path.join(WORK, "out2_ty_report.txt")
+    try:
+        with io.open(rp, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        log("!! 报告落盘失败: %s" % str(e)[:80])
+    r = rclone(["copyto", rp, REPORT, "--retries", "2"], timeout=600)
+    log("报告 -> %s: %s" % (REPORT, "OK" if r.returncode == 0 else (r.stderr or "")[:80]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
