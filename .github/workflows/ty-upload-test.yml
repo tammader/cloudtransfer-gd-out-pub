@@ -1,15 +1,15 @@
 name: ty-upload-test
 
-# 一次性验证/测速: OneDrive2/out2 -> 天翼个人/out2
-#   天翼(189) 只挂在本机 alist 上, runner 直连不到 -> 在 runner 上现装一份 OpenList,
-#   用 Secret ALIST_STORAGES_TY 注入「天翼个人」存储, 再通过它上传。
+# 一次性验证/测速: 中转远端/out2 -> 目标网盘/out2
+#   云盘(189) 只挂在本机 alist 上, runner 直连不到 -> 在 runner 上现装一份 OpenList,
+#   用 Secret ALIST_STORAGES_TY 注入「目标网盘」存储, 再通过它上传。
 #   默认测完把测试文件从 out2 删掉(进回收站), 不污染目标目录; 要留就传 keep=true。
 
 on:
   workflow_dispatch:
     inputs:
       file:
-        description: "指定 onedrive2:out2 里的文件名(留空=自动挑最大的小文件)"
+        description: "指定 中转远端:out2 里的文件名(留空=自动挑最大的小文件)"
         required: false
         default: ""
       max_mb:
@@ -21,7 +21,7 @@ on:
         required: false
         default: "false"
       upload_thread:
-        description: "天翼上传线程数(留空=用存储里的设置; 试速度可填 8)"
+        description: "云盘上传线程数(留空=用存储里的设置; 试速度可填 8)"
         required: false
         default: ""
       openlist_version:
@@ -35,6 +35,10 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
 
 jobs:
   test:
@@ -51,7 +55,7 @@ jobs:
           cp /tmp/rclone-*/rclone /usr/local/bin/
           rclone version | head -1
 
-      - name: 装 OpenList(为了挂天翼个人)
+      - name: 装 OpenList(为了挂目标网盘)
         run: |
           V="${{ inputs.openlist_version || 'v4.2.6' }}"
           curl -sL "https://github.com/OpenListTeam/OpenList/releases/download/$V/openlist-linux-amd64.tar.gz" -o /tmp/ol.tar.gz
@@ -71,7 +75,7 @@ jobs:
             sleep 2
           done
 
-      - name: 注入天翼个人存储
+      - name: 注入目标网盘存储
         env:
           ALIST_STORAGES: ${{ secrets.ALIST_STORAGES_TY }}
           UPLOAD_THREAD: ${{ inputs.upload_thread || '' }}
@@ -81,8 +85,7 @@ jobs:
           OVER=""
           if [ -n "$UPLOAD_THREAD" ]; then OVER="--override upload_thread=$UPLOAD_THREAD"; fi
           python3 tools/alist_bootstrap.py --data-dir /opt/openlist/data \
-            --password "$ALIST_PW" --storages-file /tmp/storages_ty.json --emit-env \
-            --verify-mount /天翼个人/out2 $OVER
+            --password "$ALIST_PW" --storages-file /tmp/storages_ty.json --emit-env $OVER
 
       - name: 写 rclone 配置
         env:
