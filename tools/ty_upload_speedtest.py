@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""测速: OneDrive2/out2 -> 天翼个人/out2
+"""测速: 中转远端/out2 -> 目标网盘/out2
 
-流程(在 runner 上跑, 用 runner 本地那台 OpenList 的天翼个人挂载做上传):
-  1) rclone 从 onedrive2:out2 下载一个文件到本地, 计时
-  2) 通过本地 alist 的 PUT /api/fs/put 上传到 /天翼个人/out2, 计时
+流程(在 runner 上跑, 用 runner 本地那台 OpenList 的目标网盘挂载做上传):
+  1) rclone 从 中转远端:out2 下载一个文件到本地, 计时
+  2) 通过本地 alist 的 PUT /api/fs/put 上传到 /目标网盘/out2, 计时
   3) 校验目标大小 == 本地大小
   4) 默认把测试文件从目标删掉(进回收站), 不污染 out2
 
@@ -24,8 +24,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-SRC = os.environ.get("TY_SRC", "onedrive2:out2")
-DST = os.environ.get("TY_DST", "/天翼个人/out2")
+import pathcfg          # 路径真值来自配置: CI=Secret PATHS_JSON, 本机=paths.local.json
+SRC = pathcfg.require("TY_SRC")
+DST = pathcfg.require("TY_DST")
 ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
 TMP = os.environ.get("TY_TMP", "/tmp/tytest")
 RCLONE = os.environ.get("RCLONE_BIN") or (shutil.which("rclone") or "rclone")
@@ -179,12 +180,14 @@ def main():
 
     print("\n===== 测速结果 =====")
     print("文件大小        : %s" % human(size))
-    print("下载(OneDrive2) : %.1f MB/s  (%.1fs)" % (dl_sp, dl_s))
-    print("上传(天翼个人)  : %.1f MB/s  (%.1fs)" % (up_sp, up_s))
+    print("下载(中转远端) : %.1f MB/s  (%.1fs)" % (dl_sp, dl_s))
+    print("上传(目标网盘)  : %.1f MB/s  (%.1fs)" % (up_sp, up_s))
     print("端到端          : %.1f MB/s  (%.1fs)" % (size / max(dl_s + up_s, 1e-6) / 1048576, dl_s + up_s))
     print("校验/清理       : %s / %s" % ("OK" if ok else "失败", cleaned or "n/a"))
     return 0 if ok else 1
 
 
 if __name__ == "__main__":
+    import logmask          # 日志脱敏: 文件名/路径 -> 短哈希(见 logmask.py)
+    logmask.install()
     sys.exit(main())
