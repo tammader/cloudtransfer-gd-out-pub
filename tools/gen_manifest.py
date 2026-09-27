@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""天翼编号清单导出 -> OneDrive2/dbqd  (云端版, GitHub Actions 上运行)
+"""目标网盘编号清单导出 -> 中转远端/报告区  (云端版, GitHub Actions 上运行)
 
 复刻本机 export_compare.py 的产出, 让云端流水线不再依赖本机:
-  1) /天翼个人/out2 + /天翼家庭/out2 的编号      -> onedrive2:dbqd/compare_stems.txt
-  2) /天翼个人/out2 名字+大小                    -> onedrive2:dbqd/ty_out.tsv
-  3) /天翼个人/TelegramVideos 名字+大小          -> onedrive2:dbqd/ty_tg.tsv
-  4) 本轮结果                                    -> onedrive2:dbqd/gen_manifest_report.txt
+  1) /目标网盘/out2 + /副网盘/out2 的编号      -> 中转远端:报告区/compare_stems.txt
+  2) /目标网盘/out2 名字+大小                    -> 中转远端:报告区/ty_out.tsv
+  3) /目标网盘/TG目录 名字+大小          -> 中转远端:报告区/ty_tg.tsv
+  4) 本轮结果                                    -> 中转远端:报告区/gen_manifest_report.txt
 
-跑法: runner 上现装 OpenList 挂天翼, 列目录走 alist /api/fs/list, 上传走 rclone(onedrive2)。
+跑法: runner 上现装 OpenList 挂云盘, 列目录走 alist /api/fs/list, 上传走 rclone(中转远端)。
 环境: ALIST_URL(http://127.0.0.1:5244), ALIST_TOKEN, ~/.config/rclone/rclone.conf
 """
 import io
@@ -21,15 +21,16 @@ import time
 import urllib.request
 
 ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
-OD_DIR = os.environ.get("GM_OD", "onedrive2:dbqd")
+import pathcfg          # 路径真值来自配置: CI=Secret PATHS_JSON, 本机=paths.local.json
+OD_DIR = pathcfg.require("GM_OD")
 # 编号清单覆盖的目录 (逗号分隔的 alist 路径)
-STEM_DIRS = os.environ.get("GM_STEM_DIRS", "/天翼个人/out2,/天翼家庭/out2")
+STEM_DIRS = pathcfg.require("GM_STEM_DIRS")
 # 带大小清单: (alist 路径, 输出文件名)
 SIZE_MANIFESTS = [
-    ("/天翼个人/out2", "ty_out.tsv"),
-    ("/天翼个人/TelegramVideos", "ty_tg.tsv"),
+    (pathcfg.require("GM_TY_OUT"), "ty_out.tsv"),
+    (pathcfg.require("GM_TY_TG"), "ty_tg.tsv"),
 ]
-REPORT = os.environ.get("GM_REPORT", "onedrive2:dbqd/gen_manifest_report.txt")
+REPORT = pathcfg.require("GM_REPORT")
 OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
 
@@ -111,7 +112,7 @@ def main():
         log("!! 没拿到任何编号(两处都读不到?), 不覆盖清单")
         return 1
 
-    header = ("# 天翼个人/out2 + 天翼家庭/out2 编号清单\n"
+    header = ("# 目标网盘/out2 + 副网盘/out2 编号清单\n"
               "# 由云端 gen-manifest (tools/gen_manifest.py) 生成, 云端流水线读它比对\n"
               "# 更新时间: %s | 文件 %d 个 | 编号 %d 个\n"
               % (time.strftime("%Y-%m-%d %H:%M:%S"), total_files, len(have)))
@@ -139,7 +140,7 @@ def main():
             log("  !! %s 导出异常: %s" % (fname, str(e)[:90]))
 
     # 报告
-    lines = ["# 云端天翼清单导出报告  更新: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+    lines = ["# 云端云盘清单导出报告  更新: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
              "编号清单: %s" % ("OK" if ok_stem else "FAIL"),
              "编号数: %d (文件 %d 个)" % (len(have), total_files),
              "覆盖: %s" % ", ".join(parts),
@@ -157,4 +158,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import logmask          # 日志脱敏: 文件名/路径 -> 短哈希(见 logmask.py)
+    logmask.install()
     sys.exit(main())
