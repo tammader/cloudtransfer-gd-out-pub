@@ -27,7 +27,11 @@ on:
       max_total_gb:
         description: "本轮上传总量上限(GB)"
         required: false
-        default: "6"
+        default: "25"
+      daily_limit_gb:
+        description: "云盘当日上传总量上限(GB); 按北京自然日累计, 防超网盘日配额"
+        required: false
+        default: "180"
       thresh_mb:
         description: "gd-out2 的切分阈值(判定 dbjm 分片用)"
         required: false
@@ -132,14 +136,15 @@ jobs:
         env:
           APPLY: ${{ inputs.apply || 'true' }}
           MAX_OPS: ${{ inputs.max_ops || '60' }}
-          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '6' }}
+          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '25' }}
+          DAILY_LIMIT_GB: ${{ inputs.daily_limit_gb || '180' }}
           THRESH_MB: ${{ inputs.thresh_mb || '300' }}
           BUDGET_MIN: ${{ inputs.budget_min || '170' }}
           ONLY: ${{ inputs.only || '' }}
           ALIST_URL: "http://127.0.0.1:5244"
         run: |
           set -x
-          ARGS="--max-ops $MAX_OPS --max-total-gb $MAX_TOTAL_GB --thresh-mb $THRESH_MB --budget-min $BUDGET_MIN"
+          ARGS="--max-ops $MAX_OPS --max-total-gb $MAX_TOTAL_GB --daily-limit-gb $DAILY_LIMIT_GB --thresh-mb $THRESH_MB --budget-min $BUDGET_MIN"
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
           if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
           python3 tools/out2_ty_sync.py $ARGS
