@@ -399,7 +399,7 @@ def main():
     # 0) 上传通道探针: 通道不通就整轮跳过, 别拿 3 小时预算去撞墙
     if a.apply and todo:
         if ctx[0] is not None:
-            ok, info = probe_ty189(ctx[0], ctx[1], TY_DIR, mb=2)
+            ok, info = probe_ty189(ctx[0], ctx[1], TY_DIR, mb=32)
             tag = "189直连探针"
         else:
             ok, info = probe_upload(TY_DIR, mb=8, timeout=180)
@@ -465,7 +465,7 @@ def main():
                 #   退路 = OpenList PUT。整条链路会间歇性抽风 -> 同一文件再补几次即可。
                 dst = TY_DIR.rstrip("/") + "/" + name
                 secs, last_err, note_up = 0.0, "", ""
-                for att in range(1, 4):
+                for att in range(1, 3):
                     try:
                         ok2, note_up = upload_and_verify(lp, name, size, dst, ctx)
                         if not ok2:
@@ -477,7 +477,7 @@ def main():
                         last_err = str(e)[:120]
                         put_streak += 1
                         over = (time.time() - t0) / 60 > a.budget_min
-                        if att >= 3 or over or put_streak >= PUT_BREAK:
+                        if att >= 2 or over or put_streak >= PUT_BREAK:
                             raise RuntimeError("重试 %d 次仍失败(连续零进展 %d 次): %s"
                                                % (att, put_streak, last_err))
                         print("   ↻ 第 %d 次失败(%s) -> %d 秒后重试"
