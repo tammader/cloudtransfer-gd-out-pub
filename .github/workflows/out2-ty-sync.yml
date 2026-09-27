@@ -6,11 +6,13 @@ name: out2-ty-sync
 #      (dbjm 里是 gd-out2 切过的分片: <=300MB 看同名, >300MB 看 .part001/.part002 两片)
 #   跑法: runner 上现装 OpenList, 注入「目标网盘」+「上游网盘/Crypt(/归档挂载)」两个挂载,
 #         源远端 与报告走 rclone。
-#   ⚠️ upload_thread 必须 = 1 (2026-09-27 定论):
-#       本机 alist(同账号、同 access_token/TempUuid、thread=1) 4MB 探针 3 秒传成功;
-#       runner 端 thread=8 时上传会"首个包之后零进展"卡死(列目录正常 -> 认证没问题, 只有 PUT 通道死),
-#       run#6 出现 8/8 全灭。09-25 那次"8 更快(4.0~4.6MB/s)"的结论只对速度成立, 稳定性上是错的。
-#       宁可慢也别卡: 卡一次要烧掉整轮预算。
+#   ⚠️ 上传卡死的真因(2026-09-27 读 OpenList 源码 + alist 日志后更正):
+#       * `upload_thread` 在 189CloudTV 驱动里**只被解析、从未被使用**(死配置) -> 调它没有任何作用。
+#       * 该驱动的上传 = createUploadFile -> 单流 PUT(带 ResumePolicy:1 续传) -> getUploadFileStatus 循环 -> commit,
+#         **服务端自己合成, 不需要我们拆包/合并**。
+#       * 真正的问题: 驱动那个 PUT 走 base.HttpClient **没有超时**, 189 侧一挂就是好几分钟且不报错,
+#         "续传"只在请求报错时才触发 -> 于是整轮卡死, 最后靠我们客户端的 socket 超时(360s)断开。
+#       * 缓解: 启动探针 + 连续零进展熔断 + 每文件重试(见 out2_ty_sync.py); 根治需自研带超时的 189 上传。
 #   报告: 中转远端:报告区/out2_ty_report.txt
 
 on:
@@ -44,9 +46,9 @@ on:
         required: false
         default: "170"
       upload_thread:
-        description: "云盘上传线程数; 默认 1(与本机 alist 一致, 稳)。实测 >1 会出'零进展'卡死, 别调大"
+        description: "云盘上传线程数; 该驱动(189CloudTV)里是死配置, 调了没用, 留着仅为兼容"
         required: false
-        default: "1"
+        default: "3"
       only:
         description: "只处理这一个文件名(调试用)"
         required: false
@@ -106,7 +108,7 @@ jobs:
         env:
           S_TY: ${{ secrets.ALIST_STORAGES_TY }}
           S_DBJM: ${{ secrets.ALIST_STORAGES }}
-          UPLOAD_THREAD: ${{ inputs.upload_thread || '1' }}
+          UPLOAD_THREAD: ${{ inputs.upload_thread || '3' }}
         run: |
           printf '%s' "$S_TY" > /tmp/a.json
           printf '%s' "$S_DBJM" > /tmp/b.json
