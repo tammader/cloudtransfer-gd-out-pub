@@ -48,10 +48,15 @@ _MEDIA_EXT = r"(?:mp4|mkv|avi|wmv|mov|flv|m4v|rmvb|ts|mpg|mpeg|webm|3gp|part\d*)
 
 # 1) 媒体文件名(含中文/全角括号/空格/编号) —— 最需要保护的目标
 _RE_MEDIA = re.compile(
-    r"[\w\u4e00-\u9fff（(【\[][^\s\"'|,;]*?\.%s\b" % _MEDIA_EXT, re.I)
+    r"[\w\u4e00-\u9fff（(【\[][^\s\"'|,;<>]*?\.%s\b" % _MEDIA_EXT, re.I)
 
 # 2) rclone 远端:  name:path   例 remote1:out2 / remote2:dir/x.txt
-_RE_REMOTE = re.compile(r"\b[A-Za-z0-9_\-]{2,}:[\w\u4e00-\u9fff][\w\u4e00-\u9fff/.\-]*")
+_RE_REMOTE = re.compile(r"(?<!<)\b[A-Za-z0-9_\-]{2,}:[\w\u4e00-\u9fff][\w\u4e00-\u9fff/.\-]*")
+
+# 2.5) OAuth 令牌形态(兜底): Google ya29./1///GOCSPX-, 微软 Ew.A/M.C
+_RE_TOKEN = re.compile(r"\b(?:ya29\.[\w\-]{8,}|1//[\w\-]{10,}"
+                       r"|GOCSPX-[\w\-]{6,}"
+                       r"|Ew[A-Z][\w\-.]{18,}|0\.A[\w\-.]{18,}|M\.C[\w\-.]{18,})")
 
 # 3) 绝对路径: /a/b/c 与 X:/a/b   (URL 里的 // 和 127.0.0.1:5244/api 由 lookbehind 排除)
 _RE_PATH = re.compile(r"(?<![A-Za-z0-9:/\\])/[^\s\"'|,;)\]}\u3002\uff0c]*")
@@ -75,12 +80,13 @@ def scrub(text):
                 text = text.replace(k, v)
 
         spans = []
-        for pat, kind in ((_RE_MEDIA, "file"), (_RE_REMOTE, "remote"), (_RE_PATH, "path")):
+        for pat, kind in ((_RE_MEDIA, "file"), (_RE_REMOTE, "remote"),
+                         (_RE_PATH, "path"), (_RE_TOKEN, "tok")):
             for m in pat.finditer(text):
                 spans.append((m.start(), m.end(), m.group(0), kind))
         if not spans:
             return text
-        prio = {"file": 0, "remote": 1, "path": 2}      # 起点相同时 file 更具体, 优先
+        prio = {"tok": 0, "file": 0, "remote": 1, "path": 2}      # 起点相同时 file 更具体, 优先
         spans.sort(key=lambda x: (x[0], prio[x[3]], -(x[1] - x[0])))
         out, last = [], 0
         for s, e, raw, kind in spans:
