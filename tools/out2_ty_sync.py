@@ -36,6 +36,7 @@ ARCH = pathcfg.require("OT_ARCH")
 ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
 WORK = os.environ.get("OT_WORK", "/tmp/out2ty")
 REPORT = pathcfg.require("OT_REPORT")
+DAILY = pathcfg.require("OT_DAILY")      # 云盘日上传配额账本(防超 200GB/日)
 GB = 1024 ** 3
 RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
 OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -172,9 +173,27 @@ def main():
     ap.add_argument("--budget-min", type=int, default=170)
     ap.add_argument("--only", default="")
     ap.add_argument("--keep-local", action="store_true")
+    ap.add_argument("--daily-limit-gb", type=float, default=180.0,
+                    help="云盘当日上传总量上限(GB); 按北京自然日累计, 默认 180(留 20GB 余量)")
     a = ap.parse_args()
     thresh = a.thresh_mb * 1024 ** 2
     max_total = int(a.max_total_gb * GB)
+
+    # --- 云盘日配额保护: 该网盘按北京自然日重置, 这里累计封顶, 免得撞日配额 ---
+    today = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 8 * 3600))
+    d_date, d_gb = load_daily()
+    if d_date != today:
+        d_date, d_gb = today, 0.0
+    if d_gb >= a.daily_limit_gb:
+        lines.append("今日已传 %.1fGB >= 日上限 %.1fGB -> 本轮不传, 等次日 0 点重置"
+                     % (d_gb, a.daily_limit_gb))
+        print(lines[-1])
+        finish(lines, a)
+        return 0
+    eff_gb = min(a.max_total_gb, a.daily_limit_gb - d_gb)
+    max_total = int(eff_gb * GB)
+    lines.append("日配额: 今日已用 %.1fGB / 上限 %.1fGB -> 本轮最多再传 %.1fGB"
+                 % (d_gb, a.daily_limit_gb, eff_gb))
     t0 = time.time()
     os.makedirs(WORK, exist_ok=True)
 
@@ -289,8 +308,36 @@ def main():
     lines.append("源目录剩余 %d 个" % max(len(src) - arch_n, 0))
     print("\n合计: 上传 %d (%s) | 归档 %d | 已在 %d | 失败 %d"
           % (up_n, human(total_up), arch_n, skip_n, fail_n))
+    if a.apply and total_up > 0:
+        save_daily(today, d_gb + total_up / GB)
     finish(lines, a)
     return 0
+
+
+def load_daily():
+    """读今日已上传量; 返回 (日期, GB)"""
+    try:
+        r = rclone(["cat", DAILY], timeout=90)
+        if r.returncode != 0:
+            return "", 0.0
+        d = json.loads((r.stdout or "").strip() or "{}")
+        return d.get("date", ""), float(d.get("gb", 0) or 0)
+    except Exception:
+        return "", 0.0
+
+
+def save_daily(date, gb):
+    """写回今日累计上传量(供下一轮继续累计)"""
+    try:
+        payload = json.dumps({"date": date, "gb": round(gb, 2),
+                              "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        r = subprocess.run([RCLONE, "rcat", DAILY, "--config", CONF],
+                           input=payload, capture_output=True, text=True,
+                           errors="replace", timeout=120)
+        log("日配额账本 %.1fGB -> %s: %s"
+            % (gb, DAILY, "OK" if r.returncode == 0 else (r.stderr or "")[:80]))
+    except Exception as e:
+        log("!! 日配额账本写入失败: %s" % str(e)[:80])
 
 
 def finish(lines, a):
