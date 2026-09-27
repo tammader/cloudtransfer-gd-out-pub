@@ -160,6 +160,47 @@ def alist_put(dst_path, local_file, size, label):
     return body.secs
 
 
+def alist_remove(path, names):
+    try:
+        alist("POST", "/api/fs/remove", {"dir": path, "names": names})
+        return True
+    except Exception:
+        return False
+
+
+def probe_upload(dst_dir, mb=8, timeout=180):
+    """上传通道探针: 往目标目录 PUT 一个小文件, 用后即删。
+
+    卡死发生在"首个包之后就零进展"(≈0.4MB), 所以几 MB 的探针就能检出通道是否可用。
+    """
+    n = mb * 1024 * 1024
+    p = os.path.join(WORK, "_probe.bin")
+    name = "__probe_upload.bin"
+    d, err = None, ""
+    try:
+        with open(p, "wb") as fh:
+            fh.write(os.urandom(n))
+        with open(p, "rb") as fh:
+            body = Progress(fh, n, "probe")
+            req = urllib.request.Request(
+                ALIST + "/api/fs/put", data=body, method="PUT",
+                headers={"Authorization": alist_token(),
+                         "File-Path": urllib.parse.quote(dst_dir.rstrip("/") + "/" + name),
+                         "Content-Type": "application/octet-stream",
+                         "Content-Length": str(n)})
+            d = json.loads(OP.open(req, timeout=timeout).read().decode("utf-8", "replace"))
+    except Exception as e:
+        err = str(e)[:120]
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        alist_remove(dst_dir, [name])     # 不管成功失败都清掉探针文件
+    ok = bool(d and d.get("code") == 200)
+    return ok, (err or (str(d)[:120] if d else ""))
+
+
 def split_parts(name, thresh):
     """>阈值时 gd-out2 切出来的两个分片名"""
     stem, ext = os.path.splitext(name)
@@ -242,7 +283,19 @@ def main():
 
     up_n = arch_n = skip_n = fail_n = 0
     total_up = 0
+    put_streak = 0          # 连续"零进展"的 PUT 次数(成功即清零); 用于熔断
+    PUT_BREAK = 6           # 连续这么多次零进展 -> 判定通道不可用, 本轮提前收工
     lines.append("---")
+
+    # 0) 上传通道探针: 通道不通就整轮跳过, 别拿 3 小时预算去撞墙
+    if a.apply and todo:
+        ok, info = probe_upload(TY_DIR, mb=8, timeout=180)
+        log("上传通道探针: %s" % ("可用" if ok else "不通 -> %s" % info))
+        lines.append("上传通道探针: %s" % ("可用" if ok else "不通(跳过本轮)"))
+        if not ok:
+            lines.append("目标网盘上传通道当前不可用(探针失败), 本轮不做任何上传, 等下一轮")
+            finish(lines, a)
+            return 1
 
     def checkpoint():
         """增量落盘(报告 + 日账本): 运行被取消/超时/强杀也不丢已完成的账"""
@@ -257,6 +310,11 @@ def main():
             save_daily(today, d_gb + total_up / GB)
 
     for name, size in todo:
+        if put_streak >= PUT_BREAK:
+            lines.append("连续 %d 次上传零进展 -> 目标网盘上传通道疑似异常, 本轮提前收工"
+                         % put_streak)
+            print(lines[-1])
+            break
         if up_n + arch_n + fail_n >= a.max_ops:
             lines.append("达本轮个数上限 %d, 收工" % a.max_ops)
             break
@@ -300,13 +358,16 @@ def main():
                         got = alist_get(dst)
                         if got != size:
                             raise RuntimeError("上传后校验不过: 目标 %s 期望 %s" % (got, size))
+                        put_streak = 0
                         last_err = ""
                         break
                     except Exception as e:
                         last_err = str(e)[:120]
+                        put_streak += 1
                         over = (time.time() - t0) / 60 > a.budget_min
-                        if att >= 3 or over:
-                            raise RuntimeError("重试 %d 次仍失败: %s" % (att, last_err))
+                        if att >= 3 or over or put_streak >= PUT_BREAK:
+                            raise RuntimeError("重试 %d 次仍失败(连续零进展 %d 次): %s"
+                                               % (att, put_streak, last_err))
                         print("   ↻ 第 %d 次失败(%s) -> %d 秒后重试"
                               % (att, last_err, 20 * att))
                         time.sleep(20 * att)
