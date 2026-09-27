@@ -91,8 +91,9 @@ def main():
         return 1
     txt = pat.sub(lambda m: m.group(1) + tok, txt, count=1)
     io.open(p, "w", encoding="utf-8").write(txt)
-    print("已刷新并写回: access_token=%s... expiry=%s"
-          % (d["access_token"][:18], exp))
+    # 安全: 不打印 access_token 片段(仓库公开, 日志人人可读); 只报长度和过期时间
+    print("已刷新并写回: access_token=<已打码, %d 字符> expiry=%s"
+          % (len(d["access_token"]), exp))
     return 0
 
 
