@@ -1,0 +1,109 @@
+name: ty-upload-test
+
+# 一次性验证/测速: OneDrive2/out2 -> 天翼个人/out2
+#   天翼(189) 只挂在本机 alist 上, runner 直连不到 -> 在 runner 上现装一份 OpenList,
+#   用 Secret ALIST_STORAGES_TY 注入「天翼个人」存储, 再通过它上传。
+#   默认测完把测试文件从 out2 删掉(进回收站), 不污染目标目录; 要留就传 keep=true。
+
+on:
+  workflow_dispatch:
+    inputs:
+      file:
+        description: "指定 onedrive2:out2 里的文件名(留空=自动挑最大的小文件)"
+        required: false
+        default: ""
+      max_mb:
+        description: "自动挑选时的文件大小上限(MB)"
+        required: false
+        default: "300"
+      keep:
+        description: "true=测完保留测试文件(默认删掉)"
+        required: false
+        default: "false"
+      upload_thread:
+        description: "天翼上传线程数(留空=用存储里的设置; 试速度可填 8)"
+        required: false
+        default: ""
+      openlist_version:
+        description: "OpenList 版本 tag"
+        required: false
+        default: "v4.2.6"
+
+concurrency:
+  group: ty-upload-test
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 装 OpenList(为了挂天翼个人)
+        run: |
+          V="${{ inputs.openlist_version || 'v4.2.6' }}"
+          curl -sL "https://github.com/OpenListTeam/OpenList/releases/download/$V/openlist-linux-amd64.tar.gz" -o /tmp/ol.tar.gz
+          mkdir -p /opt/openlist && tar -xzf /tmp/ol.tar.gz -C /opt/openlist
+          chmod +x /opt/openlist/openlist
+          ls -la /opt/openlist | head -5
+
+      - name: 初始化并启动 OpenList
+        run: |
+          cd /opt/openlist
+          PW="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          echo "ALIST_PW=$PW" >> $GITHUB_ENV
+          ./openlist admin set "$PW" --data /opt/openlist/data 2>&1 | tail -3
+          nohup ./openlist server --data /opt/openlist/data > /opt/openlist/alist.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s -m 3 http://127.0.0.1:5244/api/public/settings >/dev/null && { echo "alist 就绪"; break; }
+            sleep 2
+          done
+
+      - name: 注入天翼个人存储
+        env:
+          ALIST_STORAGES: ${{ secrets.ALIST_STORAGES_TY }}
+          UPLOAD_THREAD: ${{ inputs.upload_thread || '' }}
+        run: |
+          printf '%s' "$ALIST_STORAGES" > /tmp/storages_ty.json
+          echo "存储定义 $(wc -c < /tmp/storages_ty.json) 字节"
+          OVER=""
+          if [ -n "$UPLOAD_THREAD" ]; then OVER="--override upload_thread=$UPLOAD_THREAD"; fi
+          python3 tools/alist_bootstrap.py --data-dir /opt/openlist/data \
+            --password "$ALIST_PW" --storages-file /tmp/storages_ty.json --emit-env \
+            --verify-mount /天翼个人/out2 $OVER
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: 跑测速
+        env:
+          ALIST_URL: "http://127.0.0.1:5244"
+          FILE: ${{ inputs.file || '' }}
+          MAX_MB: ${{ inputs.max_mb || '300' }}
+          KEEP: ${{ inputs.keep || 'false' }}
+        run: |
+          set -x
+          ARGS="--pick-largest --max-mb $MAX_MB"
+          if [ -n "$FILE" ]; then ARGS="--file $FILE"; fi
+          if [ "$KEEP" = "true" ]; then ARGS="$ARGS --keep"; fi
+          python3 tools/ty_upload_speedtest.py $ARGS
+
+      - name: 出错时贴 alist 日志
+        if: failure()
+        run: tail -40 /opt/openlist/alist.log || true
