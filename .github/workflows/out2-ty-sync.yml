@@ -1,14 +1,14 @@
 name: out2-ty-sync
 
-# gdrive2:out2 -> 天翼个人/out2 单向同步 + 两处齐全后归档到 gdrive2:out3
-#   1) 把 gdrive2:out2 的文件传到 天翼个人/out2 (同名同大小跳过, 源文件不动)
-#   2) 当同一个文件在 天翼个人/out2 与 /dbjm 都有了, 把 gdrive2:out2 里的它移进 gdrive2:out3
+# 源远端:out2 -> 目标网盘/out2 单向同步 + 两处齐全后归档到 源远端:out3
+#   1) 把 源远端:out2 的文件传到 目标网盘/out2 (同名同大小跳过, 源文件不动)
+#   2) 当同一个文件在 目标网盘/out2 与 /归档挂载 都有了, 把 源远端:out2 里的它移进 源远端:out3
 #      (dbjm 里是 gd-out2 切过的分片: <=300MB 看同名, >300MB 看 .part001/.part002 两片)
-#   跑法: runner 上现装 OpenList, 注入「天翼个人」+「豆包/Crypt(/dbjm)」两个挂载,
-#         gdrive2 与报告走 rclone。上传线程 8 —— 189 驱动的 upload_thread 是「分片并发上传」,
+#   跑法: runner 上现装 OpenList, 注入「目标网盘」+「上游网盘/Crypt(/归档挂载)」两个挂载,
+#         源远端 与报告走 rclone。上传线程 8 —— 189 驱动的 upload_thread 是「分片并发上传」,
 #         调成 1 等于掐死并发: 实测 thread=8 中位 4.0~4.6MB/s(09-25 成功轮 50 个样本),
 #         改 1 后单文件只剩 2.4MB/s(09-26)。09-25 那次"线程数无影响"的结论已作废。
-#   报告: onedrive2:dbqd/out2_ty_report.txt
+#   报告: 中转远端:报告区/out2_ty_report.txt
 
 on:
   # 每 3 小时 (UTC 0:45/3:45/.../21:45 = 北京 8:45/11:45/.../次日 5:45)
@@ -37,7 +37,7 @@ on:
         required: false
         default: "170"
       upload_thread:
-        description: "天翼上传线程数(默认 8; 189 分片并发, 调 1 会掉到约 2.4MB/s)"
+        description: "云盘上传线程数(默认 8; 该驱动的分片并发, 调 1 会掉到约 2.4MB/s)"
         required: false
         default: "8"
       only:
@@ -56,6 +56,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -71,7 +75,7 @@ jobs:
           cp /tmp/rclone-*/rclone /usr/local/bin/
           rclone version | head -1
 
-      - name: 装 OpenList(挂天翼个人 + 豆包/dbjm)
+      - name: 装 OpenList(挂目标网盘 + 上游网盘/归档挂载)
         run: |
           V="${{ inputs.openlist_version || 'v4.2.6' }}"
           curl -sL "https://github.com/OpenListTeam/OpenList/releases/download/$V/openlist-linux-amd64.tar.gz" -o /tmp/ol.tar.gz
@@ -91,7 +95,7 @@ jobs:
             sleep 2
           done
 
-      - name: 注入存储(天翼个人 + 豆包 + Crypt /dbjm)
+      - name: 注入存储(目标网盘 + 上游网盘 + Crypt /归档挂载)
         env:
           S_TY: ${{ secrets.ALIST_STORAGES_TY }}
           S_DBJM: ${{ secrets.ALIST_STORAGES }}
@@ -115,8 +119,7 @@ jobs:
           OVER=""
           if [ -n "$UPLOAD_THREAD" ]; then OVER="--override upload_thread=$UPLOAD_THREAD"; fi
           python3 tools/alist_bootstrap.py --data-dir /opt/openlist/data \
-            --password "$ALIST_PW" --storages-file /tmp/storages.json --emit-env \
-            --verify-mount /天翼个人/out2 $OVER
+            --password "$ALIST_PW" --storages-file /tmp/storages.json --emit-env $OVER
 
       - name: 写 rclone 配置
         env:
@@ -125,7 +128,7 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: 跑 out2 -> 天翼个人/out2 (+归档 out3)
+      - name: 跑 out2 -> 目标网盘/out2 (+归档 out3)
         env:
           APPLY: ${{ inputs.apply || 'true' }}
           MAX_OPS: ${{ inputs.max_ops || '60' }}
