@@ -9,7 +9,7 @@
   - **源文件删除(2026-09-25 加)**: 只要目标 /归档挂载 里确认有**同名且同大小**的文件
     (刚上传校验通过的, 或本来就在的), 就把 中转远端/out2 里的源文件删掉。
     只有 name+size 都一致才会删; 对不上(大小不同/目标没有/目标是目录)一律不删。
-    OneDrive 侧删除走 rclone deletefile -> 进回收站(可捞), 且原文件在 源远端:out2 归档区
+    中转远端 侧删除走 rclone deletefile -> 进回收站(可捞), 且原文件在 源远端:out2 归档区
     一直都有, 所以即使误删也能拿回来。想保留源文件加 --keep-src。
 
 为什么必须在本机跑: /归档挂载 是本机 alist 上的 Crypt 加密盘(底层 /上游网盘/jm),
@@ -192,7 +192,7 @@ def lsjson(remote):
 
 # ---------------- 到位后删源 ----------------
 def _src_delete(remote, name):
-    """删源文件(OneDrive: 进回收站)。返回 (ok, msg)"""
+    """删源文件(中转远端: 进回收站)。返回 (ok, msg)"""
     r = rclone(["deletefile", "%s/%s" % (remote, name),
                 "--retries", "3", "--low-level-retries", "10"], timeout=900)
     if r.returncode != 0:
