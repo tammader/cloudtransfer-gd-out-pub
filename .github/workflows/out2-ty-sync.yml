@@ -118,7 +118,7 @@ jobs:
               if s['mount_path'] not in seen:
                   seen.add(s['mount_path']); out.append(s)
           io.open('/tmp/storages.json', 'w', encoding='utf-8').write(json.dumps(out, ensure_ascii=False))
-          print('合并后存储:', [s['mount_path'] for s in out])
+          print('合并后存储数:', len(out))
           PY
           OVER=""
           if [ -n "$UPLOAD_THREAD" ]; then OVER="--override upload_thread=$UPLOAD_THREAD"; fi
