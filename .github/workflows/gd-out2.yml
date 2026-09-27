@@ -1,0 +1,122 @@
+name: gd-out2
+
+# GoogleDrive2/out -> OneDrive2/out2 (大文件对半切) + 源文件归档到 GoogleDrive2/out2
+#   每 3 小时跑一次, 单轮处理的源文件总量控制在 4~5GB (--max-total-gb 5 / --min-total-gb 4)
+#   分批下载: 每批按 runner 剩余磁盘挑文件, 尽量写满工作区 (下完处理完再下下一批)
+#   <=300MB : 直接上传 OneDrive2/out2
+#   > 300MB : ffmpeg 无损对半切 2 段(原名.part001/part002) 再上传
+#   上传校验通过后, 把 gdrive2:out 里的源文件移到 gdrive2:out2 (同盘服务端移动, 很快)
+#   非视频 / 切不开 -> 跳过并记录, 源文件保持原样; 绝不二进制切块
+# 报告 (含批次/跳过/失败明细): onedrive2:dbqd/gd_out2_report.txt
+# 连续失败清单: onedrive2:dbqd/gd_out2_failed.json (同一文件失败 3 次后本轮不再重试)
+
+on:
+  # 每 3 小时 (UTC 0:30/3:30/.../21:30 = 北京 8:30/11:30/.../次日 5:30)
+  schedule:
+    - cron: "30 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真跑(上传+归档源文件), false=只演练看计划"
+        required: false
+        default: "true"
+      max_total_gb:
+        description: "本轮处理文件总量上限(GB), 到了就收工"
+        required: false
+        default: "5"
+      min_total_gb:
+        description: "本轮总量目标下限(GB); 凑不到(文件不够)会在报告里提示"
+        required: false
+        default: "4"
+      max_ops:
+        description: "本轮最多处理多少个源文件(个数硬上限)"
+        required: false
+        default: "200"
+      threshold_mb:
+        description: "超过多少 MB 就对半切"
+        required: false
+        default: "300"
+      disk_budget_gb:
+        description: "每批磁盘上限(GB); 0=按剩余空间自动算(留 reserve_gb 余量)"
+        required: false
+        default: "0"
+      reserve_gb:
+        description: "给系统留的磁盘余量(GB)"
+        required: false
+        default: "2"
+      budget_min:
+        description: "本轮时间预算(分钟), 到点收工下次继续"
+        required: false
+        default: "170"
+      only:
+        description: "只处理这一个文件名(留空=按顺序批量); 调试用"
+        required: false
+        default: ""
+
+concurrency:
+  group: gd-out2
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gd-out2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 环境自检(磁盘/内存)
+        run: |
+          echo "===== 磁盘 ====="; df -h / /tmp 2>/dev/null || df -h /
+          echo "===== CPU/内存 ====="; nproc; free -h || true
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 确认 ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          echo "配置里的远端: $(grep -c '^\[' ~/.config/rclone/rclone.conf) 段"
+
+      - name: 跑 gd-out2
+        env:
+          APPLY: ${{ inputs.apply || 'true' }}
+          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '5' }}
+          MIN_TOTAL_GB: ${{ inputs.min_total_gb || '4' }}
+          MAX_OPS: ${{ inputs.max_ops || '200' }}
+          THRESHOLD_MB: ${{ inputs.threshold_mb || '300' }}
+          DISK_BUDGET_GB: ${{ inputs.disk_budget_gb || '0' }}
+          RESERVE_GB: ${{ inputs.reserve_gb || '2' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '170' }}
+          ONLY: ${{ inputs.only || '' }}
+        run: |
+          set -x
+          ARGS="--max-ops $MAX_OPS --threshold-mb $THRESHOLD_MB"
+          ARGS="$ARGS --max-total-gb $MAX_TOTAL_GB --min-total-gb $MIN_TOTAL_GB"
+          ARGS="$ARGS --disk-budget-gb $DISK_BUDGET_GB --reserve-gb $RESERVE_GB"
+          ARGS="$ARGS --budget-min $BUDGET_MIN"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
+          python3 tools/gd_out2_split.py $ARGS
+
+      - name: 收尾(报剩余空间)
+        if: always()
+        run: df -h / | tail -1
