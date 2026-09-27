@@ -23,11 +23,11 @@ on:
       max_ops:
         description: "本轮最多上传几个文件"
         required: false
-        default: "40"
+        default: "500"
       budget_min:
         description: "本轮时间预算(分钟)"
         required: false
-        default: "300"
+        default: "310"
       only:
         description: "只同步这一个文件名(留空=整目录); 调试用"
         required: false
@@ -59,7 +59,7 @@ env:
 jobs:
   od2-dbjm:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 350
     steps:
       - name: 取仓库
         uses: actions/checkout@v4
@@ -126,8 +126,8 @@ jobs:
       - name: 跑同步 out2 -> /归档挂载
         env:
           APPLY: ${{ inputs.apply || 'true' }}
-          MAX_OPS: ${{ inputs.max_ops || '20' }}
-          BUDGET_MIN: ${{ inputs.budget_min || '300' }}
+          MAX_OPS: ${{ inputs.max_ops || '500' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '310' }}
           ONLY: ${{ inputs.only || '' }}
           MAX_DELETE: ${{ inputs.max_delete || '200' }}
           KEEP_SRC: ${{ inputs.keep_src || 'false' }}
