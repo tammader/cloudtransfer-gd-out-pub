@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
-"""OneDrive2/out2  ->  alist /dbjm 根目录      单向同步 + 到位后删源
+"""中转远端/out2  ->  alist /归档挂载 根目录      单向同步 + 到位后删源
 
 语义:
   - 只下载源里有、目标里没有的;
   - 目标已有同名同大小 -> 跳过上传, 这就是"避免重复上传"的依据;
   - 同名但大小不同 -> 记为冲突, 默认不覆盖(要覆盖加 --overwrite);
   - **目标里多出来的文件不删**(只报告), 所以目标不会被"反噬";
-  - **源文件删除(2026-09-25 加)**: 只要目标 /dbjm 里确认有**同名且同大小**的文件
-    (刚上传校验通过的, 或本来就在的), 就把 OneDrive2/out2 里的源文件删掉。
+  - **源文件删除(2026-09-25 加)**: 只要目标 /归档挂载 里确认有**同名且同大小**的文件
+    (刚上传校验通过的, 或本来就在的), 就把 中转远端/out2 里的源文件删掉。
     只有 name+size 都一致才会删; 对不上(大小不同/目标没有/目标是目录)一律不删。
-    OneDrive 侧删除走 rclone deletefile -> 进回收站(可捞), 且原文件在 gdrive2:out2 归档区
+    OneDrive 侧删除走 rclone deletefile -> 进回收站(可捞), 且原文件在 源远端:out2 归档区
     一直都有, 所以即使误删也能拿回来。想保留源文件加 --keep-src。
 
-为什么必须在本机跑: /dbjm 是本机 alist 上的 Crypt 加密盘(底层 /豆包网盘/jm),
-GitHub runner 访问不到它(跟 天翼个人/out2 一样只挂在本地)。
+为什么必须在本机跑: /归档挂载 是本机 alist 上的 Crypt 加密盘(底层 /上游网盘/jm),
+GitHub runner 访问不到它(跟 目标网盘/out2 一样只挂在本地)。
 
 上传走 alist 原生接口 PUT /api/fs/put (File-Path 头 + 原始 body), 下载走 rclone。
 
@@ -39,8 +39,9 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-SRC = os.environ.get("DBJM_SRC", "onedrive2:out2")
-DST = os.environ.get("DBJM_DST", "/dbjm")             # alist 里的挂载路径(根)
+import pathcfg          # 路径真值来自配置: CI=Secret PATHS_JSON, 本机=paths.local.json
+SRC = pathcfg.require("DBJM_SRC")
+DST = pathcfg.require("DBJM_DST")                     # alist 里的挂载路径(根)
 ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
 # 临时目录: 注意别放 C:/cb 下面, 会被本机 worker 当成待处理文件
 TMP = os.environ.get("DBJM_TMP") or ("/tmp/od2dbjm" if os.name != "nt" else r"C:/od2dbjm")
@@ -48,7 +49,7 @@ LOGDIR = os.path.join(HERE, "logs")
 STATE = os.path.join(HERE, "state")
 LOG = os.path.join(LOGDIR, "dbjm_sync.log")
 REPORT = os.path.join(LOGDIR, "dbjm_sync_report.txt")
-REPORT_REMOTE = os.environ.get("DBJM_REPORT", "onedrive2:dbqd/dbjm_sync_report.txt")
+REPORT_REMOTE = pathcfg.require("DBJM_REPORT")
 FAILED = os.path.join(STATE, "dbjm_failed.json")
 MAX_FAIL = 3                     # 同一文件连续失败这么多次就不再重试
 RCLONE = os.environ.get("RCLONE_BIN") or \
@@ -240,7 +241,7 @@ def main():
     ap.add_argument("--tmp", default=TMP)
     ap.add_argument("--overwrite", action="store_true", help="同名不同大小时覆盖目标")
     ap.add_argument("--keep-src", action="store_true",
-                    help="不删源文件(默认: 目标确认同名同大小后删掉 OneDrive2/out2 里的源)")
+                    help="不删源文件(默认: 目标确认同名同大小后删掉 中转远端/out2 里的源)")
     ap.add_argument("--max-delete", type=int, default=200,
                     help="本轮最多为多少个【本来就在目标】的文件删源(无需重新上传的那批)")
     ap.add_argument("--only", default="", help="只同步这一个文件名(调试用)")
@@ -268,7 +269,7 @@ def main():
     try:
         dst = alist_list(a.dst)
     except Exception as e:
-        log("!! 读目标失败(/dbjm 挂载是否正常?): %s" % str(e)[:180])
+        log("!! 读目标失败(/归档挂载 挂载是否正常?): %s" % str(e)[:180])
         lines.append("!! 读目标失败: %s" % str(e)[:180])
         finish(lines, a)
         return 1
@@ -432,4 +433,6 @@ def finish(lines, a):
 
 
 if __name__ == "__main__":
+    import logmask          # 日志脱敏: 文件名/路径 -> 短哈希(见 logmask.py)
+    logmask.install()
     sys.exit(main())
