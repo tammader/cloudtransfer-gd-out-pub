@@ -5,9 +5,12 @@ name: out2-ty-sync
 #   2) 当同一个文件在 目标网盘/out2 与 /归档挂载 都有了, 把 源远端:out2 里的它移进 源远端:out3
 #      (dbjm 里是 gd-out2 切过的分片: <=300MB 看同名, >300MB 看 .part001/.part002 两片)
 #   跑法: runner 上现装 OpenList, 注入「目标网盘」+「上游网盘/Crypt(/归档挂载)」两个挂载,
-#         源远端 与报告走 rclone。上传线程 8 —— 189 驱动的 upload_thread 是「分片并发上传」,
-#         调成 1 等于掐死并发: 实测 thread=8 中位 4.0~4.6MB/s(09-25 成功轮 50 个样本),
-#         改 1 后单文件只剩 2.4MB/s(09-26)。09-25 那次"线程数无影响"的结论已作废。
+#         源远端 与报告走 rclone。
+#   ⚠️ upload_thread 必须 = 1 (2026-09-27 定论):
+#       本机 alist(同账号、同 access_token/TempUuid、thread=1) 4MB 探针 3 秒传成功;
+#       runner 端 thread=8 时上传会"首个包之后零进展"卡死(列目录正常 -> 认证没问题, 只有 PUT 通道死),
+#       run#6 出现 8/8 全灭。09-25 那次"8 更快(4.0~4.6MB/s)"的结论只对速度成立, 稳定性上是错的。
+#       宁可慢也别卡: 卡一次要烧掉整轮预算。
 #   报告: 中转远端:报告区/out2_ty_report.txt
 
 on:
@@ -41,9 +44,9 @@ on:
         required: false
         default: "170"
       upload_thread:
-        description: "云盘上传线程数(默认 8; 该驱动的分片并发, 调 1 会掉到约 2.4MB/s)"
+        description: "云盘上传线程数; 默认 1(与本机 alist 一致, 稳)。实测 >1 会出'零进展'卡死, 别调大"
         required: false
-        default: "8"
+        default: "1"
       only:
         description: "只处理这一个文件名(调试用)"
         required: false
@@ -103,7 +106,7 @@ jobs:
         env:
           S_TY: ${{ secrets.ALIST_STORAGES_TY }}
           S_DBJM: ${{ secrets.ALIST_STORAGES }}
-          UPLOAD_THREAD: ${{ inputs.upload_thread || '8' }}
+          UPLOAD_THREAD: ${{ inputs.upload_thread || '1' }}
         run: |
           printf '%s' "$S_TY" > /tmp/a.json
           printf '%s' "$S_DBJM" > /tmp/b.json
