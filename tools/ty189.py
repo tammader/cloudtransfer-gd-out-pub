@@ -44,9 +44,9 @@ ROOT_ID = "-11"
 # 单次 PUT 的 socket 超时(秒)。189 侧"静默挂住"通常几分钟 -> 到这个点就断开重来。
 PUT_TIMEOUT = 60
 # 单个文件上传的总时长上限(秒), 到点认输(避免把整轮预算吃光)
-UPLOAD_MAX_SECS = 1800
+UPLOAD_MAX_SECS = 900
 # 连续多少次 PUT "零进展"就认输
-MAX_STRIKES = 6
+MAX_STRIKES = 4
 
 
 def _urlpath(url):
