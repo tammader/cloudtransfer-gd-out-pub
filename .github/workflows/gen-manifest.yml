@@ -1,13 +1,13 @@
 name: gen-manifest
 
-# 天翼编号清单 · 云端生成 (替代/兜底本机 worker 的「导出比对清单」)
-#   产出(都在 onedrive2:dbqd/):
-#     compare_stems.txt  天翼个人/out2 + 天翼家庭/out2 的编号(供 ty-transfer / out-sync 比对)
-#     ty_out.tsv         天翼个人/out2 名字+大小
-#     ty_tg.tsv          天翼个人/TelegramVideos 名字+大小
+# 云盘编号清单 · 云端生成 (替代/兜底本机 worker 的「导出比对清单」)
+#   产出(都在 中转远端:报告区/):
+#     compare_stems.txt  目标网盘/out2 + 副网盘/out2 的编号(供 ty-transfer / out-sync 比对)
+#     ty_out.tsv         目标网盘/out2 名字+大小
+#     ty_tg.tsv          目标网盘/TG目录 名字+大小
 #     gen_manifest_report.txt  本轮报告
-#   跑法: runner 现装 OpenList 挂天翼(189CloudTV), 列目录走 alist /api/fs/list,
-#         上传走 rclone(onedrive2)。不依赖本机 alist。
+#   跑法: runner 现装 OpenList 挂云盘(CloudTV), 列目录走 alist /api/fs/list,
+#         上传走 rclone(中转远端)。不依赖本机 alist。
 
 on:
   # 每 3 小时 (UTC 0/3/.../21 = 北京 8/11/14/17/20/23/次日 2/5)
@@ -27,6 +27,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+
 jobs:
   gen:
     runs-on: ubuntu-latest
@@ -42,7 +46,7 @@ jobs:
           cp /tmp/rclone-*/rclone /usr/local/bin/
           rclone version | head -1
 
-      - name: 装 OpenList(挂天翼)
+      - name: 装 OpenList(挂云盘)
         run: |
           V="${{ inputs.openlist_version || 'v4.2.6' }}"
           curl -sL "https://github.com/OpenListTeam/OpenList/releases/download/$V/openlist-linux-amd64.tar.gz" -o /tmp/ol.tar.gz
@@ -62,14 +66,13 @@ jobs:
             sleep 2
           done
 
-      - name: 注入天翼存储(天翼个人 + 天翼家庭)
+      - name: 注入云盘存储(目标网盘 + 副网盘)
         env:
           S_TY: ${{ secrets.ALIST_STORAGES_TY }}
         run: |
           printf '%s' "$S_TY" > /tmp/storages.json
           python3 tools/alist_bootstrap.py --data-dir /opt/openlist/data \
-            --password "$ALIST_PW" --storages-file /tmp/storages.json --emit-env \
-            --verify-mount /天翼个人/out2
+            --password "$ALIST_PW" --storages-file /tmp/storages.json --emit-env
 
       - name: 写 rclone 配置
         env:
@@ -78,7 +81,7 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: 生成并上传清单 -> onedrive2:dbqd
+      - name: 生成并上传清单 -> 中转远端:报告区
         env:
           ALIST_URL: "http://127.0.0.1:5244"
         run: python3 tools/gen_manifest.py
