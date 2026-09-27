@@ -29,8 +29,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import pathcfg          # 路径真值来自配置: CI=Secret PATHS_JSON, 本机=paths.local.json
+try:
+    import ty189        # 自研 目标网盘 直连上传: 带 socket 超时 + 断点续传
+except Exception:                                 # pragma: no cover
+    ty189 = None
 SRC = pathcfg.require("OT_SRC")
 TY_DIR = pathcfg.require("OT_TY")
+MOUNT = "/" + TY_DIR.strip("/").split("/")[0]     # 目的网盘在 alist 里的挂载名(从配置推)
 DBJM_DIR = pathcfg.require("OT_DBJM")
 ARCH = pathcfg.require("OT_ARCH")
 ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
@@ -201,6 +206,105 @@ def probe_upload(dst_dir, mb=8, timeout=180):
     return ok, (err or (str(d)[:120] if d else ""))
 
 
+def ty189_open():
+    """用 ALIST_STORAGES_TY(Secret) 或本机 alist_storages_ty.json 建 189 直连客户端。
+
+    目的网盘的 access_token/family_id 就在这份存储配置里, 不需要额外 Secret。
+    返回 (client, folder_id) 或 (None, None)。
+    """
+    if ty189 is None:
+        return None, None
+    raw = os.environ.get("ALIST_STORAGES_TY", "").strip()
+    if not raw:
+        lp = os.path.join(HERE, "alist_storages_ty.json")
+        if os.path.exists(lp):
+            raw = io.open(lp, encoding="utf-8").read()
+    if not raw:
+        print("   (没拿到 ALIST_STORAGES_TY, 直连不可用)")
+        return None, None
+    try:
+        cfg = json.loads(raw)
+        sts = cfg if isinstance(cfg, list) else (cfg.get("storages") or [])
+        per = None
+        for s in sts:
+            if (s.get("mount_path") or "").rstrip("/") == MOUNT.rstrip("/"):
+                per = s
+                break
+        if per is None:
+            for s in sts:
+                if "CloudTV" in (s.get("driver") or "") and "个人" in (s.get("mount_path") or ""):
+                    per = s
+                    break
+        if not per:
+            print("   (存储配置里没有匹配 %s 的挂载, 直连不可用)" % MOUNT)
+            return None, None
+        add = per.get("addition") or "{}"
+        if isinstance(add, str):
+            add = json.loads(add)
+        cli = ty189.Ty189(add.get("access_token") or "", add.get("family_id") or "", False)
+        d = cli.login()
+        fid = cli.resolve_dir(TY_DIR, mount=MOUNT)
+        log("直连就绪: %s -> folderId=%s" % (d.get("loginName"), fid))
+        return cli, fid
+    except Exception as e:
+        print("   !! 直连初始化失败: %s" % str(e)[:160])
+        return None, None
+
+
+def probe_ty189(cli, fid, dst_dir, mb=2):
+    """用 189 直连做一个 2MB 上传探针(用后即删), 验证这条路是否通"""
+    p = os.path.join(WORK, "_probe189.bin")
+    name = "__probe_upload_ty.bin"
+    try:
+        with open(p, "wb") as fh:
+            fh.write(os.urandom(mb * 1024 * 1024))
+        ok, msg = cli.upload(p, fid, name=name)
+    except Exception as e:
+        ok, msg = False, str(e)[:120]
+    finally:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        alist_remove(dst_dir, [name])
+    return ok, msg
+
+
+def upload_and_verify(local_file, name, size, dst, ctx):
+    """上传 + 校验。优先走 189 直连(带超时+断点续传), 失败再退回 OpenList PUT。
+
+    返回 (ok, 说明) —— 说明直接进报告。
+    """
+    if ctx and ctx[0] is not None:
+        cli, fid = ctx
+        t0 = time.time()
+        ok, msg = cli.upload(local_file, fid, name=name,
+                             log=lambda m: print(m, flush=True))
+        if ok:
+            # 用 189 自己的列表校验(OpenList 侧可能有缓存, 不能用来判刚传完的文件)
+            got = None
+            try:
+                for it in cli.list_files(fid):
+                    if (not it["is_dir"]) and it["name"] == name:
+                        got = it["size"]
+                        break
+            except Exception as e:
+                print("   189 校验列目录失败: %s" % str(e)[:90])
+            if got == size:
+                return True, "上传云盘 OK (189直连 %.1fMB/s)" % (size / 1048576 / max(time.time() - t0, 1e-6))
+            if got is None:
+                return True, "上传云盘 OK (189直连 %s; 列表未刷新)" % msg
+            return False, "189直连后校验不过: 目标 %s 期望 %s" % (got, size)
+        print("   !! 189直连失败(%s) -> 退回 OpenList PUT" % msg[:110])
+
+    t0 = time.time()
+    secs = alist_put(dst, local_file, size, os.path.basename(name)[:26])
+    got = alist_get(dst)
+    if got != size:
+        return False, "上传后校验不过: 目标 %s 期望 %s" % (got, size)
+    return True, "上传云盘 OK (%.1f MB/s)" % (size / max(secs, 1e-6) / 1048576)
+
+
 def split_parts(name, thresh):
     """>阈值时 gd-out2 切出来的两个分片名"""
     stem, ext = os.path.splitext(name)
@@ -285,14 +389,23 @@ def main():
     total_up = 0
     put_streak = 0          # 连续"零进展"的 PUT 次数(成功即清零); 用于熔断
     PUT_BREAK = 9           # 连续这么多次零进展 -> 判定通道不可用, 本轮提前收工
-                            # (thread=1 下仍有~半数文件会单发卡死, 别设太小, 免得误杀整轮)
     lines.append("---")
+
+    # 189 直连(带超时+断点续传) —— 这是上传主路径; OpenList PUT 只作退路
+    ctx = (None, None)
+    if a.apply:
+        ctx = ty189_open()
 
     # 0) 上传通道探针: 通道不通就整轮跳过, 别拿 3 小时预算去撞墙
     if a.apply and todo:
-        ok, info = probe_upload(TY_DIR, mb=8, timeout=180)
-        log("上传通道探针: %s" % ("可用" if ok else "不通 -> %s" % info))
-        lines.append("上传通道探针: %s" % ("可用" if ok else "不通(跳过本轮)"))
+        if ctx[0] is not None:
+            ok, info = probe_ty189(ctx[0], ctx[1], TY_DIR, mb=2)
+            tag = "189直连探针"
+        else:
+            ok, info = probe_upload(TY_DIR, mb=8, timeout=180)
+            tag = "OpenList探针"
+        log("上传通道%s: %s" % (tag, "可用" if ok else "不通 -> %s" % info))
+        lines.append("上传通道%s: %s" % (tag, "可用" if ok else "不通(跳过本轮)"))
         if not ok:
             lines.append("目标网盘上传通道当前不可用(探针失败), 本轮不做任何上传, 等下一轮")
             finish(lines, a)
@@ -348,17 +461,15 @@ def main():
                             "--stats-one-line"], timeout=1500)
                 if r.returncode != 0 or os.path.getsize(lp) != size:
                     raise RuntimeError("下载失败/大小不符 :: %s" % (r.stderr or "")[:120])
-                # 上传: 189/OpenList 侧会间歇性"零进展"卡死(收完首个包后不再读 body),
-                #   socket 超时 6 分钟兜住。因为它时好时坏 -> 同一文件多试几次;
-                #   每次失败都重下? 不用, 本地文件还在, 直接重传即可。
+                # 上传: 主路径 = 189 直连(自带 socket 超时 + 断点续传, 断了接着传);
+                #   退路 = OpenList PUT。整条链路会间歇性抽风 -> 同一文件再补几次即可。
                 dst = TY_DIR.rstrip("/") + "/" + name
-                secs, last_err = 0.0, ""
+                secs, last_err, note_up = 0.0, "", ""
                 for att in range(1, 4):
                     try:
-                        secs = alist_put(dst, lp, size, os.path.basename(name)[:26])
-                        got = alist_get(dst)
-                        if got != size:
-                            raise RuntimeError("上传后校验不过: 目标 %s 期望 %s" % (got, size))
+                        ok2, note_up = upload_and_verify(lp, name, size, dst, ctx)
+                        if not ok2:
+                            raise RuntimeError(note_up)
                         put_streak = 0
                         last_err = ""
                         break
@@ -378,7 +489,7 @@ def main():
                 up_n += 1
                 total_up += size
                 ty[name] = (size, False)
-                note = "上传云盘 OK (%.1f MB/s)" % (size / max(secs, 1e-6) / 1048576)
+                note = note_up or ("上传云盘 OK (%.1f MB/s)" % (size / max(secs, 1e-6) / 1048576))
             except Exception as e:
                 fail_n += 1
                 note = "上传失败(%.1fmin): %s" % ((time.time() - ft0) / 60, str(e)[:120])
