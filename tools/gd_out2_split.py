@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""GoogleDrive2/out -> OneDrive2/out2 (大文件对半切两半) + 源文件归档到 GoogleDrive2/out2
+"""源远端/out -> 中转远端/out2 (大文件对半切两半) + 源文件归档到 源远端/out2
 
 流程 (每轮分多个批次, 每批尽量写满 runner 的工作区):
-  1) 读 gdrive2:out 清单, 按剩余磁盘空间挑一批文件 (小文件优先)
+  1) 读 源远端:out 清单, 按剩余磁盘空间挑一批文件 (小文件优先)
   2) 一次性把这批下载到 runner (rclone --files-from, 多线程)
   3) 逐个处理:
-       <= 300MB : 直接上传 OneDrive2/out2, 校验大小
+       <= 300MB : 直接上传 中转远端/out2, 校验大小
        >  300MB : ffmpeg 无损对半切成 2 段, 命名 <原名去扩展>.part001/.part002.<ext>
                   -> 两段都上传并校验
-     上传校验通过 -> 源文件移入 gdrive2:out2 (归档) -> 删掉本地文件, 腾空间
+     上传校验通过 -> 源文件移入 源远端:out2 (归档) -> 删掉本地文件, 腾空间
   4) 这一批处理完, 重新按剩余空间挑下一批, 直到用完 --max-ops 或时间预算
 
 磁盘: 分批大小 = min(剩余空间 - 预留, --disk-budget-gb)。切分时源文件与分段同时在盘上,
@@ -18,7 +18,7 @@
   - 只允许 ffmpeg 无损切割真视频; 非视频/切不开 -> 跳过并记录, **绝不二进制切块**, 也绝不动源文件
   - 源文件只在"该传的东西都上传且校验成功"之后才移走
   - 默认演练 (--dry); --apply 才真动
-  - 每轮报告写到 onedrive2:dbqd/gd_out2_report.txt
+  - 每轮报告写到 中转远端:报告区/gd_out2_report.txt
 
 用法:
   python3 tools/gd_out2_split.py                       # 演练, 只看计划
@@ -36,12 +36,13 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-SRC = os.environ.get("GD_SRC", "gdrive2:out")
-DST = os.environ.get("GD_DST", "onedrive2:out2")
-ARCH = os.environ.get("GD_ARCH", "gdrive2:out2")
+import pathcfg          # 路径真值来自配置: CI=Secret PATHS_JSON, 本机=paths.local.json
+SRC = pathcfg.require("GD_SRC")
+DST = pathcfg.require("GD_DST")
+ARCH = pathcfg.require("GD_ARCH")
 WORK = os.environ.get("GD_WORK", "/tmp/gdout2")
-REPORT = os.environ.get("GD_REPORT", "onedrive2:dbqd/gd_out2_report.txt")
-FAILED = os.environ.get("GD_FAILED", "onedrive2:dbqd/gd_out2_failed.json")
+REPORT = pathcfg.require("GD_REPORT")
+FAILED = pathcfg.require("GD_FAILED")
 MAX_FAIL = 3                     # 同一文件连续失败这么多次就不再重试(防一个坏文件每轮占坑)
 VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv")
 GB = 1024 ** 3
@@ -101,7 +102,7 @@ def stat_size(path):
 
 
 def refresh_gd_token():
-    """跑 rclone 前刷新 gdrive2 的 access_token (见 tools/gd_token.py)"""
+    """跑 rclone 前刷新 源远端 的 access_token (见 tools/gd_token.py)"""
     try:
         import gd_token
         return gd_token.main() == 0
@@ -279,7 +280,7 @@ def main():
 
     lines = []
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    lines.append("# GoogleDrive2/out -> OneDrive2/out2 报告  %s UTC  [%s]"
+    lines.append("# 源远端/out -> 中转远端/out2 报告  %s UTC  [%s]"
                  % (ts, "执行模式" if a.apply else "演练模式(dry-run)"))
     lines.append("# 规则: >%dMB 对半切成两段; <=%dMB 直接上传; 上传校验通过后源文件移入 %s"
                  % (a.threshold_mb, a.threshold_mb, ARCH))
@@ -290,9 +291,9 @@ def main():
     lines.append("工作区 %s | 起始可用空间 %s | 预留 %s"
                  % (WORK, human(free_bytes()), human(reserve)))
 
-    # ---- 刷 GoogleDrive2 凭证 ----
+    # ---- 刷 源远端 凭证 ----
     if not refresh_gd_token():
-        lines.append("\n!! gd_token 刷新失败, 本轮中止 (GoogleDrive2 访问不了)")
+        lines.append("\n!! gd_token 刷新失败, 本轮中止 (源远端 访问不了)")
         finish(lines, "\n".join(lines))
         return 1
 
@@ -569,7 +570,7 @@ def main():
 
 
 def finish(lines, text):
-    """报告落盘 + 上传到 onedrive2:dbqd/"""
+    """报告落盘 + 上传到 中转远端:报告区/"""
     rp = os.path.join(WORK, "gd_out2_report.txt")
     try:
         with open(rp, "w", encoding="utf-8") as f:
@@ -588,4 +589,6 @@ def finish(lines, text):
 
 
 if __name__ == "__main__":
+    import logmask          # 日志脱敏: 文件名/路径 -> 短哈希(见 logmask.py)
+    logmask.install()
     sys.exit(main())
