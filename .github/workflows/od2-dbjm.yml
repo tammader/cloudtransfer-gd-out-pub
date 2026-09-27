@@ -1,15 +1,15 @@
 name: od2-dbjm
 
-# OneDrive2/out2 -> alist /dbjm 根目录   单向同步(不重复上传)
-#   跑法: 在 runner 上现装一份 OpenList(从 GitHub 下载发布包), 用它挂 豆包网盘 + Crypt(/dbjm),
-#         再从 onedrive2:out2 下载 -> 通过 runner 本地 alist 的 /api/fs/put 上传到 /dbjm。
-#   为什么这么绕: /dbjm 是本机 alist 上的 Crypt 盘(底层 /豆包网盘/jm), runner 直连不到本机;
-#                 而豆包驱动的 dpop_key_secret/ignore_jwt_check 字段只有 OpenList 有 -> 必须装 OpenList。
+# 中转远端/out2 -> alist /归档挂载 根目录   单向同步(不重复上传)
+#   跑法: 在 runner 上现装一份 OpenList(从 GitHub 下载发布包), 用它挂 上游网盘 + Crypt(/归档挂载),
+#         再从 中转远端:out2 下载 -> 通过 runner 本地 alist 的 /api/fs/put 上传到 /归档挂载。
+#   为什么这么绕: /归档挂载 是本机 alist 上的 Crypt 盘(底层 /上游网盘/jm), runner 直连不到本机;
+#                 而上游网盘驱动的 dpop_key_secret/ignore_jwt_check 字段只有 OpenList 有 -> 必须装 OpenList。
 #   去重: 目标已有同名同大小 -> 跳过上传; 同名不同大小 -> 记为冲突不覆盖(要覆盖用 --overwrite, 默认关)。
-#   删源(2026-09-25 加): 只要 /dbjm 里确认有同名且同大小的文件(刚传的 / 本来就在的), 就删掉 OneDrive2/out2 的源文件。
-#                        名字或大小对不上一律不删; OneDrive 侧进回收站可捞, 且原件在 gdrive2:out2 归档区一直有。
+#   删源(2026-09-25 加): 只要 /归档挂载 里确认有同名且同大小的文件(刚传的 / 本来就在的), 就删掉 中转远端/out2 的源文件。
+#                        名字或大小对不上一律不删; OneDrive 侧进回收站可捞, 且原件在 源远端:out2 归档区一直有。
 #                        想只搬不删 -> 手动触发时把 keep_src 设为 true。
-#   报告: onedrive2:dbqd/dbjm_sync_report.txt
+#   报告: 中转远端:报告区/归档挂载_sync_report.txt
 
 on:
   schedule:
@@ -37,7 +37,7 @@ on:
         required: false
         default: "200"
       keep_src:
-        description: "true=只搬不删(保留 OneDrive2/out2 源文件); 默认 false=确认到位后删源"
+        description: "true=只搬不删(保留 中转远端/out2 源文件); 默认 false=确认到位后删源"
         required: false
         default: "false"
       openlist_version:
@@ -51,6 +51,10 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
 
 jobs:
   od2-dbjm:
@@ -95,7 +99,7 @@ jobs:
           done
           curl -s -m 5 http://127.0.0.1:5244/api/public/settings | head -c 200; echo
 
-      - name: 灌入存储配置(豆包网盘 + Crypt /dbjm)
+      - name: 灌入存储配置(上游网盘 + Crypt /归档挂载)
         env:
           ALIST_STORAGES: ${{ secrets.ALIST_STORAGES }}
         run: |
@@ -119,7 +123,7 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: 跑同步 out2 -> /dbjm
+      - name: 跑同步 out2 -> /归档挂载
         env:
           APPLY: ${{ inputs.apply || 'true' }}
           MAX_OPS: ${{ inputs.max_ops || '20' }}
