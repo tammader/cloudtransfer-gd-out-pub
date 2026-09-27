@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""刷新 GoogleDrive2 的 access_token 并写回 rclone 配置
+"""刷新 源远端 的 access_token 并写回 rclone 配置
 
 为什么需要: rclone 不认"access_token 为空"的 token 配置(会报
   "token expired and there's no refresh token"), 所以跑 rclone 前先用
@@ -19,7 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-SEC = os.environ.get("GD_SEC", "gdrive2")
+import pathcfg          # 段名也不硬编码(CI=Secret / 本机=paths.local.json)
+SEC = pathcfg.require("GD_SEC")
 
 
 def _proxies():
@@ -96,4 +97,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import logmask          # 日志脱敏: 文件名/路径 -> 短哈希(见 logmask.py)
+    logmask.install()
     sys.exit(main())
