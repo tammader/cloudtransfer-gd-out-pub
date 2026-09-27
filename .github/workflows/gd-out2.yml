@@ -1,14 +1,14 @@
 name: gd-out2
 
-# GoogleDrive2/out -> OneDrive2/out2 (大文件对半切) + 源文件归档到 GoogleDrive2/out2
+# 源远端/out -> 中转远端/out2 (大文件对半切) + 源文件归档到 源远端/out2
 #   每 3 小时跑一次, 单轮处理的源文件总量控制在 4~5GB (--max-total-gb 5 / --min-total-gb 4)
 #   分批下载: 每批按 runner 剩余磁盘挑文件, 尽量写满工作区 (下完处理完再下下一批)
-#   <=300MB : 直接上传 OneDrive2/out2
+#   <=300MB : 直接上传 中转远端/out2
 #   > 300MB : ffmpeg 无损对半切 2 段(原名.part001/part002) 再上传
-#   上传校验通过后, 把 gdrive2:out 里的源文件移到 gdrive2:out2 (同盘服务端移动, 很快)
+#   上传校验通过后, 把 源远端:out 里的源文件移到 源远端:out2 (同盘服务端移动, 很快)
 #   非视频 / 切不开 -> 跳过并记录, 源文件保持原样; 绝不二进制切块
-# 报告 (含批次/跳过/失败明细): onedrive2:dbqd/gd_out2_report.txt
-# 连续失败清单: onedrive2:dbqd/gd_out2_failed.json (同一文件失败 3 次后本轮不再重试)
+# 报告 (含批次/跳过/失败明细): 中转远端:报告区/gd_out2_report.txt
+# 连续失败清单: 中转远端:报告区/gd_out2_failed.json (同一文件失败 3 次后本轮不再重试)
 
 on:
   # 每 3 小时 (UTC 0:30/3:30/.../21:30 = 北京 8:30/11:30/.../次日 5:30)
@@ -59,6 +59,10 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
 
 jobs:
   gd-out2:
