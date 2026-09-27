@@ -1,0 +1,141 @@
+name: od2-dbjm
+
+# OneDrive2/out2 -> alist /dbjm 根目录   单向同步(不重复上传)
+#   跑法: 在 runner 上现装一份 OpenList(从 GitHub 下载发布包), 用它挂 豆包网盘 + Crypt(/dbjm),
+#         再从 onedrive2:out2 下载 -> 通过 runner 本地 alist 的 /api/fs/put 上传到 /dbjm。
+#   为什么这么绕: /dbjm 是本机 alist 上的 Crypt 盘(底层 /豆包网盘/jm), runner 直连不到本机;
+#                 而豆包驱动的 dpop_key_secret/ignore_jwt_check 字段只有 OpenList 有 -> 必须装 OpenList。
+#   去重: 目标已有同名同大小 -> 跳过上传; 同名不同大小 -> 记为冲突不覆盖(要覆盖用 --overwrite, 默认关)。
+#   删源(2026-09-25 加): 只要 /dbjm 里确认有同名且同大小的文件(刚传的 / 本来就在的), 就删掉 OneDrive2/out2 的源文件。
+#                        名字或大小对不上一律不删; OneDrive 侧进回收站可捞, 且原件在 gdrive2:out2 归档区一直有。
+#                        想只搬不删 -> 手动触发时把 keep_src 设为 true。
+#   报告: onedrive2:dbqd/dbjm_sync_report.txt
+
+on:
+  schedule:
+    - cron: "15 */6 * * *"           # 每 6 小时 (UTC 1:15/7:15/13:15/19:15 = 北京 9:15/15:15/21:15/次日 3:15)
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真跑(下载+上传), false=只演练看计划"
+        required: false
+        default: "true"
+      max_ops:
+        description: "本轮最多上传几个文件"
+        required: false
+        default: "40"
+      budget_min:
+        description: "本轮时间预算(分钟)"
+        required: false
+        default: "300"
+      only:
+        description: "只同步这一个文件名(留空=整目录); 调试用"
+        required: false
+        default: ""
+      max_delete:
+        description: "本轮最多为多少个已在目标的文件删源"
+        required: false
+        default: "200"
+      keep_src:
+        description: "true=只搬不删(保留 OneDrive2/out2 源文件); 默认 false=确认到位后删源"
+        required: false
+        default: "false"
+      openlist_version:
+        description: "OpenList 版本 tag"
+        required: false
+        default: "v4.2.6"
+
+concurrency:
+  group: od2-dbjm
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  od2-dbjm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 装 OpenList(alist 分支版)
+        run: |
+          V="${{ inputs.openlist_version || 'v4.2.6' }}"
+          echo "下载 OpenList $V"
+          curl -sL "https://github.com/OpenListTeam/OpenList/releases/download/$V/openlist-linux-amd64.tar.gz" -o /tmp/ol.tar.gz
+          ls -la /tmp/ol.tar.gz
+          mkdir -p /opt/openlist && tar -xzf /tmp/ol.tar.gz -C /opt/openlist
+          chmod +x /opt/openlist/openlist
+          /opt/openlist/openlist version 2>&1 | head -3 || true
+
+      - name: 初始化 OpenList(设管理员密码)
+        run: |
+          cd /opt/openlist
+          PW="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          echo "ALIST_PW=$PW" >> $GITHUB_ENV
+          ./openlist admin set "$PW" --data /opt/openlist/data 2>&1 | tail -5
+          ls -la /opt/openlist/data
+
+      - name: 启动 OpenList
+        run: |
+          cd /opt/openlist
+          nohup ./openlist server --data /opt/openlist/data > /opt/openlist/alist.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -s -m 3 http://127.0.0.1:5244/api/public/settings >/dev/null; then echo "alist 已就绪 (第 ${i} 次探测)"; break; fi
+            sleep 2
+          done
+          curl -s -m 5 http://127.0.0.1:5244/api/public/settings | head -c 200; echo
+
+      - name: 灌入存储配置(豆包网盘 + Crypt /dbjm)
+        env:
+          ALIST_STORAGES: ${{ secrets.ALIST_STORAGES }}
+        run: |
+          printf '%s' "$ALIST_STORAGES" > /tmp/storages.json
+          echo "存储定义大小: $(wc -c < /tmp/storages.json) 字节"
+          python3 tools/alist_bootstrap.py --data-dir /opt/openlist/data \
+            --password "$ALIST_PW" --storages-file /tmp/storages.json --emit-env
+          if [ -z "$(grep -c ALIST_TOKEN $GITHUB_ENV 2>/dev/null)" ] || [ "$(grep -c ALIST_TOKEN $GITHUB_ENV)" = "0" ]; then
+            echo "== 走的是直写数据库的路子, 重启 alist 再登录 =="
+            pkill -f 'openlist server' || true
+            sleep 3
+            cd /opt/openlist && nohup ./openlist server --data /opt/openlist/data >> /opt/openlist/alist.log 2>&1 &
+            sleep 5
+            python3 tools/alist_bootstrap.py --login-only --password "$ALIST_PW" --emit-env
+          fi
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: 跑同步 out2 -> /dbjm
+        env:
+          APPLY: ${{ inputs.apply || 'true' }}
+          MAX_OPS: ${{ inputs.max_ops || '20' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '300' }}
+          ONLY: ${{ inputs.only || '' }}
+          MAX_DELETE: ${{ inputs.max_delete || '200' }}
+          KEEP_SRC: ${{ inputs.keep_src || 'false' }}
+          ALIST_URL: "http://127.0.0.1:5244"
+        run: |
+          set -x
+          ARGS="--max-ops $MAX_OPS --budget-min $BUDGET_MIN --max-delete $MAX_DELETE"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ "$KEEP_SRC" = "true" ]; then ARGS="$ARGS --keep-src"; fi
+          if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
+          python3 tools/out2_to_dbjm.py $ARGS
+
+      - name: 出错时贴 alist 日志
+        if: failure()
+        run: tail -60 /opt/openlist/alist.log || true
