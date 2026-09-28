@@ -49,6 +49,9 @@ def main():
     ap.add_argument("--purge-arch", action="store_true",
                     help="清理模式: 删掉归档区里'救援塞进去的原片'"
                          "(判据: 中转盘里存在它的 .part001 子片 —— 正常原件不会有这种情况)")
+    ap.add_argument("--copy-arch", action="store_true",
+                    help="拷贝模式: 把中转盘的文件逐个复制到归档区(多留一处备份; "
+                         "归档区由 out2-ty-sync 接手送天翼)")
     a = ap.parse_args()
     seg_bytes = a.seg_mb * MB
     os.makedirs(WORK, exist_ok=True)
@@ -56,13 +59,19 @@ def main():
     if a.purge_arch:
         lines = ["# 清理报告: 归档区里的'救援原片'  %s UTC  [%s]"
                  % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练")]
+    elif a.copy_arch:
+        lines = ["# 拷贝报告: 中转盘 -> 归档区(多留一处备份)  %s UTC  [%s]"
+                 % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练"),
+                 "# 规则: %s 里的文件逐个复制到 %s; 归档区由 out2-ty-sync 接手送天翼" % (SRC, ARCH)]
     else:
         lines = ["# 救援报告: 超上限旧分片 -> 再切一刀  %s UTC  [%s]"
                  % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练"),
                  "# 规则: >%dMB 的按 <=%dMB 切成 N 片 -> 新片回 %s; 原片 -> %s; 全部校验通过后删原片"
                  % (a.seg_mb, a.seg_mb, SRC, "不保留" if a.no_arch else ARCH)]
 
-    rname = "purge_arch_report.txt" if a.purge_arch else "rescue_parts_report.txt"
+    rname = ("purge_arch_report.txt" if a.purge_arch
+             else "copy_arch_report.txt" if a.copy_arch
+             else "rescue_parts_report.txt")
     report = OD + "/" + rname
 
     def finish(rc=0):
@@ -76,6 +85,45 @@ def main():
         r = rclone(["copyto", rp, report, "--retries", "2"], timeout=600)
         print("报告 -> %s: %s" % (report, "OK" if r.returncode == 0 else (r.stderr or "")[:90]))
         return rc
+
+    if a.copy_arch:
+        # 拷贝: 中转盘 -> 归档区 (逐个 copyto + 大小校验; 归档区已有同名同大小就跳过)
+        src = G.lsjson(SRC)
+        arch = G.lsjson(ARCH)
+        todo = [(n, s) for n, s in sorted(src.items()) if arch.get(n) != s]
+        lines.append("拷贝模式: %s 共 %d 个 | 归档区 %s 已有 %d 个 | 待拷 %d 个 (合计 %s)"
+                     % (SRC, len(src), ARCH, len(arch), len(todo),
+                        G.human(sum(s for _, s in todo))))
+        print(lines[1])
+        if not todo:
+            lines.append("没有需要拷贝的, 收工")
+            return finish()
+        if not a.apply:
+            for n, s in todo[:30]:
+                lines.append("  - [%s] %s" % (G.human(s), n))
+            if len(todo) > 30:
+                lines.append("  ... 另有 %d 个" % (len(todo) - 30))
+            lines.append("(演练) 以上 %d 个将复制到归档区; 加 --apply 才真拷" % len(todo))
+            return finish()
+        n_ok = n_fail = 0
+        for i, (n, s) in enumerate(todo, 1):
+            r = rclone(["copyto", "%s/%s" % (SRC, n), "%s/%s" % (ARCH, n),
+                        "--retries", "3", "--low-level-retries", "10", "--stats", "0"],
+                       timeout=3600)
+            got = G.stat_size("%s/%s" % (ARCH, n))
+            if r.returncode == 0 and got == s:
+                n_ok += 1
+                lines.append("[%d/%d][%s] %s -> OK" % (i, len(todo), G.human(s), n))
+            else:
+                n_fail += 1
+                lines.append("[%d/%d][%s] %s -> 失败 远端=%s %s"
+                             % (i, len(todo), G.human(s), n, got, (r.stderr or "")[:100]))
+            if i % 5 == 0:
+                print("   已拷 %d/%d (成功 %d 失败 %d)" % (i, len(todo), n_ok, n_fail))
+        lines.append("---")
+        lines.append("拷贝完成: 成功 %d | 失败 %d" % (n_ok, n_fail))
+        print(lines[-1])
+        return finish()
 
     if a.purge_arch:
         # 清理: 归档区里"和它的 .part001 子片同时在场"的文件 = 救援塞进去的原片
