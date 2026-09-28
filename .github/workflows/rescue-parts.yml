@@ -34,6 +34,10 @@ on:
         description: "true=清理模式: 删掉归档区里'救援塞进去的原片'(不再切分)"
         required: false
         default: "false"
+      copy_arch:
+        description: "true=拷贝模式: 把中转盘的文件复制到归档区(多留一处备份, 不再切分)"
+        required: false
+        default: "false"
 
 concurrency:
   group: rescue-parts
@@ -77,19 +81,21 @@ jobs:
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
           echo "配置里的远端: $(grep -c '^\[' ~/.config/rclone/rclone.conf) 段"
 
-      - name: 跑救援/清理
+      - name: 跑救援/清理/拷贝
         env:
           APPLY: ${{ inputs.apply || 'false' }}
           SEG_MB: ${{ inputs.seg_mb || '280' }}
           MAX_OPS: ${{ inputs.max_ops || '100' }}
           NO_ARCH: ${{ inputs.no_arch || 'false' }}
           PURGE: ${{ inputs.purge_arch || 'false' }}
+          COPY: ${{ inputs.copy_arch || 'false' }}
         run: |
           set -x
           ARGS="--seg-mb $SEG_MB --max-ops $MAX_OPS"
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
           if [ "$NO_ARCH" = "true" ]; then ARGS="$ARGS --no-arch"; fi
           if [ "$PURGE" = "true" ]; then ARGS="$ARGS --purge-arch"; fi
+          if [ "$COPY" = "true" ]; then ARGS="$ARGS --copy-arch"; fi
           python3 tools/rescue_parts.py $ARGS
 
       - name: 报剩余空间
