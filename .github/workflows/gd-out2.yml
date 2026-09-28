@@ -33,9 +33,13 @@ on:
         required: false
         default: "1000"
       threshold_mb:
-        description: "超过多少 MB 就对半切"
+        description: "超过多少 MB 就切片上传"
         required: false
         default: "300"
+      seg_mb:
+        description: "切片单片大小上限(MB); 下游豆包对单文件有 ~300MB 硬上限, 默认 280 留余量"
+        required: false
+        default: "280"
       disk_budget_gb:
         description: "每批磁盘上限(GB); 0=按剩余空间自动算(留 reserve_gb 余量)"
         required: false
@@ -107,13 +111,14 @@ jobs:
           MIN_TOTAL_GB: ${{ inputs.min_total_gb || '30' }}
           MAX_OPS: ${{ inputs.max_ops || '1000' }}
           THRESHOLD_MB: ${{ inputs.threshold_mb || '300' }}
+          SEG_MB: ${{ inputs.seg_mb || '280' }}
           DISK_BUDGET_GB: ${{ inputs.disk_budget_gb || '0' }}
           RESERVE_GB: ${{ inputs.reserve_gb || '2' }}
           BUDGET_MIN: ${{ inputs.budget_min || '310' }}
           ONLY: ${{ inputs.only || '' }}
         run: |
           set -x
-          ARGS="--max-ops $MAX_OPS --threshold-mb $THRESHOLD_MB"
+          ARGS="--max-ops $MAX_OPS --threshold-mb $THRESHOLD_MB --seg-mb $SEG_MB"
           ARGS="$ARGS --max-total-gb $MAX_TOTAL_GB --min-total-gb $MIN_TOTAL_GB"
           ARGS="$ARGS --disk-budget-gb $DISK_BUDGET_GB --reserve-gb $RESERVE_GB"
           ARGS="$ARGS --budget-min $BUDGET_MIN"
