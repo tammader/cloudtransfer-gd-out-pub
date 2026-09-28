@@ -317,21 +317,26 @@ def upload_and_verify(local_file, name, size, dst, ctx):
     return True, "上传云盘 OK (%.1f MB/s)" % (size / max(secs, 1e-6) / 1048576)
 
 
-def split_parts(name, thresh):
-    """>阈值时 gd-out2 切出来的两个分片名"""
-    stem, ext = os.path.splitext(name)
-    return stem + ".part001" + ext, stem + ".part002" + ext
-
-
 def dbjm_done(name, size, dbjm, thresh):
-    """dbjm 里算不算齐了"""
+    """dbjm 里算不算齐了。
+
+    gd-out2 会把 >阈值 的文件切成 N 片(每片 <=280MB, 段数不固定), 所以不能再只看
+    part001/part002 两片。判据两条:
+      ① 未切分: dbjm 里有同名同大小的文件;
+      ② 切过  : dbjm 里从 part001 起有一组片, 且这些片的大小之和 ≈ 原件大小(±5%)
+                —— 缺任意一片总和对不上, 所以能可靠挡住"缺片就当齐了去归档"。
+    """
     hit = dbjm.get(name)
     if hit and not hit[1] and hit[0] == size:
         return True
     if size > thresh:
-        a, b = split_parts(name, thresh)
-        x, y = dbjm.get(a), dbjm.get(b)
-        return bool(x and y and not x[1] and not y[1])
+        stem, ext = os.path.splitext(name)
+        pre = stem + ".part"
+        segs = {k: v[0] for k, v in dbjm.items()
+                if k.startswith(pre) and k.endswith(ext) and not v[1]}
+        if not segs or (stem + ".part001" + ext) not in segs:
+            return False
+        return abs(sum(segs.values()) - size) <= max(size * 0.05, 1048576)
     return False
 
 
