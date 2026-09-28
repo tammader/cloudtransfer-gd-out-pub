@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""源远端/out -> 中转远端/out2 (大文件对半切两半) + 源文件归档到 源远端/out2
+"""源远端/out -> 中转远端/out2 (大文件按 <=280MB 切成 N 片) + 源文件归档到 源远端/out2
 
 流程 (每轮分多个批次, 每批尽量写满 runner 的工作区):
   1) 读 源远端:out 清单, 按剩余磁盘空间挑一批文件 (小文件优先)
   2) 一次性把这批下载到 runner (rclone --files-from, 多线程)
   3) 逐个处理:
        <= 300MB : 直接上传 中转远端/out2, 校验大小
-       >  300MB : ffmpeg 无损对半切成 2 段, 命名 <原名去扩展>.part001/.part002.<ext>
-                  -> 两段都上传并校验
+       >  300MB : ffmpeg 无损按 <=280MB 切成 N 段, 命名 <原名去扩展>.part001...partNNN.<ext>
+                  -> 每段都上传并校验 (段必须 <= 上限, 超标就缩短段时长重切)
      上传校验通过 -> 源文件移入 源远端:out2 (归档) -> 删掉本地文件, 腾空间
   4) 这一批处理完, 重新按剩余空间挑下一批, 直到用完 --max-ops 或时间预算
 
@@ -27,6 +27,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -175,32 +176,46 @@ def _seg_once(src_path, stem, ext, seg_time):
     return sorted(glob.glob(glob.escape(os.path.join(WORK, stem)) + ".part???" + ext))
 
 
-def split_half(src_path, stem, ext):
-    """ffmpeg 无损对半切 -> [part1, part2]; 切不出正好 2 段就返回 []
+def split_max(src_path, stem, ext, max_bytes):
+    """ffmpeg 无损切成 N 段, 保证每段 <= max_bytes(切点仍落在关键帧上, -c copy 不重编码)。
 
-    说明: 用 segment muxer 切(切点落在关键帧上), 试几个相邻切点直到正好得到 2 段。
-    -c copy 不做编码, 段是能直接播放的真视频。
+    为什么不再"对半切": 中转盘 out2 的唯一去向(豆包 /dbjm)对**单文件**有 ~300MB 硬上限,
+    源文件 >600MB 时对半切出来的两段各自仍 >300MB -> 两段都永远传不进 /dbjm,
+    连带 gdrive2:out2 里的原件也永远归档不了。
+    这里按 ceil(大小 / max_bytes) 算段数, 切完校验每段 <= max_bytes;
+    关键帧不均匀导致某段超标就按 0.9 缩短段时长重试(最多 6 次)。
+    返回段路径列表(按名排序); 切不出合格结果返回 []。
     """
     dur = _dur(src_path)
     if dur < 2:
         print("    !! 时长异常(%.1fs), 放弃切割" % dur)
         return []
-    base = int(dur / 2)
-    for cand in (base, base + 1, base - 1, base + 2, base - 2, base + 3):
-        if cand < 1:
-            continue
+    size = local_size(src_path)
+    want = max(2, int(math.ceil(size / float(max_bytes))))
+    seg = dur / want
+    for _ in range(6):
+        if seg < 1:
+            break
         try:
-            parts = _seg_once(src_path, stem, ext, cand)
+            parts = _seg_once(src_path, stem, ext, seg)
         except Exception as e:
-            print("    !! ffmpeg 切割失败(seg=%s): %s" % (cand, str(e)[:70]))
+            print("    !! ffmpeg 切割失败(seg=%.1fs): %s" % (seg, str(e)[:70]))
+            seg *= 0.9
             continue
-        if len(parts) == 2:
-            print("    切点 %ss (时长 %.1fs): %s" % (cand, dur, " + ".join(
-                "%.0f MB" % (os.path.getsize(p) / 1048576) for p in parts)))
-            return parts
-        print("    (切点 %ss 得到 %d 段, 换切点再试)" % (cand, len(parts)))
+        if len(parts) >= 2:
+            sizes = [local_size(p) for p in parts]
+            over = [s for s in sizes if s > max_bytes]
+            if not over:
+                print("    %d 段 (seg≈%.1fs): %s" % (
+                    len(parts), seg, " + ".join("%.0f MB" % (s / 1048576) for s in sizes)))
+                return parts
+            print("    (seg≈%.1fs -> %d 段, 其中 %d 段超 %.0fMB, 缩短重试)"
+                  % (seg, len(parts), len(over), max_bytes / 1048576))
+        else:
+            print("    (seg≈%.1fs 只切出 %d 段, 缩短重试)" % (seg, len(parts)))
         for p in parts:
             rm(p)
+        seg *= 0.9
     return []
 
 
@@ -257,7 +272,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="真动; 不加则只演练")
     ap.add_argument("--max-ops", type=int, default=200, help="本轮最多处理多少个源文件")
-    ap.add_argument("--threshold-mb", type=int, default=300, help="超过该大小就对半切")
+    ap.add_argument("--threshold-mb", type=int, default=300, help="超过该大小就切片上传")
+    ap.add_argument("--seg-mb", type=int, default=280,
+                    help="切片单片上限(MB); 下游豆包对单文件有 ~300MB 硬上限, 留 20MB 余量")
     ap.add_argument("--budget-min", type=int, default=310, help="本轮时间预算(分钟), 到点收工")
     ap.add_argument("--max-total-gb", type=float, default=5.0,
                     help="本轮处理的源文件总量上限(GB), 到了就收工")
@@ -270,6 +287,7 @@ def main():
     ap.add_argument("--only", default="", help="只处理指定文件名(调试用)")
     a = ap.parse_args()
     thresh = a.threshold_mb * 1024 ** 2
+    seg_bytes = a.seg_mb * 1024 ** 2
     budget_s = a.budget_min * 60
     reserve = int(a.reserve_gb * GB)
     max_total = int(a.max_total_gb * GB)
@@ -282,10 +300,10 @@ def main():
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     lines.append("# 源远端/out -> 中转远端/out2 报告  %s UTC  [%s]"
                  % (ts, "执行模式" if a.apply else "演练模式(dry-run)"))
-    lines.append("# 规则: >%dMB 对半切成两段; <=%dMB 直接上传; 上传校验通过后源文件移入 %s"
-                 % (a.threshold_mb, a.threshold_mb, ARCH))
-    print("rclone 配置: %s | ffmpeg: %s | 阈值 %dMB | 上限 %d 个/轮 | 本轮总量 %.1f~%.1f GB | 每批磁盘上限 %s"
-          % (CONF, FFMPEG, a.threshold_mb, a.max_ops, a.min_total_gb, a.max_total_gb,
+    lines.append("# 规则: >%dMB 按 <=%dMB 切成 N 片; <=%dMB 直接上传; 上传校验通过后源文件移入 %s"
+                 % (a.threshold_mb, a.seg_mb, a.threshold_mb, ARCH))
+    print("rclone 配置: %s | ffmpeg: %s | 阈值 %dMB(单片<=%dMB) | 上限 %d 个/轮 | 本轮总量 %.1f~%.1f GB | 每批磁盘上限 %s"
+          % (CONF, FFMPEG, a.threshold_mb, a.seg_mb, a.max_ops, a.min_total_gb, a.max_total_gb,
              ("%.1f GB" % a.disk_budget_gb) if a.disk_budget_gb else "自动(剩余-%.1fGB)" % a.reserve_gb))
     print("工作区: %s | 可用空间 %s" % (WORK, human(free_bytes())))
     lines.append("工作区 %s | 起始可用空间 %s | 预留 %s"
@@ -436,28 +454,30 @@ def main():
                                 r.returncode, got_sz, size, (r.stderr or "")[:120])
                             ok = False
                 else:
-                    # ---- 大文件: 对半切 ----
+                    # ---- 大文件: 按 <= seg_mb 切成 N 片 (下游豆包对单文件有 ~300MB 硬上限) ----
                     ext = os.path.splitext(name)[1].lower()
                     if ext not in VIDEO_EXT:
                         note = ">阈值但非视频, 不切割不上传 (源文件保持原样)"
                         ok = False
                     else:
                         stem = os.path.splitext(name)[0]
-                        pa, pb = stem + ".part001" + ext, stem + ".part002" + ext
-                        if dst.get(pa) and dst.get(pb):
-                            note = "两半都已在 out2, 跳过上传"
+                        have = {k: v for k, v in dst.items()
+                                if k.startswith(stem + ".part") and k.endswith(ext)}
+                        if have and (stem + ".part001" + ext) in have \
+                                and abs(sum(have.values()) - size) <= size * 0.05:
+                            note = "分片已都在 out2 (%d 片), 跳过上传" % len(have)
                             ok = True
                             n_already += 1
                         elif not a.apply:
-                            note = "(演练) 将对半切成 %s / %s 后上传" % (pa, pb)
+                            note = "(演练) 将按 <=%dMB 切片上传: %s.part001%s ..." % (
+                                a.seg_mb, stem, ext)
                             ok = True
                         else:
-                            print("\n[%s] ✂ 对半切: %s" % (human(size), name))
-                            parts = split_half(lp, stem, ext)
+                            print("\n[%s] ✂ 按 <=%dMB 切片: %s" % (human(size), a.seg_mb, name))
+                            parts = split_max(lp, stem, ext, seg_bytes)
                             total_p = sum(local_size(p) for p in parts)
-                            if (len(parts) != 2
-                                    or any(local_size(p) < size * 0.05 for p in parts)
-                                    or any(local_size(p) > size * 0.98 for p in parts)
+                            if (len(parts) < 2
+                                    or any(local_size(p) > seg_bytes for p in parts)
                                     or abs(total_p - size) > size * 0.05):
                                 note = ("切割结果异常: %s 段, 合计 %s / 原 %s"
                                         % (len(parts), human(total_p), human(size)))
@@ -473,7 +493,7 @@ def main():
                                     ups.append((bn, rr.returncode == 0 and got_sz == local_size(p),
                                                 local_size(p), got_sz))
                                 if all(u[1] for u in ups):
-                                    note = "对半切并上传 OK: " + " + ".join(
+                                    note = "切片并上传 OK (%d 片): " % len(ups) + " + ".join(
                                         "%s(%s)" % (u[0], human(u[2])) for u in ups)
                                     ok = True
                                     n_up_split += 1
@@ -538,7 +558,7 @@ def main():
 
     remain = len(src) - n_arch
     lines.append("\n---")
-    lines.append("本轮 %d 批 | 处理 %d 个 | 小文件直传 %d | 对半切上传 %d | 已在目标 %d | 归档源文件 %d | 跳过 %d | 失败 %d"
+    lines.append("本轮 %d 批 | 处理 %d 个 | 小文件直传 %d | 切片上传 %d | 已在目标 %d | 归档源文件 %d | 跳过 %d | 失败 %d"
                  % (batch_no, done, n_up_small, n_up_split, n_already, n_arch,
                     len(skipped), len(failed)))
     lines.append("本轮处理总量 %s (%.2f GB) | 目标 %.1f~%.1f GB | %s"
