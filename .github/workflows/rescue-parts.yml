@@ -1,0 +1,91 @@
+name: rescue-parts
+
+# 🚑 临时救援 (一次性): 把中转盘 out2 里"超过单片上限"的旧分片再切一刀,
+#    让它们能进归档盘(豆包 /dbjm 有 ~300MB 单文件硬上限, 超了就报 90001043)。
+#
+#    流程: 下载 -> 按 <=seg_mb 无损切成 N 片 -> 新片回 out2(交给 od2-dbjm)
+#          -> 原片送 out2 归档区(交给 out2-ty-sync 送天翼)
+#          -> 全部校验通过后删掉 out2 里的原片(进回收站, 可捞)
+#    命名 <原名去扩展>.part001...partNNN.<ext>, 能被现有分片判定直接认出, 不用改别的代码。
+#
+#    默认演练(apply=false 只看清单); 跑完确认无误后可以把这个 workflow 删掉。
+#    背景与细节见 tools/rescue_parts.py 头部注释。
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真跑(切分+上传+删原片), false=只演练看清单"
+        required: false
+        default: "false"
+      seg_mb:
+        description: "新分片的单片大小上限(MB)"
+        required: false
+        default: "280"
+      max_ops:
+        description: "本轮最多处理几个文件"
+        required: false
+        default: "100"
+      no_arch:
+        description: "true=原片不送归档区(中间片不保留, 只留切出来的新片)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: rescue-parts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 确认 ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          echo "配置里的远端: $(grep -c '^\[' ~/.config/rclone/rclone.conf) 段"
+
+      - name: 跑救援
+        env:
+          APPLY: ${{ inputs.apply || 'false' }}
+          SEG_MB: ${{ inputs.seg_mb || '280' }}
+          MAX_OPS: ${{ inputs.max_ops || '100' }}
+          NO_ARCH: ${{ inputs.no_arch || 'false' }}
+        run: |
+          set -x
+          ARGS="--seg-mb $SEG_MB --max-ops $MAX_OPS"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ "$NO_ARCH" = "true" ]; then ARGS="$ARGS --no-arch"; fi
+          python3 tools/rescue_parts.py $ARGS
+
+      - name: 报剩余空间
+        if: always()
+        run: df -h / /tmp 2>/dev/null || df -h /
