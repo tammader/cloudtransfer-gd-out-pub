@@ -30,7 +30,7 @@ import gd_out2_split as G           # noqa: E402  复用 rclone 封装 + split_m
 
 SRC = pathcfg.require("DBJM_SRC")           # 中转盘 out2 (卡住的分片都在这儿)
 ARCH = pathcfg.require("GD_ARCH")           # 源远端 out2 (原片归档区)
-REPORT = pathcfg.require("GM_OD") + "/rescue_parts_report.txt"
+OD = pathcfg.require("GM_OD")               # 报告区
 WORK = G.WORK
 MB = 1048576
 
@@ -46,26 +46,74 @@ def main():
     ap.add_argument("--max-ops", type=int, default=100, help="本轮最多处理几个")
     ap.add_argument("--no-arch", action="store_true",
                     help="不把原片送到归档区(中间片不保留, 只留切出来的新片)")
+    ap.add_argument("--purge-arch", action="store_true",
+                    help="清理模式: 删掉归档区里'救援塞进去的原片'"
+                         "(判据: 中转盘里存在它的 .part001 子片 —— 正常原件不会有这种情况)")
     a = ap.parse_args()
     seg_bytes = a.seg_mb * MB
     os.makedirs(WORK, exist_ok=True)
 
-    lines = ["# 救援报告: 超上限旧分片 -> 再切一刀  %s UTC  [%s]"
-             % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练"),
-             "# 规则: >%dMB 的按 <=%dMB 切成 N 片 -> 新片回 %s; 原片 -> %s; 全部校验通过后删原片"
-             % (a.seg_mb, a.seg_mb, SRC, "不保留" if a.no_arch else ARCH)]
+    if a.purge_arch:
+        lines = ["# 清理报告: 归档区里的'救援原片'  %s UTC  [%s]"
+                 % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练")]
+    else:
+        lines = ["# 救援报告: 超上限旧分片 -> 再切一刀  %s UTC  [%s]"
+                 % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练"),
+                 "# 规则: >%dMB 的按 <=%dMB 切成 N 片 -> 新片回 %s; 原片 -> %s; 全部校验通过后删原片"
+                 % (a.seg_mb, a.seg_mb, SRC, "不保留" if a.no_arch else ARCH)]
+
+    rname = "purge_arch_report.txt" if a.purge_arch else "rescue_parts_report.txt"
+    report = OD + "/" + rname
 
     def finish(rc=0):
         txt = "\n".join(lines) + "\n"
-        rp = os.path.join(WORK, "rescue_parts_report.txt")
+        rp = os.path.join(WORK, rname)
         try:
             with io.open(rp, "w", encoding="utf-8") as f:
                 f.write(txt)
         except Exception as e:
             print("!! 报告落盘失败: %s" % str(e)[:80])
-        r = rclone(["copyto", rp, REPORT, "--retries", "2"], timeout=600)
-        print("报告 -> %s: %s" % (REPORT, "OK" if r.returncode == 0 else (r.stderr or "")[:90]))
+        r = rclone(["copyto", rp, report, "--retries", "2"], timeout=600)
+        print("报告 -> %s: %s" % (report, "OK" if r.returncode == 0 else (r.stderr or "")[:90]))
         return rc
+
+    if a.purge_arch:
+        # 清理: 归档区里"和它的 .part001 子片同时在场"的文件 = 救援塞进去的原片
+        # (正常原件只会被切出一层 .partNNN 放在中转盘; 这里的 X 有 X.part001 子片, 说明 X 本身被再切过)
+        arch = G.lsjson(ARCH)
+        src = G.lsjson(SRC)
+        victims = []
+        for n in sorted(arch):
+            stem, ext = os.path.splitext(n)
+            if (stem + ".part001" + ext) in src:
+                victims.append((n, arch[n]))
+        lines.append("清理模式: 归档区 %s 共 %d 个文件 | 中转盘 %s 共 %d 个"
+                     % (ARCH, len(arch), SRC, len(src)))
+        lines.append("判定为'救援原片'的 %d 个:" % len(victims))
+        for n, s in victims:
+            lines.append("  - [%s] %s" % (G.human(s), n))
+        print(lines[1])
+        for l in lines[2:]:
+            print("   " + l)
+        if not victims:
+            lines.append("没有需要清理的, 收工")
+            return finish()
+        if not a.apply:
+            lines.append("(演练) 以上 %d 个将从归档区删除; 加 --apply 才真删" % len(victims))
+            return finish()
+        ok = fail = 0
+        for n, s in victims:
+            r = rclone(["deletefile", "%s/%s" % (ARCH, n), "--retries", "3"], timeout=600)
+            if r.returncode == 0:
+                ok += 1
+                lines.append("  已删除: %s" % n)
+            else:
+                fail += 1
+                lines.append("  删除失败: %s -> %s" % (n, (r.stderr or "")[:110]))
+        lines.append("---")
+        lines.append("清理完成: 成功 %d | 失败 %d" % (ok, fail))
+        print(lines[-1])
+        return finish()
 
     listing = G.lsjson(SRC)
     todo = [(n, s) for n, s in sorted(listing.items(), key=lambda kv: kv[1]) if s > seg_bytes]
