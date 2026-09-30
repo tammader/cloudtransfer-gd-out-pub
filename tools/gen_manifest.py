@@ -3,7 +3,7 @@
 
 复刻本机 export_compare.py 的产出, 让云端流水线不再依赖本机:
   1) /目标网盘/out2 + /副网盘/out2 的编号      -> 中转远端:报告区/compare_stems.txt
-  2) /目标网盘/out2 名字+大小                    -> 中转远端:报告区/ty_out.tsv
+  2) /目标网盘/out2(+副网盘/out2) 名字+大小      -> 中转远端:报告区/ty_out.tsv   (可多目录合并)
   3) /目标网盘/TG目录 名字+大小          -> 中转远端:报告区/ty_tg.tsv
   4) 本轮结果                                    -> 中转远端:报告区/gen_manifest_report.txt
 
@@ -26,6 +26,9 @@ OD_DIR = pathcfg.require("GM_OD")
 # 编号清单覆盖的目录 (逗号分隔的 alist 路径)
 STEM_DIRS = pathcfg.require("GM_STEM_DIRS")
 # 带大小清单: (alist 路径, 输出文件名)
+#   路径支持**逗号分隔多目录** -> 合并成一份, 先列到的目录优先(同名不覆盖)。
+#   为什么要多目录: 主网盘空间不够, 会不断把 out2 的文件挪到副网盘/out2;
+#   清单只扫一个目录的话, 被挪走的文件在消费方(out-sync)眼里就"天翼没有" -> 重复上传回源。
 SIZE_MANIFESTS = [
     (pathcfg.require("GM_TY_OUT"), "ty_out.tsv"),
     (pathcfg.require("GM_TY_TG"), "ty_tg.tsv"),
@@ -121,22 +124,42 @@ def main():
     ok_stem = upload(tmp, OD_DIR + "/compare_stems.txt", "compare_stems.txt")
     log("  编号 %d 个 -> %s/compare_stems.txt (%s)" % (len(have), OD_DIR, ", ".join(parts)))
 
-    # 带大小清单
+    # 带大小清单: 一个 spec 可含多个目录(逗号分隔) -> 合并成一份, 先列到的目录优先
     size_desc = []
-    for remote, fname in SIZE_MANIFESTS:
+    for spec, fname in SIZE_MANIFESTS:
+        dirs = [d.strip() for d in spec.split(",") if d.strip()]
         try:
-            items = alist_list(remote)
-            rows = ["%s\t%d" % (n, s) for (n, s, isd) in items if not isd]
+            merged, per, conf = {}, [], []
+            for d in dirs:
+                cnt = 0
+                for (n, s, isd) in alist_list(d):
+                    if isd:
+                        continue
+                    cnt += 1
+                    if n in merged:
+                        # 两个目录都有同名: 大小一致=正常镜像; 不一致要告警, 别静默取一个
+                        if merged[n] != s:
+                            conf.append("%s(%d vs %d)" % (n, merged[n], s))
+                        continue
+                    merged[n] = s
+                per.append("%s %d 个" % (d, cnt))
+            rows = ["%s\t%d" % (n, merged[n]) for n in sorted(merged)]
             tf = "/tmp/gen_" + fname
             io.open(tf, "w", encoding="utf-8").write(
                 "# %s 清单 (名字<TAB>字节) 更新: %s\n"
-                % (remote, time.strftime("%Y-%m-%d %H:%M:%S")) + "\n".join(rows) + "\n")
+                "# 来源目录: %s\n"
+                % (spec, time.strftime("%Y-%m-%d %H:%M:%S"), ", ".join(dirs))
+                + "\n".join(rows) + "\n")
             ok = upload(tf, OD_DIR + "/" + fname, fname)
             size_desc.append("%s %s %d 条" % (fname, "OK" if ok else "FAIL", len(rows)))
-            log("  %-12s -> %s %d 条 (%s)" % (fname, OD_DIR, len(rows), "OK" if ok else "FAIL"))
+            log("  %-12s -> %s %d 条 (%s) [%s]"
+                % (fname, OD_DIR, len(rows), "OK" if ok else "FAIL", "; ".join(per)))
+            if conf:
+                problems.append("%s 同名不同大小 %d 条: %s"
+                                % (fname, len(conf), "; ".join(conf[:5])))
         except Exception as e:
             size_desc.append("%s 异常" % fname)
-            problems.append("%s: %s" % (remote, str(e)[:90]))
+            problems.append("%s: %s" % (spec, str(e)[:90]))
             log("  !! %s 导出异常: %s" % (fname, str(e)[:90]))
 
     # 报告
