@@ -3,7 +3,9 @@
 
 规则:
   1) 单向同步: 把 源远端:out2 里的文件传到 目标网盘/out2 (同名同大小则跳过, 源文件不动)
-  2) 完成判定: 同一个文件在 **目标网盘/out2** 和 **/归档挂载** 都齐了, 就把 源远端:out2 里的它
+     判定"已有"时会同时看 `OT_TY_CHECK` 里的**所有目录**(缺省=OT_TY): 只要任一目录有同名同大小
+     就算已归档 —— 因为目标盘空间不够, 会把已经落地的文件挪到镜像盘, 只看一个目录会导致重传。
+  2) 完成判定: 同一个文件在 **目标网盘(任一判重目录)/** 和 **/归档挂载** 都齐了, 就把 源远端:out2 里的它
      `moveto` 到 **源远端:out3** (同盘服务端移动, 秒完成) —— 等于"这条文件走完了全流程"
   3) dbjm 里是 gd-out2 切过的分片, 所以判定要分两种:
        <= 阈值(默认300MB): dbjm 里有同名同大小
@@ -34,8 +36,12 @@ try:
 except Exception:                                 # pragma: no cover
     ty189 = None
 SRC = pathcfg.require("OT_SRC")
-TY_DIR = pathcfg.require("OT_TY")
+TY_DIR = pathcfg.require("OT_TY")                 # 上传目标 —— **必须单值**(要拼路径)
 MOUNT = "/" + TY_DIR.strip("/").split("/")[0]     # 目的网盘在 alist 里的挂载名(从配置推)
+# 判"云盘已有"时要一起看的目录(逗号多值; 缺省 = TY_DIR)。
+# 为什么需要: 个人云空间不够, 会把 个人/out2 的文件不断挪到 家庭/out2; 只看 TY_DIR 的话,
+# 被挪走的文件下一轮就被判"没有" -> 从源重传(又把个人云塞满)。TY_DIR 仍保持单值。
+TY_CHECK_DIRS = [x.strip() for x in (pathcfg.get("OT_TY_CHECK") or TY_DIR).split(",") if x.strip()]
 DBJM_DIR = pathcfg.require("OT_DBJM")
 ARCH = pathcfg.require("OT_ARCH")
 ALIST = os.environ.get("ALIST_URL", "http://127.0.0.1:5244")
@@ -384,11 +390,18 @@ def main():
     except Exception as e:
         log("!! gd_token 异常: %s" % str(e)[:120])
 
-    # 列目录(源 / 目标网盘 / 归档区)。跨境链路抖动是常态(189 listFiles 超时 -> alist 回 500),
+    # 列目录(源 / 判重目录们 / 归档区)。跨境链路抖动是常态(189 listFiles 超时 -> alist 回 500),
     # 列不动就本轮优雅跳过: 不处理任何文件、不动任何源文件, 正常退出, 交给下一轮自动重试。
+    # "云盘已有" 判定 = TY_CHECK_DIRS 里**任一目录**有同名同大小(通常是 目标盘/out2 + 镜像盘/out2,
+    # 两个都算已归档; 前面的目录优先)。这样把文件从目标盘挪到镜像盘后不会被重传。
     try:
         src = lsjson(SRC)
-        ty = alist_list(TY_DIR)
+        ty, ty_parts = {}, []
+        for d in TY_CHECK_DIRS:
+            part = alist_list(d)
+            ty_parts.append("%s %d" % (d, len(part)))
+            for n, v in part.items():
+                ty.setdefault(n, v)
         db = alist_list(DBJM_DIR)
     except Exception as e:
         lines.append("[跳过] 列目录失败(链路抖动?): %s" % str(e)[:200])
@@ -397,8 +410,10 @@ def main():
         print(lines[-1], flush=True)
         finish(lines, a)
         return 0
-    log("源 %s: %d 个文件 | 云盘 %s: %d | dbjm: %d" % (SRC, len(src), TY_DIR, len(ty), len(db)))
-    lines.append("源 %s %d 个 | %s %d 个 | %s %d 个" % (SRC, len(src), TY_DIR, len(ty), DBJM_DIR, len(db)))
+    log("源 %s: %d 个文件 | 判重目录 %s -> 合并 %d | %s: %d"
+        % (SRC, len(src), "; ".join(ty_parts), len(ty), DBJM_DIR, len(db)))
+    lines.append("源 %s %d 个 | 判重目录 %s = %d 个 | %s %d 个"
+                 % (SRC, len(src), "; ".join(ty_parts), len(ty), DBJM_DIR, len(db)))
 
     if a.apply:
         r = rclone(["mkdir", ARCH])
