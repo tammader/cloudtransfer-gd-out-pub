@@ -1,0 +1,70 @@
+name: in-dedup
+
+# 上游盘 /in 的**跨系统判重** -> 已归档的移出 /out, 其余写成"待下载清单"
+#   为什么需要: 清理流程只做 /in **内部**去重(同编号保最大), 它不读清单、不看目标盘;
+#   本流程判断"这个编号是不是已经落在目标侧任何一个 out 区"(实时列 + 云端编号清单),
+#   已经归档的就不必再下载/切分/上传 -> 直接从 /in 移出 /out; 剩下的写进待下载清单,
+#   交给手机端去 下载 -> 切分 -> 上传。
+#
+#   ⚠️ 排在 gen-manifest 之后 20 分钟跑(0 */3 + 20), 尽量用新的编号清单;
+#      /in 里还带杂质前缀的文件(站点名+@+编号)靠"编号级"兜底, 不会重复下载。
+#
+#   依赖: rclone(中转远端) + 上游盘直连(Secrets HALAL_CLIENT_ID/SECRET/REFRESH_TOKEN)
+#   默认演练(--dry), schedule 走执行模式。产出(中转远端:报告区/): 待下载清单 TSV + 报告
+
+on:
+  schedule:
+    - cron: "20 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真移动并上传清单, false=只演练"
+        required: false
+        default: "false"
+      max_ops:
+        description: "本轮最多移出几个"
+        required: false
+        default: "800"
+
+concurrency:
+  group: in-dedup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+
+jobs:
+  dedup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          rclone version | head -1
+
+      - name: 跨系统判重 -> 待下载清单
+        env:
+          HALAL_CLIENT_ID: ${{ secrets.HALAL_CLIENT_ID }}
+          HALAL_CLIENT_SECRET: ${{ secrets.HALAL_CLIENT_SECRET }}
+          HALAL_REFRESH_TOKEN: ${{ secrets.HALAL_REFRESH_TOKEN }}
+          APPLY: ${{ inputs.apply || 'true' }}
+          MAX_OPS: ${{ inputs.max_ops || '800' }}
+        run: |
+          set -x
+          ARGS="--max-ops $MAX_OPS --budget-min 20"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          python3 tools/in_dedup.py $ARGS
