@@ -349,4 +349,9 @@ def main():
 
 
 if __name__ == "__main__":
+    try:
+        import logmask              # 日志脱敏: 文件名/路径/盘名 -> 中性代号(见 logmask.py)
+        logmask.install()
+    except Exception:
+        pass
     sys.exit(main())
