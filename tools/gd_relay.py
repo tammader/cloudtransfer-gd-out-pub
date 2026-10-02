@@ -162,8 +162,8 @@ def main():
     lines = ["# 跨网盘中转报告 %s UTC  [%s]" % (time.strftime("%Y-%m-%d %H:%M:%S"),
                                                 "执行模式" if a.apply else "演练模式(dry-run)"),
              "# 模式: %s (%s)" % (a.mode, m["title"]),
-             "# 规则: 目标端「同名同大小」才算成功; 成功后才%s源文件" %
-             ("删除" if m["on_success"] == "delete" else "移动到 %s" % ARCH)]
+             "# 规则: 目标端「同名同大小」才算成功; 送达后才处理源文件(%s)" %
+             ("删除" if m["on_success"] == "delete" else "移到 %s" % ARCH)]
     log("模式 %s | %s -> %s" % (a.mode, SRC, DST))
     if SUFFIX:
         log("只处理名字含 %r 的文件" % SUFFIX)
