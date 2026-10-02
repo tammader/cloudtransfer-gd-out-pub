@@ -1,0 +1,42 @@
+name: tg-control
+
+# Telegram 命令控制: 长轮询 getUpdates, 收命令 -> 调 GitHub Actions API -> 回复
+#   /status /run <流程> [k=v] /stop <流程> /disable|/enable <流程> /list /help
+# 一个 job 挂 ~5.9 小时(长轮询, 命令通常几秒内响应), 到期退出由下一个 schedule 接上。
+# 只响应 TG_CHAT_ID 的消息。
+# 需要 Secrets: TG_TOKEN / TG_CHAT_ID / GH_TOKEN / GH_TOKEN_TAM(可选)
+
+on:
+  # 每 6 小时起一轮 (UTC 0 0/6/12/18 = 北京 8:00/14:00/20:00/次日 2:00)
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "本轮挂多久(分钟), 默认 340"
+        required: false
+        default: "340"
+
+concurrency:
+  group: tg-control
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 长轮询收命令
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN_TAM: ${{ secrets.GH_TOKEN_TAM }}
+        run: |
+          python3 tools/tg_command.py --minutes ${{ inputs.minutes || '340' }}
