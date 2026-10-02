@@ -1,0 +1,49 @@
+name: flow-status
+
+# 云流程状态总览: 扫描所有流程的 Actions 运行 -> 判定状态 -> 抓失败日志提错误行
+#   -> 画成状态图(SVG->PNG) -> 发到 Telegram
+# 需要 Secrets: TG_TOKEN / TG_CHAT_ID / GH_TOKEN / GH_TOKEN_TAM(可选, 私有仓库用)
+
+on:
+  # 每 6 小时 (UTC 20 0/6/12/18 = 北京 8:20/14:20/20:20/次日 2:20)
+  schedule:
+    - cron: "20 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      text_only:
+        description: "true=不发图片, 只发文字摘要"
+        required: false
+        default: "false"
+
+concurrency:
+  group: flow-status
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  GH_TOKEN_TAM: ${{ secrets.GH_TOKEN_TAM }}
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装中文字体 + SVG 转 PNG 工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk librsvg2-bin
+          rsvg-convert --version
+
+      - name: 扫描 + 出图 + 发 Telegram
+        run: |
+          ARGS=""
+          if [ "${{ inputs.text_only }}" = "true" ]; then ARGS="--text-only"; echo "(只发文字)"; fi
+          python3 tools/flow_status.py $ARGS
