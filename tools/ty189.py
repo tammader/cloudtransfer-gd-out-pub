@@ -14,7 +14,16 @@ OpenList 那条 PUT 走 base.HttpClient 没有超时 —— 189 侧一挂就是�
   PUT fileUploadUrl        (header: ResumePolicy=1 / Edrive-UploadFileId=<id>; body = 从偏移到末尾)
   getUploadFileStatus.action?uploadFileId=<id>&resumePolicy=1 -> dataSize + size(=已存)
   POST fileCommitUrl       (form: opertype=3 / resumePolicy=1 / uploadFileId=<id> / isLog=0)
-鉴权: getQrCode -> loginFamilyMerge 拿 sessionKey/sessionSecret, 之后所有请求走 HMAC-SHA1 会话签名。
+
+家庭云 family (与个人云**不是同一套接口**, 只改 is_family 不够):
+  listFiles        -> /family/file/listFiles.action       (query: familyId + folderId + orderBy/descending)
+  createUploadFile -> /family/file/createFamilyFile.action(query: familyId/parentId/fileName/fileSize/fileMd5/resumePolicy)
+  getStatus        -> /family/file/getFamilyFileStatus.action(query: familyId/uploadFileId/resumePolicy)
+  PUT              -> header UploadFileId + FamilyId (个人云是 Edrive-UploadFileId)
+  ⚠️ 家庭云的**根 folderId 是空串**, 个人云是 -11 —— 混用会列到错的目录(实测 2026-09-30)。
+
+鉴权: getQrCode -> loginFamilyMerge 拿 sessionKey/sessionSecret, 之后所有请求走 HMAC-SHA1 会话签名;
+      家庭云的请求要用返回里的 familySessionKey/familySessionSecret 签名。
 
 命令行自测:
   python ty189.py <本地文件> <远端目录, 如 /<挂载名>/out2>
@@ -39,7 +48,9 @@ TV_VERSION = "6.5.5"
 CLIENT_TYPE = "FAMILY_TV"
 TV_CHANNEL = "home02"
 UA = "go-resty/2.16 (" + "https://github.com/go-resty/resty)"
-ROOT_ID = "-11"
+PERSONAL_ROOT_ID = "-11"      # 个人云根目录 id
+FAMILY_ROOT_ID = ""           # 家庭云根目录 id —— **空串**(不是 -11), 实测 2026-09-30
+ROOT_ID = PERSONAL_ROOT_ID    # 兼容旧引用
 
 # 单次 PUT 的 socket 超时(秒)。189 侧"静默挂住"通常几分钟 -> 到这个点就断开重来。
 PUT_TIMEOUT = 60
@@ -96,10 +107,14 @@ class _ProgressReader(object):
 
 
 class Ty189(object):
-    def __init__(self, access_token, family_id="", is_family=False):
+    def __init__(self, access_token, family_id="", is_family=False, root_id=None):
         self.access_token = (access_token or "").strip()
         self.family_id = str(family_id or "")
         self.is_family = bool(is_family)
+        # 家庭云根 = 空串, 个人云根 = -11; 不显式给就按模式取默认
+        if root_id is None:
+            root_id = FAMILY_ROOT_ID if self.is_family else PERSONAL_ROOT_ID
+        self.root_id = str(root_id)
         self.session_key = ""
         self.session_secret = ""
         self.op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -187,8 +202,11 @@ class Ty189(object):
         return d
 
     # ---------- 目录 ----------
-    def list_files(self, folder_id=ROOT_ID):
-        """列目录。注意: 这个接口回的是 **XML**(<listFiles><fileList><folder>..<file>..), 不是 JSON。"""
+    def list_files(self, folder_id=None):
+        """列目录。注意: 这个接口回的是 **XML**(<listFiles><fileList><folder>..<file>..), 不是 JSON。
+        folder_id 省略时用 self.root_id(个人云 -11 / 家庭云 空串)。"""
+        if folder_id is None:
+            folder_id = self.root_id
         url = API + ("/family/file/listFiles.action" if self.is_family else "/listFiles.action")
         out, page = [], 1
         while page <= 200:
@@ -223,8 +241,8 @@ class Ty189(object):
             page += 1
         return out
 
-    def resolve_dir(self, path, root_id=ROOT_ID, mount=None):
-        """把 /<挂载名>/out2 这样的路径解析成 folderId(个人云从 -11 逐级找)。
+    def resolve_dir(self, path, root_id=None, mount=None):
+        """把 /<挂载名>/out2 这样的路径解析成 folderId(个人云从 -11 / 家庭云从 "" 逐级找)。
 
         路径第一段通常是挂载名, 端侧没有它 -> 传 mount 剥掉;
         没传 mount 时, 若第一段在根下找不到, 也当作挂载名跳过。
@@ -232,7 +250,7 @@ class Ty189(object):
         parts = [p for p in (path or "").split("/") if p]
         if mount and parts and parts[0] == str(mount).strip("/"):
             parts = parts[1:]
-        cur = root_id
+        cur = self.root_id if root_id is None else str(root_id)
         for i, name in enumerate(parts):
             hit = None
             for it in self.list_files(cur):
