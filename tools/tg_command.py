@@ -59,7 +59,7 @@ def tokens():
 def find_flow(name):
     """按流程名/文件名找 (repo, wf, tok_key, 显示名)"""
     q = (name or "").strip().lower()
-    for repo, wf, disp, _desc, _period, tk in fs.WATCH:
+    for repo, wf, disp, _period, tk in fs.WATCH:
         if q in (disp.lower(), wf.lower(), wf.lower().replace(".yml", "")):
             return repo, wf, tk, disp
     return None
@@ -87,8 +87,8 @@ def cmd_help():
 
 def cmd_list():
     lines = ["全部流程:"]
-    for repo, wf, disp, desc, period, _tk in fs.WATCH:
-        lines.append("· %-14s %s%s" % (disp, desc,
+    for repo, wf, disp, period, _tk in fs.WATCH:
+        lines.append("· %-14s %s%s" % (disp, fs.desc_of(disp),
                                        "" if period else "（手动）"))
     lines.append("\n用 /run <流程名> 触发; /status 看状态")
     return "\n".join(lines)
