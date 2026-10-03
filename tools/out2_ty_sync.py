@@ -39,8 +39,8 @@ SRC = pathcfg.require("OT_SRC")
 TY_DIR = pathcfg.require("OT_TY")                 # 上传目标 —— **必须单值**(要拼路径)
 MOUNT = "/" + TY_DIR.strip("/").split("/")[0]     # 目的网盘在 alist 里的挂载名(从配置推)
 # 判"云盘已有"时要一起看的目录(逗号多值; 缺省 = TY_DIR)。
-# 为什么需要: 个人云空间不够, 会把 个人/out2 的文件不断挪到 家庭/out2; 只看 TY_DIR 的话,
-# 被挪走的文件下一轮就被判"没有" -> 从源重传(又把个人云塞满)。TY_DIR 仍保持单值。
+# 为什么需要: 源盘空间不够, 会把 out2 的文件不断挪到另一个同名目录; 只看 TY_DIR 的话,
+# 被挪走的文件下一轮就被判"没有" -> 从源重传(又把源盘塞满)。TY_DIR 仍保持单值。
 TY_CHECK_DIRS = [x.strip() for x in (pathcfg.get("OT_TY_CHECK") or TY_DIR).split(",") if x.strip()]
 DBJM_DIR = pathcfg.require("OT_DBJM")
 ARCH = pathcfg.require("OT_ARCH")
