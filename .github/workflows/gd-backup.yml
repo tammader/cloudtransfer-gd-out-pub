@@ -1,0 +1,80 @@
+name: gd-backup
+
+# 目录级备份: GoogleDrive2 的 out / out2 / out3 / TelegramVideos **拷贝**到 GoogleDrive6 同名目录。
+#   源端**只读**, 不动任何文件; 目录级 rclone copy, 同名同大小自动跳过 -> 每轮增量补齐。
+#   按工作量从小到大执行, 到时间预算优雅收工, 剩下的下一轮继续。
+# 需要仓库 Secrets: RCLONE_CONF(含 [gdrive2] + [gdrive6]) / PATHS_JSON
+
+on:
+  # 每 12 小时 (UTC 30 0/12 = 北京 8:30 / 20:30)
+  schedule:
+    - cron: "30 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真拷(源端不动), false=只演练"
+        required: false
+        default: "false"
+      only:
+        description: "只备份某个目录(留空=全部), 例: out2"
+        required: false
+        default: ""
+      transfers:
+        description: "并发传输数"
+        required: false
+        default: "4"
+      budget_min:
+        description: "本轮时间预算(分钟)"
+        required: false
+        default: "320"
+
+concurrency:
+  group: gd-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+          df -h / | tail -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
+          echo "配置里的远端:"
+          grep -E '^\[' ~/.config/rclone/rclone.conf | sed 's/^/  /'
+
+      - name: 跑备份(目录级拷贝, 源端只读)
+        env:
+          # schedule 触发时 inputs.apply 为空 -> 自动真跑; 手动触发默认演练
+          APPLY: ${{ inputs.apply || 'true' }}
+          ONLY_NAME: ${{ inputs.only }}
+          TRANSFERS: ${{ inputs.transfers || '4' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '320' }}
+        run: |
+          set -e
+          ARGS="--transfers $TRANSFERS --budget-min $BUDGET_MIN"
+          if [ -n "$ONLY_NAME" ]; then ARGS="$ARGS --only $ONLY_NAME"; fi
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; else echo "(演练模式)"; fi
+          python3 tools/gd_backup.py $ARGS
