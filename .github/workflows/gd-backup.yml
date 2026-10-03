@@ -1,9 +1,9 @@
 name: gd-backup
 
-# 目录级备份: GoogleDrive2 的 out / out2 / out3 / TelegramVideos **拷贝**到 GoogleDrive6 同名目录。
+# 目录级备份: 把源盘的 out / out3 / TG 目录 **拷贝**到目标盘同名目录(不含流动目录 out2)。
 #   源端**只读**, 不动任何文件; 目录级 rclone copy, 同名同大小自动跳过 -> 每轮增量补齐。
 #   按工作量从小到大执行, 到时间预算优雅收工, 剩下的下一轮继续。
-# 需要仓库 Secrets: RCLONE_CONF(含 [gdrive2] + [gdrive6]) / PATHS_JSON
+# 需要仓库 Secrets: RCLONE_CONF(两端配置) / PATHS_JSON(盘名/目录名真值)
 
 on:
   # 每 12 小时 (UTC 30 0/12 = 北京 8:30 / 20:30)
