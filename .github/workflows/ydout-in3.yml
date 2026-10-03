@@ -1,10 +1,10 @@
 name: ydout-in3
 
-# GoogleDrive2/ydout -> OneDrive2/in3, 并把 ydout 里已送达的源文件移到 GoogleDrive2/out3(归档)
+# 目标远端 ydout 目录 -> 中转远端 in3 目录, 并把已送达的源文件同盘移到归档目录 out3
 #   跨网盘搬运由 rclone 自动「下载到 runner -> 上传到目标」;
-#   只在**目标端同名同大小**确认送达后, 才把 ydout 里的源文件同盘移动(move, 秒完成)到 out3。
+#   只在**目标端同名同大小**确认送达后, 才把源文件同盘移动(move, 秒完成)到 out3。
 #   手动触发的流程(无定时)。
-# 需要仓库 Secrets: RCLONE_CONF(含 [onedrive2] + [gdrive2]) / PATHS_JSON
+# 需要仓库 Secrets: RCLONE_CONF(两端配置) / PATHS_JSON(盘名/目录名真值)
 
 on:
   workflow_dispatch:
