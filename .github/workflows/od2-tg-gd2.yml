@@ -1,0 +1,89 @@
+name: od2-tg-gd2
+
+# OneDrive2/TelegramVideos -> GoogleDrive2/TelegramVideos
+#   跨网盘没有 server-side copy, 由 rclone 自动「下载到 runner -> 上传到目标」;
+#   全量文件(不筛后缀), 只在**目标端同名同大小**确认送达后, 才删除源文件(进回收站可捞)。
+#   分批搬运, 到时间预算优雅收工, 剩下的下一轮继续。
+# 需要仓库 Secrets: RCLONE_CONF(含 [onedrive2] + [gdrive2]) / PATHS_JSON
+
+on:
+  # 每 6 小时 (UTC 10 0/6/12/18 = 北京 8:10/14:10/20:10/次日 2:10); 与 in2-ydout(:45) 错开
+  schedule:
+    - cron: "10 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真搬(上传+删源), false=只演练"
+        required: false
+        default: "false"
+      max_ops:
+        description: "本轮最多处理多少个文件"
+        required: false
+        default: "400"
+      max_total_gb:
+        description: "本轮总量上限(GB)"
+        required: false
+        default: "60"
+      batch_gb:
+        description: "每批搬运量上限(GB)"
+        required: false
+        default: "8"
+      budget_min:
+        description: "本轮时间预算(分钟)"
+        required: false
+        default: "300"
+      only:
+        description: "只处理名字含该子串的文件(留空=全部); 验证时有用"
+        required: false
+        default: ""
+
+concurrency:
+  group: od2-tg-gd2
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 盘名/目录名的真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+          df -h / | tail -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
+
+      - name: 跑搬运(TelegramVideos 全量 -> 目标远端, 送达后删源)
+        env:
+          # schedule 触发时 inputs.apply 为空 -> 自动真跑; 手动触发默认演练
+          APPLY: ${{ inputs.apply || 'true' }}
+          MAX_OPS: ${{ inputs.max_ops || '400' }}
+          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '60' }}
+          BATCH_GB: ${{ inputs.batch_gb || '8' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '300' }}
+          ONLY_NAME: ${{ inputs.only }}
+        run: |
+          set -e
+          ARGS="--mode tg-gd2 --max-ops $MAX_OPS --max-total-gb $MAX_TOTAL_GB"
+          ARGS="$ARGS --batch-gb $BATCH_GB --budget-min $BUDGET_MIN"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; else echo "(演练模式)"; fi
+          python3 tools/gd_relay.py $ARGS
