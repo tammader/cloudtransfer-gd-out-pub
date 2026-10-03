@@ -37,7 +37,7 @@ on:
         required: false
         default: "300"
       seg_mb:
-        description: "切片单片大小上限(MB); 下游豆包对单文件有 ~300MB 硬上限, 默认 280 留余量"
+        description: "切片单片大小上限(MB); 下游网盘对单文件有 ~300MB 硬上限, 默认 280 留余量"
         required: false
         default: "280"
       disk_budget_gb:
