@@ -6,10 +6,10 @@
 不用逐文件校验收尾。每轮跑一遍即可增量补齐(新文件追加上去)。
 
 配置(走 pathcfg: CI=Secret PATHS_JSON, 本机=paths.local.json):
-  GB_SRC_ROOT  源根, 如 gdrive2
-  GB_DST_ROOT  目标根, 如 gdrive6
-  GB_DIRS      要备份的目录名, 逗号分隔, 如 out,out2,out3,TelegramVideos
-  GB_REPORT    报告落点, 如 onedrive2:dbqd/gd_backup_report.txt
+  GB_SRC_ROOT  源远端名(真值在配置里)
+  GB_DST_ROOT  目标远端名(真值在配置里)
+  GB_DIRS      要备份的目录名, 逗号分隔(真值在配置里)
+  GB_REPORT    报告落点(真值在配置里)
 
 安全: 默认演练(--dry); --apply 才真拷。源端**只读**。
 """
