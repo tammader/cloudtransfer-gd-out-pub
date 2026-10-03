@@ -14,7 +14,7 @@
 磁盘: 分批大小 = min(剩余空间 - 预留, --disk-budget-gb)。切分时源文件与分段同时在盘上,
       所以选批时按 "本批总量 + 本批最大的待切文件" 估算峰值, 保证不超过预算。
 
-铁律 (沿用 6盘 流水线):
+铁律 (沿用上游流水线):
   - 只允许 ffmpeg 无损切割真视频; 非视频/切不开 -> 跳过并记录, **绝不二进制切块**, 也绝不动源文件
   - 源文件只在"该传的东西都上传且校验成功"之后才移走
   - 默认演练 (--dry); --apply 才真动
@@ -179,9 +179,9 @@ def _seg_once(src_path, stem, ext, seg_time):
 def split_max(src_path, stem, ext, max_bytes):
     """ffmpeg 无损切成 N 段, 保证每段 <= max_bytes(切点仍落在关键帧上, -c copy 不重编码)。
 
-    为什么不再"对半切": 中转盘 out2 的唯一去向(豆包 /dbjm)对**单文件**有 ~300MB 硬上限,
+    为什么不再"对半切": 中转盘 out2 的唯一去向(下游归档盘)对**单文件**有 ~300MB 硬上限,
     源文件 >600MB 时对半切出来的两段各自仍 >300MB -> 两段都永远传不进 /dbjm,
-    连带 gdrive2:out2 里的原件也永远归档不了。
+    连带中转源盘 out2 里的原件也永远归档不了。
     这里按 ceil(大小 / max_bytes) 算段数, 切完校验每段 <= max_bytes;
     关键帧不均匀导致某段超标就按 0.9 缩短段时长重试(最多 6 次)。
     返回段路径列表(按名排序); 切不出合格结果返回 []。
@@ -274,7 +274,7 @@ def main():
     ap.add_argument("--max-ops", type=int, default=200, help="本轮最多处理多少个源文件")
     ap.add_argument("--threshold-mb", type=int, default=300, help="超过该大小就切片上传")
     ap.add_argument("--seg-mb", type=int, default=280,
-                    help="切片单片上限(MB); 下游豆包对单文件有 ~300MB 硬上限, 留 20MB 余量")
+                    help="切片单片上限(MB); 下游网盘对单文件有 ~300MB 硬上限, 留 20MB 余量")
     ap.add_argument("--budget-min", type=int, default=310, help="本轮时间预算(分钟), 到点收工")
     ap.add_argument("--max-total-gb", type=float, default=5.0,
                     help="本轮处理的源文件总量上限(GB), 到了就收工")
@@ -454,7 +454,7 @@ def main():
                                 r.returncode, got_sz, size, (r.stderr or "")[:120])
                             ok = False
                 else:
-                    # ---- 大文件: 按 <= seg_mb 切成 N 片 (下游豆包对单文件有 ~300MB 硬上限) ----
+                    # ---- 大文件: 按 <= seg_mb 切成 N 片 (下游网盘对单文件有 ~300MB 硬上限) ----
                     ext = os.path.splitext(name)[1].lower()
                     if ext not in VIDEO_EXT:
                         note = ">阈值但非视频, 不切割不上传 (源文件保持原样)"
