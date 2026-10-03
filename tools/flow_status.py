@@ -28,75 +28,69 @@ import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
 
+import pathcfg          # 文案/路径真值: CI=Secret PATHS_JSON, 本机=paths.local.json
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 API = "https://api.github.com"
 TG = "https://api.telegram.org"
 BJ = timezone(timedelta(hours=8))
 GH_OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # GitHub 直连(不走代理)
 
-# ---- 监控清单: (仓库, workflow 文件, 显示名, 功能说明, 周期小时(0=手动), token 键) ----
+# ---- 监控清单: (仓库, workflow 文件, 显示名, 周期小时(0=手动), token 键) ----
+# ⚠️ 这里**只放中性信息**(仓库/文件名/显示名/周期)。带盘名的**功能说明、分组标题、失败建议**
+# 一律不进源码 —— 它们放在 PATHS_JSON(CI) / paths.local.json(本机) 的
+# FS_DESC / FS_GROUPS / FS_ADVICE 三个键里(JSON 字符串), 见 _meta()。
 WATCH = [
-    ("tammader/cloudtransfer-gd-out-pub", "in-pipeline.yml", "in-pipeline",
-     "清上游 + 判重 → 出队列", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "gen-manifest.yml", "gen-manifest",
-     "导出编号清单（判重依据）", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "in2-ydout.yml", "in2-ydout",
-     "in2 的 _D 分卷 → ydout", 6, "A"),
-    ("tammader/ty-transfer-pub", "ty-transfer.yml", "ty-transfer",
-     "家庭云 /in 切分 → ydout", 12, "A"),
-    ("tammader/ty-transfer-pub", "ydy2-transfer.yml", "ydy2-transfer",
-     "个人云 /in 切分 → ydout", 12, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "ydout-in3.yml", "ydout-in3",
-     "ydout → in3，源归档 out3", 0, "A"),
-    ("tamd258/cloudtransfer-speedtest", "out-sync.yml", "out-sync",
-     "OneDrive 成品 → 天翼 / GD", 12, "B"),
-    ("tammader/cloudtransfer-gd-out-pub", "gd-out2.yml", "gd-out2",
-     "GD out 切分 → OneDrive out2", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "od2-dbjm.yml", "od2-dbjm",
-     "out2 → 豆包 /dbjm", 6, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "out2-ty-sync.yml", "out2-ty-sync",
-     "out2 → 天翼，完成后归档 out3", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "od2-tg-gd2.yml", "od2-tg-gd2",
-     "TelegramVideos → GD2（删源）", 6, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "gd-backup.yml", "gd-backup",
-     "GD2 四目录 → GD6 备份", 12, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "in-pipeline.yml", "in-pipeline", 3, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "gen-manifest.yml", "gen-manifest", 3, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "in2-ydout.yml", "in2-ydout", 6, "A"),
+    ("tammader/ty-transfer-pub", "ty-transfer.yml", "ty-transfer", 12, "A"),
+    ("tammader/ty-transfer-pub", "ydy2-transfer.yml", "ydy2-transfer", 12, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "ydout-in3.yml", "ydout-in3", 0, "A"),
+    ("tamd258/cloudtransfer-speedtest", "out-sync.yml", "out-sync", 12, "B"),
+    ("tammader/cloudtransfer-gd-out-pub", "gd-out2.yml", "gd-out2", 3, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "od2-dbjm.yml", "od2-dbjm", 6, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "out2-ty-sync.yml", "out2-ty-sync", 3, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "od2-tg-gd2.yml", "od2-tg-gd2", 6, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "gd-backup.yml", "gd-backup", 12, "A"),
 ]
 
-# 图上分四列
-GROUPS = [
+NAMES = [e[2] for e in WATCH]
+
+
+def _meta(key, default):
+    """从配置里取一段 JSON 文案; 取不到/格式不对就用中性兜底(源码里不留盘名)"""
+    raw = pathcfg.get("FS_" + key, "")
+    if raw:
+        try:
+            v = json.loads(raw)
+            if isinstance(v, type(default)):
+                return v
+        except Exception:
+            pass
+    return default
+
+
+# 图上分四列(标题真值在配置; 兜底标题保持中性 —— 流程名本身是仓库里的文件名, 遮不掉)
+GROUPS = _meta("GROUPS", [
     ("① 上游 / 清单", ["in-pipeline", "gen-manifest"]),
-    ("② 分卷入 ydout", ["in2-ydout", "ty-transfer", "ydy2-transfer"]),
+    ("② 分卷 / 中继", ["in2-ydout", "ty-transfer", "ydy2-transfer"]),
     ("③ 出口 / 搬运", ["ydout-in3", "out-sync", "gd-out2", "od2-tg-gd2"]),
     ("④ 落地 / 备份", ["od2-dbjm", "out2-ty-sync", "gd-backup"]),
-]
+])
 
-# 失败时的「影响 / 处置」建议(按流程名; 没写就用通用文案)
-ADVICE = {
-    "gd-out2": ("out 里的文件不再被切分送往 out2，下游 od2-dbjm 会断供",
-                "先看 gdrive2:out 目录还在不在（曾被误删过）"),
-    "od2-dbjm": ("out2 不再进豆包 /dbjm，out2 会堆着",
-                 "看 alist 与豆包网盘是否可达"),
-    "out2-ty-sync": ("out2 不进天翼，也就不会归档到 out3",
-                     "看天翼上传配额是否用尽、alist 是否正常"),
-    "in-pipeline": ("上游不清理、下载队列不更新，手机端会缺活",
-                    "看上游盘是否可达 / 目录是否被改名"),
-    "gen-manifest": ("编号清单不更新，各处判重会用到旧清单",
-                     "看 OpenList 挂载是否正常"),
-    "in2-ydout": ("in2 的分卷进不了 ydout，ydout 那条链会缺料",
-                  "看两侧凭证是否过期、目标目录是否存在"),
-    "ydout-in3": ("ydout 不往 in3 送，也不会归档到 out3",
-                  "手动流程 —— 只有你触发才会跑，失败看日志里的 rclone 报错"),
-    "ty-transfer": ("家庭云 /in 不进 ydout",
-                    "看 139 凭证（TY_AUTH）是否过期"),
-    "ydy2-transfer": ("个人云 /in 不进 ydout",
-                      "看 YDY_AUTHORIZATION 是否过期（脚本会提示剩余天数）"),
-    "out-sync": ("OneDrive 成品不归档到天翼/GD",
-                 "看 gdrive2:out 是否存在、天翼配额"),
-    "od2-tg-gd2": ("TelegramVideos 不往 GD2 搬，源盘会一直堆着（不会重复上传）",
-                   "看 RCLONE_CONF 里 [gdrive2] 的 token 是否可刷新、源目录是否改名"),
-    "gd-backup": ("GD2 的新文件不再备份到 GD6，备份会滞后",
-                  "看 RCLONE_CONF 里 [gdrive6] 是否正常、GD6 空间是否够"),
-}
+# 每个流程的功能说明(卡片里那一行)
+DESC = _meta("DESC", {})
+DESC_FALLBACK = "（未配置说明）"
+
+
+def desc_of(name):
+    return DESC.get(name) or DESC_FALLBACK
+
+
+# 失败时的「影响 / 处置」建议
+ADVICE = _meta("ADVICE", {})
+ADVICE_FALLBACK = ("该环节停摆，下游会缺料", "点开该 run 看完整日志")
 
 COL_X = [16, 186, 356, 526]
 ROW_Y = [108, 172, 236, 300]
@@ -215,8 +209,8 @@ def fetch_error_lines(repo, run_id, tok, max_lines=3):
 
 
 def scan(entry, tokens):
-    repo, wf, name, desc, period, tk = entry
-    base = {"name": name, "desc": desc, "repo": repo, "wf": wf, "period": period,
+    repo, wf, name, period, tk = entry
+    base = {"name": name, "desc": desc_of(name), "repo": repo, "wf": wf, "period": period,
             "state": "unknown", "note": "", "time": "", "run_id": None,
             "errors": [], "age_h": None}
     tok = tokens.get(tk) or ""
@@ -318,7 +312,7 @@ def render_svg(items, ts):
     fails = [i for i in items if i["state"] == "fail"]
     if fails:
         f = fails[0]
-        imp, fix = ADVICE.get(f["name"], ("该环节停摆，下游会缺料", "点开该 run 看完整日志"))
+        imp, fix = ADVICE.get(f["name"], ADVICE_FALLBACK)
         L.append('<rect x="16" y="376" width="648" height="156" rx="10" fill="#fef2f2" '
                  'stroke="#fca5a5" stroke-width="1.5"/>')
         L.append('<text x="32" y="402" font-size="12.5" font-weight="700" fill="#991b1b">'
