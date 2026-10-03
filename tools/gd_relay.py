@@ -4,11 +4,13 @@
 跨网盘(OneDrive <-> Google Drive)没有 server-side copy, rclone 会自动
 "下载到 runner -> 上传到目标" —— 这一步不用我们管, 我们要管的是**只在确认送达后才动源文件**。
 
-两种模式(共用同一套逻辑, 只有源/目标/收尾动作不同):
+三种模式(共用同一套逻辑, 只有源/目标/收尾动作不同):
   --mode in2-ydout : 源 = GR_A_SRC, 只挑名字含 GR_A_SUFFIX 的文件(默认 "_D");
                      目标 = GR_A_DST; 成功后 **删除** 源文件(进回收站可捞)
   --mode ydout-in3 : 源 = GR_B_SRC; 目标 = GR_B_DST;
                      成功后把源 **同盘移动** 到 GR_B_ARCH(服务端 move, 秒完成)
+  --mode tg-gd2    : 源 = GR_TG_SRC(TelegramVideos), 全量不带后缀过滤;
+                     目标 = GR_TG_DST; 成功后 **删除** 源文件
 
 安全设计(这是全脚本的重点):
   * **只有"目标里存在同名且大小一致"的文件才算成功, 也才动源文件** —— 绝不留一半
@@ -64,6 +66,15 @@ MODES = {
         "arch": lambda: pathcfg.require("GR_B_ARCH"),
         "on_success": "move",            # 成功后把源移到归档区
         "title": "目标远端 -> in3(并归档源)",
+    },
+    "tg-gd2": {
+        # OneDrive2/TelegramVideos -> GoogleDrive2/TelegramVideos (全量, 不筛后缀)
+        "src": lambda: pathcfg.require("GR_TG_SRC"),
+        "dst": lambda: pathcfg.require("GR_TG_DST"),
+        "suffix": lambda: "",
+        "arch": None,
+        "on_success": "delete",          # 送达后删源(进回收站可捞)
+        "title": "TelegramVideos -> 目标远端(删源)",
     },
 }
 
