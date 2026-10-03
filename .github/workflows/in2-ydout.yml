@@ -1,10 +1,10 @@
 name: in2-ydout
 
-# OneDrive2/in2 里「已标记 _D」的分卷 -> GoogleDrive2/ydout
+# 中转远端 in2 目录里「已标记 _D」的分卷 -> 目标远端 ydout 目录
 #   跨网盘没有 server-side copy, 由 rclone 自动「下载到 runner -> 上传到目标」;
-#   只在**目标端同名同大小**确认送达后, 才删除 in2 里的源文件(进回收站可捞)。
+#   只在**目标端同名同大小**确认送达后, 才删除源文件(进回收站可捞)。
 #   分批搬运, 到时间预算优雅收工, 剩下的下一轮继续。
-# 需要仓库 Secrets: RCLONE_CONF(含 [onedrive2] + [gdrive2]) / PATHS_JSON
+# 需要仓库 Secrets: RCLONE_CONF(两端配置) / PATHS_JSON(盘名/目录名真值)
 
 on:
   # 每 6 小时 (UTC 45 0/6/12/18 = 北京 8:45/14:45/20:45/次日 2:45); 与 od2-dbjm(:15) 错开
