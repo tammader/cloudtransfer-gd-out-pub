@@ -3,6 +3,7 @@ name: flow-status
 # 云流程状态总览: 扫描所有流程的 Actions 运行 -> 判定状态 -> 抓失败日志提错误行
 #   -> 画成状态图(SVG->PNG) -> 发到 Telegram
 # 需要 Secrets: TG_TOKEN / TG_CHAT_ID / GH_TOKEN / GH_TOKEN_TAM(可选, 私有仓库用)
+#              + PATHS_JSON(带盘名的功能说明/失败建议/分组标题都从它读)
 
 on:
   # 每 6 小时 (UTC 20 0/6/12/18 = 北京 8:20/14:20/20:20/次日 2:20)
@@ -27,6 +28,7 @@ env:
   TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
   GH_TOKEN: ${{ secrets.GH_TOKEN }}
   GH_TOKEN_TAM: ${{ secrets.GH_TOKEN_TAM }}
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
 
 jobs:
   status:
