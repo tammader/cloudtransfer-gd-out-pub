@@ -1,10 +1,10 @@
 name: od2-tg-gd2
 
-# OneDrive2/TelegramVideos -> GoogleDrive2/TelegramVideos
+# 源盘 TG 目录 -> 目标盘同名目录
 #   跨网盘没有 server-side copy, 由 rclone 自动「下载到 runner -> 上传到目标」;
 #   全量文件(不筛后缀), 只在**目标端同名同大小**确认送达后, 才删除源文件(进回收站可捞)。
 #   分批搬运, 到时间预算优雅收工, 剩下的下一轮继续。
-# 需要仓库 Secrets: RCLONE_CONF(含 [onedrive2] + [gdrive2]) / PATHS_JSON
+# 需要仓库 Secrets: RCLONE_CONF(两端配置) / PATHS_JSON(盘名/目录名真值)
 
 on:
   # 每 6 小时 (UTC 10 0/6/12/18 = 北京 8:10/14:10/20:10/次日 2:10); 与 in2-ydout(:45) 错开
@@ -72,7 +72,7 @@ jobs:
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
           test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
 
-      - name: 跑搬运(TelegramVideos 全量 -> 目标远端, 送达后删源)
+      - name: 跑搬运(全量 -> 目标远端, 送达后删源)
         env:
           # schedule 触发时 inputs.apply 为空 -> 自动真跑; 手动触发默认演练
           APPLY: ${{ inputs.apply || 'true' }}
