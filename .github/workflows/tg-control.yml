@@ -38,5 +38,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_TOKEN_TAM: ${{ secrets.GH_TOKEN_TAM }}
+          # /list 的功能说明也从它读(带盘名, 不进源码)
+          PATHS_JSON: ${{ secrets.PATHS_JSON }}
         run: |
           python3 tools/tg_command.py --minutes ${{ inputs.minutes || '340' }}
