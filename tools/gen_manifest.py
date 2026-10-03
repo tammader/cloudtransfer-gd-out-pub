@@ -28,7 +28,7 @@ STEM_DIRS = pathcfg.require("GM_STEM_DIRS")
 # 带大小清单: (alist 路径, 输出文件名)
 #   路径支持**逗号分隔多目录** -> 合并成一份, 先列到的目录优先(同名不覆盖)。
 #   为什么要多目录: 主网盘空间不够, 会不断把 out2 的文件挪到副网盘/out2;
-#   清单只扫一个目录的话, 被挪走的文件在消费方(out-sync)眼里就"天翼没有" -> 重复上传回源。
+#   清单只扫一个目录的话, 被挪走的文件在消费方(out-sync)眼里就"目标盘没有" -> 重复上传回源。
 SIZE_MANIFESTS = [
     (pathcfg.require("GM_TY_OUT"), "ty_out.tsv"),
     (pathcfg.require("GM_TY_TG"), "ty_tg.tsv"),
