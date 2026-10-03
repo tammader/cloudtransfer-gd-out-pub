@@ -371,6 +371,8 @@ def main():
     if not tokens["A"]:
         log("!! 缺 GH_TOKEN")
         return 1
+    log("文案: 说明 %d 条 | 失败建议 %d 条 | 分组 %d 组  (来自 PATHS_JSON; 0 = Secret 里没配)"
+        % (len(DESC), len(ADVICE), len(GROUPS)))
     items = []
     for e in WATCH:
         it = scan(e, tokens)
