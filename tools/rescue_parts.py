@@ -62,7 +62,7 @@ def main():
     elif a.copy_arch:
         lines = ["# 拷贝报告: 中转盘 -> 归档区(多留一处备份)  %s UTC  [%s]"
                  % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练"),
-                 "# 规则: %s 里的文件逐个复制到 %s; 归档区由 out2-ty-sync 接手送天翼" % (SRC, ARCH)]
+                 "# 规则: %s 里的文件逐个复制到 %s; 归档区由 out2-ty-sync 接手送目标盘" % (SRC, ARCH)]
     else:
         lines = ["# 救援报告: 超上限旧分片 -> 再切一刀  %s UTC  [%s]"
                  % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练"),
