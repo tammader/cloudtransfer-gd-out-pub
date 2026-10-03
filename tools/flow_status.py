@@ -56,14 +56,18 @@ WATCH = [
      "out2 → 豆包 /dbjm", 6, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "out2-ty-sync.yml", "out2-ty-sync",
      "out2 → 天翼，完成后归档 out3", 3, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "od2-tg-gd2.yml", "od2-tg-gd2",
+     "TelegramVideos → GD2（删源）", 6, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "gd-backup.yml", "gd-backup",
+     "GD2 四目录 → GD6 备份", 12, "A"),
 ]
 
 # 图上分四列
 GROUPS = [
     ("① 上游 / 清单", ["in-pipeline", "gen-manifest"]),
     ("② 分卷入 ydout", ["in2-ydout", "ty-transfer", "ydy2-transfer"]),
-    ("③ 出口 / out 线", ["ydout-in3", "out-sync", "gd-out2"]),
-    ("④ 落地归档", ["od2-dbjm", "out2-ty-sync"]),
+    ("③ 出口 / 搬运", ["ydout-in3", "out-sync", "gd-out2", "od2-tg-gd2"]),
+    ("④ 落地 / 备份", ["od2-dbjm", "out2-ty-sync", "gd-backup"]),
 ]
 
 # 失败时的「影响 / 处置」建议(按流程名; 没写就用通用文案)
@@ -88,10 +92,14 @@ ADVICE = {
                       "看 YDY_AUTHORIZATION 是否过期（脚本会提示剩余天数）"),
     "out-sync": ("OneDrive 成品不归档到天翼/GD",
                  "看 gdrive2:out 是否存在、天翼配额"),
+    "od2-tg-gd2": ("TelegramVideos 不往 GD2 搬，源盘会一直堆着（不会重复上传）",
+                   "看 RCLONE_CONF 里 [gdrive2] 的 token 是否可刷新、源目录是否改名"),
+    "gd-backup": ("GD2 的新文件不再备份到 GD6，备份会滞后",
+                  "看 RCLONE_CONF 里 [gdrive6] 是否正常、GD6 空间是否够"),
 }
 
 COL_X = [16, 186, 356, 526]
-ROW_Y = [108, 172, 236]
+ROW_Y = [108, 172, 236, 300]
 NODE_W, NODE_H = 150, 56
 STATE_STYLE = {
     "ok":      ("#dcfce7", "#16a34a", "#14532d", "#15803d"),
@@ -264,8 +272,8 @@ def render_svg(items, ts):
     L = []
     L.append('<svg viewBox="0 0 680 %d" xmlns="http://www.w3.org/2000/svg" '
              'font-family="Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Zen Hei, sans-serif">'
-             % 490)
-    L.append('<rect x="0" y="0" width="680" height="490" fill="#ffffff"/>')
+             % 556)
+    L.append('<rect x="0" y="0" width="680" height="556" fill="#ffffff"/>')
     L.append('<text x="16" y="26" font-size="15" font-weight="700" fill="#1f2937">'
              '云流程状态总览 · 每 6 小时刷新</text>')
     n_fail = sum(1 for i in items if i["state"] == "fail")
@@ -311,14 +319,14 @@ def render_svg(items, ts):
     if fails:
         f = fails[0]
         imp, fix = ADVICE.get(f["name"], ("该环节停摆，下游会缺料", "点开该 run 看完整日志"))
-        L.append('<rect x="16" y="318" width="648" height="156" rx="10" fill="#fef2f2" '
+        L.append('<rect x="16" y="376" width="648" height="156" rx="10" fill="#fef2f2" '
                  'stroke="#fca5a5" stroke-width="1.5"/>')
-        L.append('<text x="32" y="344" font-size="12.5" font-weight="700" fill="#991b1b">'
+        L.append('<text x="32" y="402" font-size="12.5" font-weight="700" fill="#991b1b">'
                  '【失败】%s · %s · run %s%s</text>'
                  % (esc(f["name"]), esc(f["time"]), f["run_id"],
                     "" if len(fails) == 1 else "（另有 %d 个失败）" % (len(fails) - 1)))
-        L.append('<line x1="32" y1="354" x2="648" y2="354" stroke="#fecaca"/>')
-        y = 372
+        L.append('<line x1="32" y1="412" x2="648" y2="412" stroke="#fecaca"/>')
+        y = 430
         L.append('<text x="32" y="%d" font-size="10.5" fill="#7f1d1d">'
                  '原因（自动抓日志里的错误行）：</text>' % y)
         y += 18
@@ -334,11 +342,11 @@ def render_svg(items, ts):
         L.append('<text x="32" y="%d" font-size="10.5" fill="#7f1d1d">处置：%s</text>'
                  % (y, esc(fix)))
     else:
-        L.append('<rect x="16" y="318" width="648" height="60" rx="10" fill="#f0fdf4" '
+        L.append('<rect x="16" y="376" width="648" height="60" rx="10" fill="#f0fdf4" '
                  'stroke="#bbf7d0"/>')
-        L.append('<text x="32" y="346" font-size="12.5" font-weight="700" fill="#166534">'
+        L.append('<text x="32" y="404" font-size="12.5" font-weight="700" fill="#166534">'
                  '【全部正常】没有失败流程</text>')
-        L.append('<text x="32" y="366" font-size="10.5" fill="#15803d">'
+        L.append('<text x="32" y="424" font-size="10.5" fill="#15803d">'
                  '（黄色的只是超过预期周期没跑或正在跑 —— GitHub 定时任务常有几小时漂移，属正常）</text>')
     L.append("</svg>")
     return "\n".join(L)
