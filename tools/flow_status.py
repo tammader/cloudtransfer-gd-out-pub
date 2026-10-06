@@ -2,7 +2,8 @@
 """云流程状态总览 -> Telegram
 
 扫描各仓库的 Actions 运行情况, 判定每个流程的状态(正常 / 超期 / 进行中 / 失败),
-失败的自动去抓那次的日志、提取错误行, 画成一张状态图(SVG -> PNG)发到 Telegram。
+失败的自动去抓那次的日志、提取错误行, 再附一段"各网盘已用 / 剩余容量",
+画成一张状态图(SVG -> PNG)发到 Telegram。
 
 用法:
   python3 flow_status.py               # 扫描 + 出图 + 发 TG
@@ -10,15 +11,23 @@
   python3 flow_status.py --text-only   # 不发图, 只发文字摘要
 
 环境变量: TG_TOKEN / TG_CHAT_ID / GH_TOKEN / GH_TOKEN_TAM(可选, 私有仓库用)
+          RCLONE_CONF(可选, 容量采集用) / ALIST_STORAGES_TY(可选, 容量采集用)
 
-安全: 只回应/发送给 TG_CHAT_ID; token 不进日志。
+容量区的清单(显示名 + 取自哪个远端/挂载)放在 PATHS_JSON 的 FS_QUOTA 里 —— 源码里
+不出现任何盘名/目录名(仓库是公开的)。
+
+安全: 只回应/发送给 TG_CHAT_ID; token 不进日志; 容量接口只读, 不写不改。
 """
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
+import random
 import re
+import shutil
+import string
 import subprocess
 import sys
 import time
@@ -91,6 +100,209 @@ def desc_of(name):
 # 失败时的「影响 / 处置」建议
 ADVICE = _meta("ADVICE", {})
 ADVICE_FALLBACK = ("该环节停摆，下游会缺料", "点开该 run 看完整日志")
+
+# ---- 网盘容量区 ----
+# 清单真值在配置里(源码公开, 不留盘名), 形如:
+#   [{"k":"rclone","a":"<远端名>","n":"<显示名>"},
+#    {"k":"189","a":"<挂载路径>","n":"<显示名>"},
+#    {"k":"139","a":"<挂载路径>","t":<分区号>,"n":"<显示名>"}]
+QUOTA = _meta("QUOTA", [])
+QUOTA_NOTE = pathcfg.get("FS_QUOTA_NOTE", "")      # 纯文本, 不套 JSON
+
+_SIZE_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3,
+               "TIB": 1024 ** 4, "PIB": 1024 ** 5}
+
+
+def fmt_size(b):
+    """字节 -> 1.43T / 481G 这种短写法"""
+    if not b:
+        return "?"
+    for u, s in (("T", 1024 ** 4), ("G", 1024 ** 3), ("M", 1024 ** 2), ("K", 1024)):
+        if b >= s:
+            return "%.2f%s" % (b / float(s), u)
+    return "%dB" % int(b)
+
+
+def _storages():
+    """CI Secret ALIST_STORAGES_TY: 挂载清单(各存储的凭证在内); addition 是 JSON 字符串"""
+    raw = os.environ.get("ALIST_STORAGES_TY", "")
+    if not raw:
+        return []
+    try:
+        arr = json.loads(raw)
+    except Exception:
+        return []
+    out = []
+    for it in (arr if isinstance(arr, list) else []):
+        if not isinstance(it, dict):
+            continue
+        add = it.get("addition") or "{}"
+        if isinstance(add, str):
+            try:
+                add = json.loads(add)
+            except Exception:
+                add = {}
+        out.append((it.get("mount_path") or "", add))
+    return out
+
+
+def _pick(adds, mount, key):
+    """按挂载路径挑带某个凭证字段的存储; 路径留空就取第一个匹配的"""
+    for mp, add in adds:
+        if mount and mp != mount:
+            continue
+        if add.get(key):
+            return add
+    return {}
+
+
+def quota_rclone(remote):
+    """rclone about <远端>: -> (总量, 已用)。配置由 CI 写进 ~/.config/rclone/rclone.conf"""
+    exe = shutil.which("rclone")
+    if not exe or not remote:
+        return None
+    try:
+        r = subprocess.run([exe, "about", remote.rstrip(":") + ":"],
+                           capture_output=True, text=True, errors="replace", timeout=150)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    vals = {}
+    for ln in (r.stdout or "").splitlines():
+        m = re.match(r"^\s*(Total|Used|Trashed)\s*:\s*([\d.]+)\s*([KMGT]?i?B)\s*$", ln, re.I)
+        if not m:
+            continue
+        unit = m.group(3).upper()
+        if unit in _SIZE_UNITS:
+            vals[m.group(1).lower()] = float(m.group(2)) * _SIZE_UNITS[unit]
+    if vals.get("total"):
+        return (int(vals["total"]), int(vals.get("used") or 0))
+    return None
+
+
+def quota_189(mount):
+    """走 189 协议盘的会话接口取账号容量(个人云 / 家庭云同账号共用一个池子)"""
+    add = _pick(_storages(), mount, "access_token")
+    tok = add.get("access_token") or ""
+    if not tok:
+        return None
+    try:
+        import ty189                       # 同仓库 tools/ty189.py, 只管签名与请求
+        c = ty189.Ty189(tok, add.get("family_id") or "", is_family=False)
+        c.login()
+        d = c.request("GET", ty189.API + "/portal/getUserSizeInfo.action")
+    except Exception:
+        return None
+    try:
+        total = int(d.get("totalSize") or 0)
+        used = int(d.get("usedSize") or 0)
+    except Exception:
+        return None
+    return (total, used) if total > 0 else None
+
+
+def _mcloud_sign(body, ts, rand):
+    """云盘签名: enc -> 逐字符排序 -> base64 -> md5(md5(b64)+md5(ts:rand)) 转大写"""
+
+    def enc(s):
+        r = urllib.parse.quote(s, safe="")
+        for a, b in (("+", "%20"), ("%21", "!"), ("%27", "'"),
+                     ("%28", "("), ("%29", ")"), ("%2A", "*")):
+            r = r.replace(a, b)
+        return r
+
+    def md5(s):
+        return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+    b64 = base64.b64encode("".join(sorted(enc(body))).encode("utf-8")).decode()
+    return md5(md5(b64) + md5(ts + ":" + rand)).upper()
+
+
+def quota_139(mount, drive_type):
+    """配额接口: 一次返回该账号下各分区(个人云 / 家庭云 ...)的已用量
+
+    单位随接口: 已用量是 **MB**; 总量字段实测是 **GB** —— 两个口径对不上时
+    宁可只报已用, 不硬凑一个百分比出来。
+    """
+    add = _pick(_storages(), mount, "authorization")
+    auth = add.get("authorization") or ""
+    if not auth:
+        return None
+    body = "{}"
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    rand = "".join(random.choices(string.ascii_letters + string.digits, k=16))
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Authorization": "Basic " + auth,
+        "Caller": "web",
+        "Cms-Device": "default",
+        "Content-Type": "application/json",
+        "Mcloud-Channel": "1000101",
+        "Mcloud-Client": "10701",
+        "Mcloud-Route": "001",
+        "Mcloud-Sign": "%s,%s,%s" % (ts, rand, _mcloud_sign(body, ts, rand)),
+        "Mcloud-Version": "7.14.0",
+        "X-Yun-Api-Version": "v1",
+        "X-Yun-Module-Type": "100",
+        "X-Yun-Svc-Type": "1",
+    }
+    try:
+        req = urllib.request.Request(
+            "https://user-njs.yun.139.com/user/disk/quota/detail",
+            data=body.encode("utf-8"), headers=headers, method="POST")
+        with urllib.request.build_opener(
+                urllib.request.ProxyHandler({})).open(req, timeout=90) as x:
+            d = json.loads(x.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    data = d.get("data") or {}
+    used = 0
+    for q in (data.get("quotaList") or []):
+        try:
+            if int(q.get("driveType") or -1) == int(drive_type):
+                used = int(q.get("usedSize") or 0) * 1024 ** 2          # 已用: MB
+                break
+        except Exception:
+            continue
+    try:
+        total = int(data.get("diskSize") or 0) * 1024 ** 3             # 总量: GB
+    except Exception:
+        total = 0
+    if used <= 0:
+        return None
+    if total <= 0 or used > total:            # 口径不一致 -> 只报已用
+        return (None, used)
+    return (total, used)
+
+
+def collect_quotas():
+    """按配置清单逐个采集; 采不到的回来标「未取到」, 不影响别的"""
+    rows = []
+    for spec in QUOTA:
+        if not isinstance(spec, dict):
+            continue
+        kind = str(spec.get("k") or "")
+        arg = spec.get("a") or ""
+        name = spec.get("n") or arg
+        r = None
+        try:
+            if kind == "rclone":
+                r = quota_rclone(arg)
+            elif kind == "189":
+                r = quota_189(arg)
+            elif kind == "139":
+                r = quota_139(arg, spec.get("t"))
+        except Exception:
+            r = None
+        total, used = (r if r else (None, None))
+        rows.append({"n": name, "total": total, "used": used,
+                     "note": spec.get("note") or ""})
+        log("容量 %-18s %s" % (name, ("已用 %s / 总 %s" % (fmt_size(used), fmt_size(total)))
+                               if total else ("已用 %s（总量未取到）" % fmt_size(used)
+                                              if used else (spec.get("note") or "未取到"))))
+    return rows
+
 
 COL_X = [16, 186, 356, 526]
 ROW_Y = [108, 172, 236, 300]
@@ -261,13 +473,20 @@ def esc(s):
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def render_svg(items, ts):
+def render_svg(items, ts, quotas=None):
+    quotas = quotas or []
     by = {it["name"]: it for it in items}
+    fails = [i for i in items if i["state"] == "fail"]
+    box_h = 156 if fails else 60
+    y_sec = 376 + box_h + 44                 # 容量区标题基线
+    y_rows = y_sec + 16                      # 第一根容量条的上沿
+    pitch = 28
+    H = (y_rows + len(quotas) * pitch + 36) if quotas else 556
     L = []
     L.append('<svg viewBox="0 0 680 %d" xmlns="http://www.w3.org/2000/svg" '
              'font-family="Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Zen Hei, sans-serif">'
-             % 556)
-    L.append('<rect x="0" y="0" width="680" height="556" fill="#ffffff"/>')
+             % H)
+    L.append('<rect x="0" y="0" width="680" height="%d" fill="#ffffff"/>' % H)
     L.append('<text x="16" y="26" font-size="15" font-weight="700" fill="#1f2937">'
              '云流程状态总览 · 每 6 小时刷新</text>')
     n_fail = sum(1 for i in items if i["state"] == "fail")
@@ -342,11 +561,52 @@ def render_svg(items, ts):
                  '【全部正常】没有失败流程</text>')
         L.append('<text x="32" y="424" font-size="10.5" fill="#15803d">'
                  '（黄色的只是超过预期周期没跑或正在跑 —— GitHub 定时任务常有几小时漂移，属正常）</text>')
+    # ---- 网盘容量 ----
+    if quotas:
+        L.append('<line x1="16" y1="%d" x2="664" y2="%d" stroke="#e2e8f0"/>'
+                 % (y_sec - 30, y_sec - 30))
+        L.append('<text x="16" y="%d" font-size="12.5" font-weight="700" fill="#1f2937">'
+                 '网盘容量</text>' % y_sec)
+        L.append('<text x="664" y="%d" font-size="9.5" fill="#94a3b8" '
+                 'text-anchor="end">已用 / 总量 · 剩余</text>' % y_sec)
+        for i, q in enumerate(quotas):
+            y = y_rows + i * pitch
+            cy = y + 7
+            total, used = q["total"], q["used"]
+            pct = (float(used) / total) if (total and used) else None
+            if pct is None:
+                col = "#94a3b8"
+            elif pct < 0.7:
+                col = "#16a34a"
+            elif pct <= 0.9:
+                col = "#ca8a04"
+            else:
+                col = "#dc2626"
+            L.append('<text x="20" y="%d" font-size="10.5" fill="#334155" '
+                     'dominant-baseline="middle">%s</text>' % (cy, esc(q["n"])))
+            L.append('<rect x="146" y="%d" width="320" height="14" rx="7" fill="#e2e8f0"/>' % y)
+            if pct is not None:
+                L.append('<rect x="146" y="%d" width="%d" height="14" rx="7" fill="%s"/>'
+                         % (y, max(6, int(320 * min(pct, 1.0))), col))
+                txt = "已用 %s / 总 %s · 剩 %d%%" % (
+                    fmt_size(used), fmt_size(total), max(0, int(round((1 - pct) * 100))))
+            elif used:
+                txt = "已用 %s（总量未取到）" % fmt_size(used)
+            elif q.get("note"):
+                txt = q["note"]
+            else:
+                txt = "未取到"
+            L.append('<text x="478" y="%d" font-size="10" fill="%s" '
+                     'dominant-baseline="middle">%s</text>'
+                     % (cy, col if pct is not None else "#94a3b8", esc(txt)))
+        if QUOTA_NOTE:
+            L.append('<text x="16" y="%d" font-size="9" fill="#94a3b8">%s</text>'
+                     % (y_rows + len(quotas) * pitch + 14, esc(QUOTA_NOTE)))
     L.append("</svg>")
     return "\n".join(L)
 
 
-def build_caption(items, ts):
+def build_caption(items, ts, quotas=None):
     n_fail = sum(1 for i in items if i["state"] == "fail")
     n_late = sum(1 for i in items if i["state"] in ("late", "running"))
     n_ok = sum(1 for i in items if i["state"] == "ok")
@@ -357,6 +617,12 @@ def build_caption(items, ts):
         for f in [i for i in items if i["state"] == "fail"][:3]:
             err = (f["errors"] or ["(见日志)"])[0]
             s += "\n\n✕ %s（%s）\n%s" % (f["name"], f["time"], err[:120])
+    tight = [q for q in (quotas or []) if q["total"] and q["used"]]
+    if tight:
+        tight.sort(key=lambda q: q["used"] / float(q["total"]), reverse=True)
+        s += "\n\n容量最紧：" + " · ".join(
+            "%s 剩%d%%" % (q["n"], max(0, int(round(
+                (1 - q["used"] / float(q["total"])) * 100)))) for q in tight[:3])
     return s[:1000]
 
 
@@ -379,7 +645,8 @@ def main():
         log("%-14s %-8s %s" % (it["name"], it["state"], it["note"] or it["time"]))
         items.append(it)
     ts = datetime.now(BJ).strftime("%m-%d %H:%M")
-    svg = render_svg(items, ts)
+    quotas = collect_quotas()
+    svg = render_svg(items, ts, quotas)
     svg_p = a.out + ".svg"
     io.open(svg_p, "w", encoding="utf-8", newline="\n").write(svg)
     log("SVG -> %s (%d 字节)" % (svg_p, len(svg)))
@@ -399,7 +666,7 @@ def main():
     if not chat:
         log("!! 缺 TG_CHAT_ID")
         return 1
-    cap = build_caption(items, ts)
+    cap = build_caption(items, ts, quotas)
     if png_p:
         d = tg_call("sendPhoto", {"chat_id": chat, "caption": cap},
                     files={"photo": ("flow_status.png", io.open(png_p, "rb").read())})
