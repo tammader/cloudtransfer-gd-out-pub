@@ -29,6 +29,8 @@ env:
   GH_TOKEN: ${{ secrets.GH_TOKEN }}
   GH_TOKEN_TAM: ${{ secrets.GH_TOKEN_TAM }}
   PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  # 容量区用: 挂载清单(含各存储凭证)。采不到就整段跳过, 不影响状态判定。
+  ALIST_STORAGES_TY: ${{ secrets.ALIST_STORAGES_TY }}
 
 jobs:
   status:
@@ -43,6 +45,21 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq fonts-noto-cjk librsvg2-bin
           rsvg-convert --version
+
+      - name: 装 rclone(容量区要读远端配额)
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          echo "配置里的远端: $(grep -c '^\[' ~/.config/rclone/rclone.conf) 段"
 
       - name: 扫描 + 出图 + 发 Telegram
         run: |
