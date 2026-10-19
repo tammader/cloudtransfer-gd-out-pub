@@ -1,0 +1,204 @@
+name: gd2-teldrive
+
+# gdrive2 -> Teldrive(Telegram) 冷备份   【公开仓库版, Actions 不计费】
+#
+# 为什么搬到公开仓库: 私有仓库跑 350 分钟的 job 要烧额度; 公开仓库免费。
+# 代价是日志任何人可读, 所以:
+#   * 脚本开头 logmask.install() 把文件名/目录名/远端名换成 <file:hash>/<path:hash>;
+#   * rclone 的输出被 Popen 接进 Python 再打印, 保证也过一遍脱敏(不能直接继承 fd);
+#   * 真实路径只存在 Secret PATHS_JSON_TD / PATHS_JSON 里, 源码与日志零明文。
+# 报告图仍然发给 Telegram, 图里带目录名(那是私聊, 不进日志)。
+#
+#   Teldrive 是跑在 Unikraft 上的 Telegram 网盘, 走 HTTP API。
+#   ⚠️ 官方 rclone **没有** teldrive backend, 必须装 tgdrive/rclone fork。
+#      fork 是官方版的超集, 所以同一个二进制 gdrive2 / teldrive 都能连。
+#   单向: 源不动, 同名同大小跳过。
+#   ⚠️ 默认「真传」。只有手动 dispatch 时显式填 apply=false 才演练。
+#      必须默认真传: schedule 触发时 inputs 上下文是空的, 表达式 ${inputs.apply || 'x'}
+#      只会拿到兜底值 x; 以前兜底写的 'false', 结果每 6 小时定时跑的全是演练。
+#   单轮限量(max_transfer_gb) + 时间预算(budget_min), 到点优雅收工下次继续。
+#   报告: GT_REPORT 指向的路径, 含未完成明细(下次会重挑)。
+#
+# 需要 Secrets: RCLONE_CONF / PATHS_JSON / PATHS_JSON_TD /
+#               TELDRIVE_API_HOST / TELDRIVE_API_KEY / TG_TOKEN / TG_CHAT_ID / GH_TOKEN
+# 与 yd2-teldrive 错开: 本条 40 */6, 那条 20 */6。
+
+on:
+  # 每 6 小时 (UTC 0:40/6:40/12:40/18:40 = 北京 8:40/14:40/20:40/次日 2:40)
+  schedule:
+    - cron: "40 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真传(默认), false=只演练看计划(不传任何东西)"
+        required: false
+        default: "true"
+      max_transfer_gb:
+        description: "本轮传输总量上限(GB); 实测 ~8MiB/s, 270 分钟约 130GB, 默认 150 够用"
+        required: false
+        default: "150"
+      budget_min:
+        description: "本轮时间预算(分钟)。job 硬上限 350, 默认 270 留 80 分钟收尾(曾有一轮卡到 350 被强杀)"
+        required: false
+        default: "270"
+      transfers:
+        description: "并发文件数。求稳 3; Telegram 侧并发高容易 504/限流"
+        required: false
+        default: "3"
+      chunk_mb:
+        description: "Teldrive 分片大小(MB)。Unikraft 网关实测单请求体上限 8MiB(9Mi 起 413), 所以默认 8; 调大必炸"
+        required: false
+        default: "8"
+      max_dirs:
+        description: "本轮最多备份几个文件夹; 0=不限(按总量上限收工)"
+        required: false
+        default: "0"
+      video_only:
+        description: "true=只传视频文件; false=整个文件夹都传(含字幕/图片)"
+        required: false
+        default: "false"
+      only:
+        description: "只备份这一个文件夹(相对路径, 留空=自动扫描); 调试用"
+        required: false
+        default: ""
+
+concurrency:
+  group: gd2-teldrive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 路径真值走加密 Secret; 日志里只会显示 ***
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  PATHS_JSON_TD: ${{ secrets.PATHS_JSON_TD }}
+  # 公开仓库: 日志脱敏强制开启(文件名/路径 -> 哈希标签)
+  LOG_MASK: "1"
+  # 固定用这个 fork 版本(内含 teldrive backend)
+  RCLONE_FORK_VERSION: "v1.75.4"
+  # 收尾出图发 Telegram(跟 flow-status 同一套: SVG -> PNG -> sendPhoto)
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  # 备份统计落点; 出图脚本读它。目录跟备份脚本的 GT_WORK 默认一致
+  TD_STATS_JSON: /tmp/gd2teldrive/stats.json
+
+jobs:
+  gd2-teldrive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装中文字体 + SVG 转 PNG 工具
+        run: |
+          # 收尾那步要用 rsvg-convert 把报告图转成 PNG 发 Telegram;
+          # 中文字体现在不装, 图上标题就是一排豆腐块
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk librsvg2-bin
+          rsvg-convert --version
+          fc-list :lang=zh | head -3
+
+      - name: 环境自检(磁盘/内存/时间)
+        run: |
+          echo "===== 磁盘 ====="; df -h /
+          echo "===== CPU/内存 ====="; nproc; free -h || true
+          echo "===== UTC / 北京 ====="; date -u; TZ=Asia/Shanghai date
+
+      - name: 装 rclone（补丁版，允许 8Mi 小分片，绕开 Unikraft 8MiB 请求体上限）
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 上游 fork 把分片强制 ≥64MiB 并对齐 16MiB, 在这里必然 413;
+          # 用 build-td-rclone.yml 编出来的补丁版(下限 4MiB / 对齐 1MiB)。
+          # 资产在**私有**仓库的 release 里, 匿名 curl 会 404 -> 必须 gh + token
+          T="td-rclone-${RCLONE_FORK_VERSION}"
+          gh release download "$T" -R tammader/cloudtransfer-gd-out \
+            -p rclone-linux-amd64 -O /tmp/rclone-td --clobber
+          install -m 0755 /tmp/rclone-td /usr/local/bin/rclone
+          echo "===== 版本 ====="
+          rclone version > /tmp/td_ver.txt
+          head -3 /tmp/td_ver.txt
+          echo "===== teldrive backend 自检(装错会在这里炸) ====="
+          # 注意: 别用 `rclone help ... | head`, 有 pipefail 时 SIGPIPE 会让这步以 141 失败
+          rclone help backend teldrive > /tmp/td_help.txt
+          head -14 /tmp/td_help.txt
+
+      - name: 检查必备 Secret
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          PATHS_JSON_TD: ${{ secrets.PATHS_JSON_TD }}
+        run: |
+          miss=0
+          [ -n "$TELDRIVE_API_KEY" ]  || { echo "!! 缺 Secret TELDRIVE_API_KEY";  miss=1; }
+          [ -n "$TELDRIVE_API_HOST" ] || { echo "!! 缺 Secret TELDRIVE_API_HOST"; miss=1; }
+          [ -n "$RCLONE_CONF" ]       || { echo "!! 缺 Secret RCLONE_CONF";       miss=1; }
+          [ -n "$PATHS_JSON_TD" ]     || { echo "!! 缺 Secret PATHS_JSON_TD (GT_SRC/GT_DST/GT_REPORT)"; miss=1; }
+          if [ "$miss" = "1" ]; then
+            echo ""
+            echo "怎么拿 TELDRIVE_API_KEY: 打开 Teldrive 网页 → 登录 → Settings → API keys → 新建 → 复制"
+            exit 1
+          fi
+          echo "必备 Secret 齐全"
+
+      - name: 写 rclone 配置 (gdrive2 等现有远端)
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          echo "现有远端: $(grep -c '^\[' ~/.config/rclone/rclone.conf) 段"
+
+      - name: 添加 teldrive 远端
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+        run: |
+          set -euo pipefail
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" \
+            api_key="$TELDRIVE_API_KEY" >/dev/null
+          echo "远端清单:"
+          rclone listremotes
+          echo "===== 连通性测试 ====="
+          rclone lsd teldrive: 2>&1 | head -10 || echo "(根目录为空或列不出, 继续)"
+
+      - name: 跑 gd2 -> teldrive 备份
+        env:
+          # schedule 触发时 inputs 为空 -> 走兜底 'true'; 手动 dispatch 时以填的值为准
+          APPLY: ${{ inputs.apply || 'true' }}
+          # 触发来源, 打进报告图副标题, 一眼分清定时/手动
+          TD_EVENT: ${{ github.event_name }}
+          MAX_GB: ${{ inputs.max_transfer_gb || '150' }}
+          BUDGET: ${{ inputs.budget_min || '270' }}
+          TRANSFERS: ${{ inputs.transfers || '3' }}
+          CHUNK: ${{ inputs.chunk_mb || '8' }}
+          MAX_DIRS: ${{ inputs.max_dirs || '0' }}
+          VIDEO_ONLY: ${{ inputs.video_only || 'false' }}
+          ONLY: ${{ inputs.only || '' }}
+          # 开跑前清理上一轮残留的 open upload session(409 冲突的根源), 需要这两个
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set -x
+          ARGS="--max-transfer-gb $MAX_GB --budget-min $BUDGET"
+          ARGS="$ARGS --transfers $TRANSFERS --chunk-mb $CHUNK --max-dirs $MAX_DIRS"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          if [ "$VIDEO_ONLY" = "true" ]; then ARGS="$ARGS --video-only"; fi
+          if [ -n "$ONLY" ]; then ARGS="$ARGS --only '$ONLY'"; fi
+          python3 tools/gd2_teldrive_backup.py $ARGS
+
+      - name: 出报告图并发 Telegram
+        if: always()
+        run: |
+          # 统计文件不存在也照样出图(画一张「没跑出统计」的告警卡片),
+          # 这样备份步骤自己炸了也能收到通知
+          python3 tools/gd2_teldrive_report.py || echo "!! 出图/发 TG 失败(不影响备份结果)"
+
+      - name: 收尾(报剩余空间)
+        if: always()
+        run: df -h / | tail -1
