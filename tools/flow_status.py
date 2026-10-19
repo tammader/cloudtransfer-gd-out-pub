@@ -127,6 +127,12 @@ ADVICE_DEFAULT = {
 #    {"k":"189","a":"<挂载路径>","n":"<显示名>"},
 #    {"k":"139","a":"<挂载路径>","t":<分区号>,"n":"<显示名>"}]
 QUOTA = _meta("QUOTA", [])
+# teldrive 走 Telegram, 没有"总量"概念(只有已用)。配置里没登记就自动补一条,
+# 否则卡片上永远看不到它到底吃进去多少。
+if not any("teldrive" in str(s.get("n", "")).lower() for s in QUOTA if isinstance(s, dict)):
+    QUOTA = list(QUOTA) + [
+        {"k": "size", "a": "teldrive", "n": "teldrive（Telegram）", "note": "不限容量"}]
+
 QUOTA_NOTE = pathcfg.get("FS_QUOTA_NOTE", "")      # 纯文本, 不套 JSON
 
 _SIZE_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3,
@@ -188,8 +194,7 @@ def _none(name, why):
 
 def quota_rclone(remote, name=""):
     """rclone about <远端>: -> (总量, 已用)。配置由 CI 写进 ~/.config/rclone/rclone.conf"""
-    exe = shutil.which("rclone")
-    if not exe or not remote:
+    exe = shutil.which("rclone")    if not exe or not remote:
         return _none(name, "本机/CI 没装 rclone 或没配该远端")
     try:
         r = subprocess.run([exe, "about", remote.rstrip(":") + ":"],
@@ -210,6 +215,33 @@ def quota_rclone(remote, name=""):
     if vals.get("total"):
         return (int(vals["total"]), int(vals.get("used") or 0))
     return _none(name, "about 没返回总量(该盘无配额接口)")
+
+
+_EXTRA = {}        # 附带信息(如 teldrive 的文件数), 只进日志/文案, 不上条形图
+
+
+def quota_size(remote, name=""):
+    """没有配额接口的盘(teldrive): rclone size 数出已用, 返回 (None, used)。
+    总量给 None -> 卡片上显示"已用 X（不限容量）", 不画百分比条。"""
+    exe = shutil.which("rclone")
+    if not exe or not remote:
+        return _none(name, "本机/CI 没装 rclone 或没配该远端")
+    try:
+        r = subprocess.run([exe, "size", remote.rstrip(":") + ":", "--json"],
+                           capture_output=True, text=True, errors="replace", timeout=300)
+    except Exception:
+        return _none(name, "rclone size 超时/异常")
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        return _none(name, "rclone size 失败: %s" % (tail[-1][:60] if tail else "未知"))
+    try:
+        d = json.loads((r.stdout or "").strip().splitlines()[-1])
+        used = int(d.get("bytes") or 0)
+        cnt = int(d.get("count") or 0)
+    except Exception:
+        return _none(name, "size 输出解析失败")
+    _EXTRA[name] = "%d 个文件" % cnt
+    return (None, used)
 
 
 def quota_189(mount, name=""):
@@ -334,6 +366,8 @@ def collect_quotas():
         try:
             if kind == "rclone":
                 r = quota_rclone(arg, name)
+            elif kind == "size":
+                r = quota_size(arg, name)
             elif kind == "189":
                 r = quota_189(arg, name)
             elif kind == "139":
@@ -349,11 +383,13 @@ def collect_quotas():
         total, used = (r if r else (None, None))
         if not r and _WHY.get(name):
             note = "未取到：%s" % _WHY[name]
+        if used and _EXTRA.get(name):
+            note = (note + " · " if note else "") + _EXTRA[name]
         rows.append({"n": name, "total": total, "used": used, "note": note})
         log("容量 %-18s %s%s" % (
             name,
             ("已用 %s / 总 %s" % (fmt_size(used), fmt_size(total)))
-            if total else ("已用 %s（总量未取到）" % fmt_size(used) if used else "未取到"),
+            if total else ("已用 %s（无总量）" % fmt_size(used) if used else "未取到"),
             ("  [" + note + "]") if note else ""))
     return rows
 
@@ -654,7 +690,8 @@ def render_svg(items, ts, quotas=None):
                 txt = "已用 %s / 总 %s · 剩 %d%%" % (
                     fmt_size(used), fmt_size(total), max(0, int(round((1 - pct) * 100))))
             elif used:
-                txt = "已用 %s（总量未取到）" % fmt_size(used)
+                txt = "已用 %s（不限容量）" % fmt_size(used) if "不限" in (q.get("note") or "") \
+                    else "已用 %s（总量未取到）" % fmt_size(used)
             elif q.get("note"):
                 txt = q["note"][:26]          # 卡片位置窄, 原因只留头一段
             else:
