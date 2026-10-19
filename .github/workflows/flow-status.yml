@@ -66,3 +66,14 @@ jobs:
           ARGS=""
           if [ "${{ inputs.text_only }}" = "true" ]; then ARGS="--text-only"; echo "(只发文字)"; fi
           python3 tools/flow_status.py $ARGS
+
+      - name: 留存卡片(7 天, 方便回看/下载)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow-status-card
+          path: |
+            tools/flow_status.png
+            tools/flow_status.svg
+          if-no-files-found: ignore
+          retention-days: 7
