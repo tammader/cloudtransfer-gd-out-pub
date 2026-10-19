@@ -159,8 +159,15 @@ def main():
             token = login(a.user, a.password)
             print("管理 API 可用, 逐个建存储")
             for st in storages:
-                add_via_api(st, token)
-                print("   OK %s (%s)" % (st["mount_path"], st["driver"]))
+                try:
+                    add_via_api(st, token)
+                    print("   OK %s (%s)" % (st["mount_path"], st["driver"]))
+                except Exception as e:
+                    # 单个存储失败(典型: 某个盘 authorization 过期)绝不能拖垮整轮 ——
+                    # 以前一个存储报错就清空 token、退化成"只写库", 下一步拿不到
+                    # ALIST_TOKEN 直接 exit 1, 无辜的其它盘跟着全废。
+                    print("   !! 跳过 %s (%s): %s"
+                          % (st["mount_path"], st["driver"], str(e)[:120]))
         except Exception as e:
             print("  !! API 建存储失败: %s -> 改用直接写库" % str(e)[:120])
             token = ""
