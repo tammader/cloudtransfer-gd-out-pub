@@ -1,0 +1,88 @@
+name: td-probe
+
+# teldrive 写入探针：不碰移动云盘，直接造一个 N MB 随机文件 copyto 上去。
+# 目的：把「上传失败」从 139 列目录里剥出来，单独定位 teldrive 写入到底卡在哪。
+#   小文件(5MB)成功 -> 说明通路活着，问题在大文件/分片
+#   小文件也 504 -> 说明是平台/实例层面，跟文件无关
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: "测试文件大小(MB)"
+        required: false
+        default: "5"
+      chunk_mb:
+        description: "分片大小(MiB), 8=绕开 Unikraft 边缘 8MiB 上限"
+        required: false
+        default: "8"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 装补丁版 rclone(含 teldrive backend)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 \
+            --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -3
+          rclone help backend teldrive | grep -iE "chunk|multi" | head -8
+
+      - name: 配 teldrive 远端 + 连通性自检
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+        run: |
+          set -euo pipefail
+          echo "HOST=[$TELDRIVE_API_HOST]"
+          echo -n "GET /api/v1/me -> "
+          curl -s -o /dev/null -w '%{http_code}  (%{time_total}s)\n' --max-time 40 \
+            "$TELDRIVE_API_HOST/api/v1/me" || echo "curl failed"
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" >/dev/null
+          echo "--- lsd teldrive: ---"
+          rclone lsd teldrive: -vv 2>&1 | tail -6
+
+      - name: 造测试文件
+        run: |
+          set -euo pipefail
+          dd if=/dev/urandom of=/tmp/probe.bin bs=1M count=${{ inputs.size_mb }} status=none
+          ls -l /tmp/probe.bin
+          echo -n "sha256(前16): "; sha256sum /tmp/probe.bin | cut -c1-16
+
+      - name: 直传 teldrive
+        env:
+          SIZE: ${{ inputs.size_mb }}
+          CHUNK: ${{ inputs.chunk_mb }}
+        run: |
+          set +e
+          START=$(date +%s)
+          rclone copyto /tmp/probe.bin "teldrive:probe/s${SIZE}m_c${CHUNK}.bin" \
+            --teldrive-chunk-size "${CHUNK}Mi" \
+            --transfers 1 --checkers 1 \
+            --retries 1 --low-level-retries 1 \
+            --contimeout 60s --timeout 600s \
+            --stats 5s --stats-one-line -vv > /tmp/up.log 2>&1
+          RC=$?
+          END=$(date +%s)
+          echo "=== RC=$RC  用时 $((END-START))s ==="
+          tail -40 /tmp/up.log
+
+      - name: 核对目标端
+        if: always()
+        run: |
+          set +e
+          echo "--- ls probe ---"
+          rclone lsl teldrive:probe -vv 2>&1 | tail -10
+          echo "--- size probe ---"
+          rclone size teldrive:probe 2>&1 | tail -5
