@@ -46,19 +46,30 @@ jobs:
           sudo apt-get install -y -qq fonts-noto-cjk librsvg2-bin
           rsvg-convert --version
 
-      - name: 装 rclone(容量区要读远端配额)
+      - name: 装 rclone（补丁版: 同时支持 teldrive 与各盘 about）
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
-          unzip -q -o /tmp/r.zip -d /tmp
-          cp /tmp/rclone-*/rclone /usr/local/bin/
-          rclone version | head -1
+          set -euo pipefail
+          # 官方版没有 teldrive backend; 补丁版是超集, about/size 都照常
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -2
+          rclone help backend teldrive > /dev/null && echo "teldrive backend OK"
 
-      - name: 写 rclone 配置
+      - name: 写 rclone 配置（+ teldrive 远端）
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
         run: |
           mkdir -p ~/.config/rclone
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          # teldrive 没有"总量"(Telegram 不限), 用 rclone size 数已用
+          rclone config create teldrive teldrive api_host="$TELDRIVE_API_HOST" \
+            api_key="$TELDRIVE_API_KEY" >/dev/null || echo "(teldrive 远端没建起来)"
           echo "配置里的远端: $(grep -c '^\[' ~/.config/rclone/rclone.conf) 段"
 
       - name: 扫描 + 出图 + 发 Telegram
