@@ -62,6 +62,9 @@ WATCH = [
     ("tammader/cloudtransfer-gd-out-pub", "out2-ty-sync.yml", "out2-ty-sync", 3, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "od2-tg-gd2.yml", "od2-tg-gd2", 6, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "gd-backup.yml", "gd-backup", 12, "A"),
+    # teldrive 冷备两条(2026-10-20 纳入总览): 都跑在公开仓库, 周期 6h
+    ("tammader/cloudtransfer-gd-out-pub", "yd2-teldrive.yml", "yd2-teldrive", 6, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "gd2-teldrive.yml", "gd2-teldrive", 6, "A"),
 ]
 
 NAMES = [e[2] for e in WATCH]
@@ -88,18 +91,35 @@ GROUPS = _meta("GROUPS", [
     ("④ 落地 / 备份", ["od2-dbjm", "out2-ty-sync", "gd-backup"]),
 ])
 
+# 配置里没登记的新流程 -> 自动挂到最后一列, 否则会从图上"消失"(只更新 WATCH 就能上图)
+_seen = {n for _, ns in GROUPS for n in ns}
+_extra = [n for n in NAMES if n not in _seen]
+if _extra:
+    _t, _ns = GROUPS[-1]
+    GROUPS = list(GROUPS)
+    GROUPS[-1] = (_t, list(_ns) + _extra)
+
 # 每个流程的功能说明(卡片里那一行)
 DESC = _meta("DESC", {})
 DESC_FALLBACK = "（未配置说明）"
+# 新增流程的说明兜底(配置里还没登记时用; 都是中性描述, 不含盘名/路径)
+DESC_DEFAULT = {
+    "yd2-teldrive": "移动云盘 → teldrive 冷备",
+    "gd2-teldrive": "gdrive2 → teldrive 冷备",
+}
 
 
 def desc_of(name):
-    return DESC.get(name) or DESC_FALLBACK
+    return DESC.get(name) or DESC_DEFAULT.get(name) or DESC_FALLBACK
 
 
 # 失败时的「影响 / 处置」建议
 ADVICE = _meta("ADVICE", {})
 ADVICE_FALLBACK = ("该环节停摆，下游会缺料", "点开该 run 看完整日志")
+ADVICE_DEFAULT = {
+    "yd2-teldrive": ("移动云盘/家庭云的冷备停了", "看 run 日志里的 401/504；先确认 139 token 是否过期"),
+    "gd2-teldrive": ("gdrive2 的冷备停了", "看 run 日志里的 409/504；确认 teldrive 实例是否正常"),
+}
 
 # ---- 网盘容量区 ----
 # 清单真值在配置里(源码公开, 不留盘名), 形如:
@@ -339,7 +359,10 @@ def collect_quotas():
 
 
 COL_X = [16, 186, 356, 526]
-ROW_Y = [108, 172, 236, 300]
+ROW_STEP = 64
+ROW_Y0 = 108
+# 原来固定 3 行; 现在按最长那一列算行数(流程加进来不会挤掉/越界)
+ROW_Y = [ROW_Y0 + i * ROW_STEP for i in range(10)]
 NODE_W, NODE_H = 150, 56
 STATE_STYLE = {
     "ok":      ("#dcfce7", "#16a34a", "#14532d", "#15803d"),
@@ -512,10 +535,14 @@ def render_svg(items, ts, quotas=None):
     by = {it["name"]: it for it in items}
     fails = [i for i in items if i["state"] == "fail"]
     box_h = 156 if fails else 60
-    y_sec = 376 + box_h + 44                 # 容量区标题基线
+    # 行数跟着最长那一列走: 多一行就整体下移 64px, 容量区不会压到方框上
+    max_rows = max([len(ns) for _, ns in GROUPS] or [3])
+    grow = max(0, max_rows - 3) * ROW_STEP
+    box_y = 376 + grow                       # 失败/正常提示框的上沿
+    y_sec = box_y + box_h + 44               # 容量区标题基线
     y_rows = y_sec + 16                      # 第一根容量条的上沿
     pitch = 28
-    H = (y_rows + len(quotas) * pitch + 36) if quotas else 556
+    H = (y_rows + len(quotas) * pitch + 36) if quotas else (box_y + box_h + 60)
     L = []
     L.append('<svg viewBox="0 0 680 %d" xmlns="http://www.w3.org/2000/svg" '
              'font-family="Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Zen Hei, sans-serif">'
@@ -566,14 +593,15 @@ def render_svg(items, ts, quotas=None):
     if fails:
         f = fails[0]
         imp, fix = ADVICE.get(f["name"], ADVICE_FALLBACK)
-        L.append('<rect x="16" y="376" width="648" height="156" rx="10" fill="#fef2f2" '
-                 'stroke="#fca5a5" stroke-width="1.5"/>')
-        L.append('<text x="32" y="402" font-size="12.5" font-weight="700" fill="#991b1b">'
+        L.append('<rect x="16" y="%d" width="648" height="156" rx="10" fill="#fef2f2" '
+                 'stroke="#fca5a5" stroke-width="1.5"/>' % box_y)
+        L.append('<text x="32" y="%d" font-size="12.5" font-weight="700" fill="#991b1b">'
                  '【失败】%s · %s · run %s%s</text>'
-                 % (esc(f["name"]), esc(f["time"]), f["run_id"],
+                 % (box_y + 26, esc(f["name"]), esc(f["time"]), f["run_id"],
                     "" if len(fails) == 1 else "（另有 %d 个失败）" % (len(fails) - 1)))
-        L.append('<line x1="32" y1="412" x2="648" y2="412" stroke="#fecaca"/>')
-        y = 430
+        L.append('<line x1="32" y1="%d" x2="648" y2="%d" stroke="#fecaca"/>'
+                 % (box_y + 36, box_y + 36))
+        y = box_y + 54
         L.append('<text x="32" y="%d" font-size="10.5" fill="#7f1d1d">'
                  '原因（自动抓日志里的错误行）：</text>' % y)
         y += 18
@@ -589,12 +617,13 @@ def render_svg(items, ts, quotas=None):
         L.append('<text x="32" y="%d" font-size="10.5" fill="#7f1d1d">处置：%s</text>'
                  % (y, esc(fix)))
     else:
-        L.append('<rect x="16" y="376" width="648" height="60" rx="10" fill="#f0fdf4" '
-                 'stroke="#bbf7d0"/>')
-        L.append('<text x="32" y="404" font-size="12.5" font-weight="700" fill="#166534">'
-                 '【全部正常】没有失败流程</text>')
-        L.append('<text x="32" y="424" font-size="10.5" fill="#15803d">'
-                 '（黄色的只是超过预期周期没跑或正在跑 —— GitHub 定时任务常有几小时漂移，属正常）</text>')
+        L.append('<rect x="16" y="%d" width="648" height="60" rx="10" fill="#f0fdf4" '
+                 'stroke="#bbf7d0"/>' % box_y)
+        L.append('<text x="32" y="%d" font-size="12.5" font-weight="700" fill="#166534">'
+                 '【全部正常】没有失败流程</text>' % (box_y + 28))
+        L.append('<text x="32" y="%d" font-size="10.5" fill="#15803d">'
+                 '（黄色的只是超过预期周期没跑或正在跑 —— GitHub 定时任务常有几小时漂移，属正常）</text>'
+                 % (box_y + 48))
     # ---- 网盘容量 ----
     if quotas:
         L.append('<line x1="16" y1="%d" x2="664" y2="%d" stroke="#e2e8f0"/>'
