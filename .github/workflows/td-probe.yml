@@ -67,16 +67,19 @@ jobs:
         run: |
           set +e
           START=$(date +%s)
+          # 参数与 yd2_teldrive.py 完全一致（关 BLAKE3 树哈希、单文件单流）
           rclone copyto /tmp/probe.bin "teldrive:probe/s${SIZE}m_c${CHUNK}.bin" \
             --teldrive-chunk-size "${CHUNK}Mi" \
+            --teldrive-hash-enabled=false \
+            --multi-thread-streams 0 \
             --transfers 1 --checkers 1 \
-            --retries 1 --low-level-retries 1 \
+            --retries 2 --retries-sleep 30s --low-level-retries 10 \
             --contimeout 60s --timeout 600s \
-            --stats 5s --stats-one-line -vv > /tmp/up.log 2>&1
+            --stats 10s --stats-one-line -vv > /tmp/up.log 2>&1
           RC=$?
           END=$(date +%s)
           echo "=== RC=$RC  用时 $((END-START))s ==="
-          tail -40 /tmp/up.log
+          tail -50 /tmp/up.log
 
       - name: 核对目标端
         if: always()
