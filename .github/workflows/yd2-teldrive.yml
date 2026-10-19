@@ -35,9 +35,9 @@ on:
         required: false
         default: "270"
       max_file_gb:
-        description: "单文件上限(GB)"
+        description: "单文件上限(GB)。实测上传仅 1.9MiB/s, 大文件传 2 小时必撞边缘超时, 默认压到 2"
         required: false
-        default: "15"
+        default: "2"
       max_total_gb:
         description: "本轮总量上限(GB)"
         required: false
@@ -93,7 +93,7 @@ jobs:
           APPLY: ${{ inputs.apply || 'true' }}
           DISK: ${{ inputs.disk || 'both' }}
           BUDGET: ${{ inputs.budget_min || '270' }}
-          MAX_FILE_GB: ${{ inputs.max_file_gb || '15' }}
+          MAX_FILE_GB: ${{ inputs.max_file_gb || '2' }}
           MAX_TOTAL_GB: ${{ inputs.max_total_gb || '150' }}
           YDY_AUTHORIZATION: ${{ secrets.YDY_AUTHORIZATION }}
           TY139_AUTH: ${{ secrets.TY139_AUTH }}
