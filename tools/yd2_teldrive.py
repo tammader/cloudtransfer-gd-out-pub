@@ -310,7 +310,7 @@ def main():
     ap.add_argument("--disk", default="both", choices=("personal", "family", "both"))
     ap.add_argument("--apply", action="store_true", help="不加=只列计划")
     ap.add_argument("--budget-min", type=int, default=270)
-    ap.add_argument("--max-file-gb", type=float, default=15.0)
+    ap.add_argument("--max-file-gb", type=float, default=2.0)
     ap.add_argument("--max-total-gb", type=float, default=150.0)
     ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--preview", type=int, default=8)
