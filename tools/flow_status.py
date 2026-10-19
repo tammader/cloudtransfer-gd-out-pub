@@ -659,8 +659,11 @@ def build_caption(items, ts, quotas=None):
                 (1 - q["used"] / float(q["total"])) * 100)))) for q in tight[:3])
     warn = [q["note"] for q in (quotas or [])
             if q.get("note") and q["note"].startswith("⚠")]
-    if warn:
-        s += "\n\n" + "\n".join(warn)
+    tok = sorted({q["note"] for q in (quotas or [])
+                  if q.get("note") and "token 剩" in q["note"] and not q["note"].startswith("⚠")})
+    tail = warn + tok
+    if tail:
+        s += "\n\n" + "\n".join(tail)
     return s[:1000]
 
 
