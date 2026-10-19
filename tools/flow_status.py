@@ -156,18 +156,29 @@ def _pick(adds, mount, key):
     return {}
 
 
-def quota_rclone(remote):
+_WHY = {}          # 容量采集失败原因(按显示名), 只用于卡片上说明"为什么没取到"
+
+
+def _none(name, why):
+    """采不到时记一句人话原因 —— 以前一律 print「未取到」, 事后根本查不出是缺凭证、
+    远端不存在、还是授权过期。"""
+    _WHY[name] = why
+    return None
+
+
+def quota_rclone(remote, name=""):
     """rclone about <远端>: -> (总量, 已用)。配置由 CI 写进 ~/.config/rclone/rclone.conf"""
     exe = shutil.which("rclone")
     if not exe or not remote:
-        return None
+        return _none(name, "本机/CI 没装 rclone 或没配该远端")
     try:
         r = subprocess.run([exe, "about", remote.rstrip(":") + ":"],
                            capture_output=True, text=True, errors="replace", timeout=150)
     except Exception:
-        return None
+        return _none(name, "rclone about 超时/异常")
     if r.returncode != 0:
-        return None
+        tail = (r.stderr or "").strip().splitlines()
+        return _none(name, "rclone about 失败: %s" % (tail[-1][:60] if tail else "未知"))
     vals = {}
     for ln in (r.stdout or "").splitlines():
         m = re.match(r"^\s*(Total|Used|Trashed)\s*:\s*([\d.]+)\s*([KMGT]?i?B)\s*$", ln, re.I)
@@ -178,27 +189,27 @@ def quota_rclone(remote):
             vals[m.group(1).lower()] = float(m.group(2)) * _SIZE_UNITS[unit]
     if vals.get("total"):
         return (int(vals["total"]), int(vals.get("used") or 0))
-    return None
+    return _none(name, "about 没返回总量(该盘无配额接口)")
 
 
-def quota_189(mount):
+def quota_189(mount, name=""):
     """走 189 协议盘的会话接口取账号容量(个人云 / 家庭云同账号共用一个池子)"""
     add = _pick(_storages(), mount, "access_token")
     tok = add.get("access_token") or ""
     if not tok:
-        return None
+        return _none(name, "ALIST_STORAGES_TY 里没有该挂载/没有 access_token")
     try:
         import ty189                       # 同仓库 tools/ty189.py, 只管签名与请求
         c = ty189.Ty189(tok, add.get("family_id") or "", is_family=False)
         c.login()
         d = c.request("GET", ty189.API + "/portal/getUserSizeInfo.action")
-    except Exception:
-        return None
+    except Exception as e:
+        return _none(name, "189 接口异常: %s" % str(e)[:50])
     try:
         total = int(d.get("totalSize") or 0)
         used = int(d.get("usedSize") or 0)
     except Exception:
-        return None
+        return _none(name, "189 返回字段解析失败")
     return (total, used) if total > 0 else None
 
 
@@ -219,7 +230,7 @@ def _mcloud_sign(body, ts, rand):
     return md5(md5(b64) + md5(ts + ":" + rand)).upper()
 
 
-def quota_139(mount, drive_type):
+def quota_139(mount, drive_type, name=""):
     """配额接口: 一次返回该账号下各分区(个人云 / 家庭云 ...)的已用量
 
     单位随接口: 已用量是 **MB**; 总量字段实测是 **GB** —— 两个口径对不上时
@@ -228,7 +239,7 @@ def quota_139(mount, drive_type):
     add = _pick(_storages(), mount, "authorization")
     auth = add.get("authorization") or ""
     if not auth:
-        return None
+        return _none(name, "ALIST_STORAGES_TY 里没有该挂载/没有 authorization")
     body = "{}"
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     rand = "".join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -254,9 +265,11 @@ def quota_139(mount, drive_type):
         with urllib.request.build_opener(
                 urllib.request.ProxyHandler({})).open(req, timeout=90) as x:
             d = json.loads(x.read().decode("utf-8", "replace"))
-    except Exception:
-        return None
+    except Exception as e:
+        return _none(name, "139 配额接口异常(多为 authorization 过期): %s" % str(e)[:40])
     data = d.get("data") or {}
+    if d.get("code") not in (None, 0, "0", "200") and not data:
+        return _none(name, "139 鉴权失效: %s" % str(d.get("message") or d.get("code"))[:40])
     used = 0
     for q in (data.get("quotaList") or []):
         try:
@@ -270,37 +283,58 @@ def quota_139(mount, drive_type):
     except Exception:
         total = 0
     if used <= 0:
-        return None
+        return _none(name, "该分区(driveType=%s)没有用量字段" % drive_type)
     if total <= 0 or used > total:            # 口径不一致 -> 只报已用
         return (None, used)
     return (total, used)
 
 
+def auth_days(auth):
+    """139 authorization 里带过期毫秒时间戳 -> 剩余天数(拿不到返回 None)"""
+    try:
+        raw = base64.b64decode(auth).decode("utf-8", "replace")
+        seg = raw.split(":")[2]
+        return (int(seg.split("|")[3]) - int(time.time() * 1000)) / 86400000.0
+    except Exception:
+        return None
+
+
 def collect_quotas():
-    """按配置清单逐个采集; 采不到的回来标「未取到」, 不影响别的"""
+    """按配置清单逐个采集; 采不到的回来标「未取到」+ 人话原因, 不影响别的"""
     rows = []
+    _WHY.clear()
     for spec in QUOTA:
         if not isinstance(spec, dict):
             continue
         kind = str(spec.get("k") or "")
         arg = spec.get("a") or ""
         name = spec.get("n") or arg
+        note = spec.get("note") or ""
         r = None
         try:
             if kind == "rclone":
-                r = quota_rclone(arg)
+                r = quota_rclone(arg, name)
             elif kind == "189":
-                r = quota_189(arg)
+                r = quota_189(arg, name)
             elif kind == "139":
-                r = quota_139(arg, spec.get("t"))
+                r = quota_139(arg, spec.get("t"), name)
+                # 139 的 authorization 自带过期时间, 顺手报剩余天数(≈30 天一轮)
+                auth = _pick(_storages(), arg, "authorization").get("authorization") or ""
+                days = auth_days(auth) if auth else None
+                if days is not None:
+                    note = ("⚠ 139 token 仅剩 %.0f 天, 该换 ALIST_STORAGES_TY 了" % days
+                            if days < 7 else "139 token 剩 %.0f 天" % days)
         except Exception:
             r = None
         total, used = (r if r else (None, None))
-        rows.append({"n": name, "total": total, "used": used,
-                     "note": spec.get("note") or ""})
-        log("容量 %-18s %s" % (name, ("已用 %s / 总 %s" % (fmt_size(used), fmt_size(total)))
-                               if total else ("已用 %s（总量未取到）" % fmt_size(used)
-                                              if used else (spec.get("note") or "未取到"))))
+        if not r and _WHY.get(name):
+            note = "未取到：%s" % _WHY[name]
+        rows.append({"n": name, "total": total, "used": used, "note": note})
+        log("容量 %-18s %s%s" % (
+            name,
+            ("已用 %s / 总 %s" % (fmt_size(used), fmt_size(total)))
+            if total else ("已用 %s（总量未取到）" % fmt_size(used) if used else "未取到"),
+            ("  [" + note + "]") if note else ""))
     return rows
 
 
@@ -593,7 +627,7 @@ def render_svg(items, ts, quotas=None):
             elif used:
                 txt = "已用 %s（总量未取到）" % fmt_size(used)
             elif q.get("note"):
-                txt = q["note"]
+                txt = q["note"][:26]          # 卡片位置窄, 原因只留头一段
             else:
                 txt = "未取到"
             L.append('<text x="478" y="%d" font-size="10" fill="%s" '
@@ -623,6 +657,10 @@ def build_caption(items, ts, quotas=None):
         s += "\n\n容量最紧：" + " · ".join(
             "%s 剩%d%%" % (q["n"], max(0, int(round(
                 (1 - q["used"] / float(q["total"])) * 100)))) for q in tight[:3])
+    warn = [q["note"] for q in (quotas or [])
+            if q.get("note") and q["note"].startswith("⚠")]
+    if warn:
+        s += "\n\n" + "\n".join(warn)
     return s[:1000]
 
 
