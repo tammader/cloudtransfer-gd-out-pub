@@ -194,7 +194,8 @@ def _none(name, why):
 
 def quota_rclone(remote, name=""):
     """rclone about <远端>: -> (总量, 已用)。配置由 CI 写进 ~/.config/rclone/rclone.conf"""
-    exe = shutil.which("rclone")    if not exe or not remote:
+    exe = shutil.which("rclone")
+    if not exe or not remote:
         return _none(name, "本机/CI 没装 rclone 或没配该远端")
     try:
         r = subprocess.run([exe, "about", remote.rstrip(":") + ":"],
