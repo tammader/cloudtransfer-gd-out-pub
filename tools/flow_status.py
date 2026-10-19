@@ -691,8 +691,12 @@ def render_svg(items, ts, quotas=None):
                 txt = "已用 %s / 总 %s · 剩 %d%%" % (
                     fmt_size(used), fmt_size(total), max(0, int(round((1 - pct) * 100))))
             elif used:
-                txt = "已用 %s（不限容量）" % fmt_size(used) if "不限" in (q.get("note") or "") \
-                    else "已用 %s（总量未取到）" % fmt_size(used)
+                nm = q.get("note") or ""
+                if "不限" in nm:
+                    extra = nm.split("·")[-1].strip() if "·" in nm else ""
+                    txt = "已用 %s%s" % (fmt_size(used), (" · " + extra) if extra else "（不限容量）")
+                else:
+                    txt = "已用 %s（总量未取到）" % fmt_size(used)
             elif q.get("note"):
                 txt = q["note"][:26]          # 卡片位置窄, 原因只留头一段
             else:
