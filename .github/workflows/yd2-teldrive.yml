@@ -1,0 +1,114 @@
+name: yd2-teldrive
+
+# 移动云盘(个人 + 家庭) -> teldrive 备份   【公开仓库版, Actions 不计费】
+#
+# 为什么在本仓库:
+#   移动盘只有国内 139 OpenAPI, rclone 没有它的 backend。本仓库/兄弟仓库已有两个
+#   现役客户端, 直接复用:
+#     tools/ty_cloud_personal.py  个人云(personal_new)
+#     tools/ty139.py              家庭云(familyCloud rebuild)
+#   流程: 列源(OpenAPI) -> 取 CDN 直链 -> 落本地 -> rclone copyto 上传 teldrive
+#
+# 脱敏: 仓库公开, Actions 日志任何人可读。脚本开头 logmask.install() 会把所有
+#       文件名/路径替换成 <file:hash>/<path:hash>(同串同标签, 可排障不可反推)。
+#
+# 需要 Secrets: YDY_AUTHORIZATION / TY139_AUTH / TY139_CLOUD_ID /
+#               TELDRIVE_API_HOST / TELDRIVE_API_KEY / GH_TOKEN(拉补丁 rclone)
+#
+# 与 gd2-teldrive 错开: 那条是 40 */6, 本条 20 */6。
+
+on:
+  schedule:
+    - cron: "20 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真传, false=只演练"
+        required: false
+        default: "true"
+      disk:
+        description: "personal / family / both"
+        required: false
+        default: "both"
+      budget_min:
+        description: "本轮时间预算(分钟); job 上限 350"
+        required: false
+        default: "270"
+      max_file_gb:
+        description: "单文件上限(GB)"
+        required: false
+        default: "15"
+      max_total_gb:
+        description: "本轮总量上限(GB)"
+        required: false
+        default: "150"
+
+concurrency:
+  group: yd2-teldrive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 环境自检
+        run: |
+          echo "CPU: $(nproc)  内存: $(free -m | awk '/Mem:/{print $2}')MB"
+          df -h / | tail -1
+          python3 --version
+
+      - name: 装补丁版 rclone(8Mi 小分片, 绕开边缘网关 8MiB 请求体上限)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 \
+            --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          ls -la /tmp/rdl
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -2
+          rclone help backend teldrive > /tmp/td_help.txt && echo "teldrive backend OK"
+
+      - name: 添加 teldrive 远端
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+        run: |
+          set -euo pipefail
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" >/dev/null
+          rclone lsd teldrive: 2>&1 | head -5 || echo "(列不出, 继续)"
+
+      - name: 跑 移动云盘 -> teldrive
+        env:
+          APPLY: ${{ inputs.apply || 'true' }}
+          DISK: ${{ inputs.disk || 'both' }}
+          BUDGET: ${{ inputs.budget_min || '270' }}
+          MAX_FILE_GB: ${{ inputs.max_file_gb || '15' }}
+          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '150' }}
+          YDY_AUTHORIZATION: ${{ secrets.YDY_AUTHORIZATION }}
+          TY139_AUTH: ${{ secrets.TY139_AUTH }}
+          TY139_CLOUD_ID: ${{ secrets.TY139_CLOUD_ID }}
+          TD_STATS_JSON: /tmp/yd2work/stats.json
+          LOG_MASK: "1"
+        run: |
+          set -x
+          ARGS="--disk $DISK --budget-min $BUDGET --max-file-gb $MAX_FILE_GB --max-total-gb $MAX_TOTAL_GB"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          python3 tools/yd2_teldrive.py $ARGS
+
+      - name: 统计
+        if: always()
+        run: |
+          echo "===== 本轮统计 ====="
+          cat /tmp/yd2work/stats.json 2>/dev/null || echo "(无统计文件)"
+          df -h / | tail -1
