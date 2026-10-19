@@ -75,6 +75,17 @@ def log(msg):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
 
 
+def mask_dir(d):
+    """裸目录名没有扩展名/远端前缀, logmask 的正则抓不到, 这里显式换成 <path:hash>。
+    公开仓库的日志任何人可读, 目录名也是隐私。"""
+    if not d:
+        return "(根目录)"
+    try:
+        return logmask._tag("path", d)
+    except Exception:
+        return d
+
+
 def human(b):
     return "%.1f MB" % (b / MB) if b < GB else "%.2f GB" % (b / GB)
 
@@ -292,7 +303,7 @@ def main():
         % (len(plan), human(planned_bytes), human(max_bytes)))
     for d, todo, need in plan[:a.preview]:
         vids = sum(1 for p, _ in todo if is_video(p))
-        log("   + %s  (%d 个文件/其中视频 %d, %s)" % (d or "(根目录)", len(todo), vids, human(need)))
+        log("   + %s  (%d 个文件/其中视频 %d, %s)" % (mask_dir(d), len(todo), vids, human(need)))
     if len(plan) > a.preview:
         log("   ... 其余 %d 个省略" % (len(plan) - a.preview))
 
