@@ -16,6 +16,10 @@ on:
         description: "分片大小(MiB), 8=绕开 Unikraft 边缘 8MiB 上限"
         required: false
         default: "8"
+      cleanup:
+        description: "true=只清空 teldrive:probe 目录(不传文件)"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -54,6 +58,7 @@ jobs:
           rclone lsd teldrive: -vv 2>&1 | tail -6
 
       - name: 造测试文件
+        if: inputs.cleanup != 'true'
         run: |
           set -euo pipefail
           dd if=/dev/urandom of=/tmp/probe.bin bs=1M count=${{ inputs.size_mb }} status=none
@@ -61,6 +66,7 @@ jobs:
           echo -n "sha256(前16): "; sha256sum /tmp/probe.bin | cut -c1-16
 
       - name: 直传 teldrive
+        if: inputs.cleanup != 'true'
         env:
           SIZE: ${{ inputs.size_mb }}
           CHUNK: ${{ inputs.chunk_mb }}
@@ -80,6 +86,16 @@ jobs:
           END=$(date +%s)
           echo "=== RC=$RC  用时 $((END-START))s ==="
           tail -50 /tmp/up.log
+
+      - name: 清空 probe 目录
+        if: inputs.cleanup == 'true'
+        run: |
+          set +e
+          echo "--- 清理前 ---"; rclone lsl teldrive:probe 2>&1 | tail -10
+          rclone purge teldrive:probe -vv 2>&1 | tail -10
+          echo "RC=$?"
+          echo "--- 清理后 ---"
+          rclone lsl teldrive:probe 2>&1 | tail -10
 
       - name: 核对目标端
         if: always()
