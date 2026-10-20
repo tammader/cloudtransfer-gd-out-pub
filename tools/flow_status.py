@@ -405,6 +405,8 @@ STATE_STYLE = {
     "ok":      ("#dcfce7", "#16a34a", "#14532d", "#15803d"),
     "late":    ("#fef9c3", "#ca8a04", "#713f12", "#a16207"),
     "running": ("#fef9c3", "#ca8a04", "#713f12", "#a16207"),
+    # 排队(还没拿到 runner / 没抢到并发组): 不是"在跑", 得跟进行中区分开
+    "queued":  ("#e0f2fe", "#0284c7", "#0c4a6e", "#0369a1"),
     "fail":    ("#fee2e2", "#dc2626", "#7f1d1d", "#b91c1c"),
     "unknown": ("#f1f5f9", "#94a3b8", "#334155", "#64748b"),
 }
@@ -543,9 +545,17 @@ def scan(entry, tokens):
     except Exception:
         pass
     if r["status"] != "completed":
-        base["state"] = "running"
-        if base["age_h"] is not None:
-            base["note"] = "已跑 %.0f 分钟" % (base["age_h"] * 60)
+        # queued/pending/waiting = 还没真正开跑(常见于共用并发组排队), 不能算"进行中"
+        if r["status"] in ("queued", "pending", "waiting", "requested"):
+            base["state"] = "queued"
+            if base["age_h"] is not None:
+                base["note"] = "等 %s 分钟" % ("%.0f" % (base["age_h"] * 60))
+        else:
+            base["state"] = "running"
+            if base["age_h"] is not None:
+                mins = base["age_h"] * 60
+                base["note"] = "已跑 %.0f 分钟%s" % (
+                    mins, "(近 350 上限)" if mins > 300 else "")
         return base
     if r.get("conclusion") == "success":
         base["state"] = "ok"
@@ -589,12 +599,17 @@ def render_svg(items, ts, quotas=None):
              '云流程状态总览 · 每 6 小时刷新</text>')
     n_fail = sum(1 for i in items if i["state"] == "fail")
     n_late = sum(1 for i in items if i["state"] in ("late", "running"))
+    n_que = sum(1 for i in items if i["state"] == "queued")
     n_ok = sum(1 for i in items if i["state"] == "ok")
     L.append('<text x="16" y="45" font-size="10.5" fill="#64748b">共 %d 个流程：'
-             '%d 正常 · %d 超期/进行中 · %d 失败　　扫描 %s（北京时间）</text>'
-             % (len(items), n_ok, n_late, n_fail, esc(ts)))
-    for i, (c, txt) in enumerate([("#16a34a", "正常"), ("#ca8a04", "超期 / 进行中"),
-                                  ("#dc2626", "失败"), ("#94a3b8", "未知/未监控")]):
+             '%d 正常 · %d 超期/进行中%s · %d 失败　　扫描 %s（北京时间）</text>'
+             % (len(items), n_ok, n_late, (" · %d 排队" % n_que) if n_que else "",
+                n_fail, esc(ts)))
+    legend = [("#16a34a", "正常"), ("#ca8a04", "超期 / 进行中")]
+    if n_que:
+        legend.append(("#0284c7", "排队"))
+    legend += [("#dc2626", "失败"), ("#94a3b8", "未知/未监控")]
+    for i, (c, txt) in enumerate(legend):
         x = 24 + i * 106
         L.append('<circle cx="%d" cy="66" r="5" fill="%s"/>'
                  '<text x="%d" y="70" font-size="10" fill="#475569">%s</text>'
@@ -617,9 +632,10 @@ def render_svg(items, ts, quotas=None):
             L.append('<text x="%d" y="%d" font-size="8.5" fill="#64748b" text-anchor="middle">%s</text>'
                      % (cx, y + 33, esc(it["desc"])))
             st_txt = {"ok": "正常 · %s", "late": "超期 · 上次 %s", "running": "进行中 · %s",
-                      "fail": "失败 · %s", "unknown": "%s"}.get(it["state"], "%s")
+                      "queued": "排队 · %s", "fail": "失败 · %s",
+                      "unknown": "%s"}.get(it["state"], "%s")
             arg = it["time"] or (it["note"] or "—")
-            if it["state"] == "running" and it["note"]:
+            if it["state"] in ("running", "queued") and it["note"]:
                 arg = it["note"]
             elif it["state"] == "unknown":
                 arg = it["note"] or "未监控"
@@ -714,10 +730,12 @@ def render_svg(items, ts, quotas=None):
 def build_caption(items, ts, quotas=None):
     n_fail = sum(1 for i in items if i["state"] == "fail")
     n_late = sum(1 for i in items if i["state"] in ("late", "running"))
+    n_que = sum(1 for i in items if i["state"] == "queued")
     n_ok = sum(1 for i in items if i["state"] == "ok")
     head = "✅" if not n_fail else "⚠️"
-    s = "%s 云流程状态 · %s\n%d 个流程：%d 正常 · %d 超期/进行中 · %d 失败" % (
-        head, ts, len(items), n_ok, n_late, n_fail)
+    s = "%s 云流程状态 · %s\n%d 个流程：%d 正常 · %d 超期/进行中%s · %d 失败" % (
+        head, ts, len(items), n_ok, n_late,
+        (" · %d 排队" % n_que) if n_que else "", n_fail)
     if n_fail:
         for f in [i for i in items if i["state"] == "fail"][:3]:
             err = (f["errors"] or ["(见日志)"])[0]
