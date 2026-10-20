@@ -31,9 +31,9 @@ on:
         required: false
         default: "both"
       budget_min:
-        description: "本轮时间预算(分钟); job 上限 350"
+        description: "本轮时间预算(分钟); job 上限 350, 留 ~100 分钟收尾, 默认 240"
         required: false
-        default: "270"
+        default: "240"
       max_file_gb:
         description: "单文件上限(GB)。实测上传仅 1.9MiB/s, 大文件传 2 小时必撞边缘超时, 默认压到 2"
         required: false
@@ -44,7 +44,10 @@ on:
         default: "150"
 
 concurrency:
-  group: yd2-teldrive
+  # ⚠️ 与 gd2-teldrive **共用同一个组**: 两条都往同一个 teldrive 实例传,
+  # Telegram 侧总共只有 ≈1.9 MiB/s, 同时跑会互相抢带宽、还会撞 409/504。
+  # 共用组 = 天然排队互斥(同一时刻只允许一条真跑), 后到的那条在队列里等。
+  group: teldrive-upload
   cancel-in-progress: false
 
 permissions:
@@ -92,7 +95,7 @@ jobs:
         env:
           APPLY: ${{ inputs.apply || 'true' }}
           DISK: ${{ inputs.disk || 'both' }}
-          BUDGET: ${{ inputs.budget_min || '270' }}
+          BUDGET: ${{ inputs.budget_min || '240' }}
           MAX_FILE_GB: ${{ inputs.max_file_gb || '2' }}
           MAX_TOTAL_GB: ${{ inputs.max_total_gb || '150' }}
           YDY_AUTHORIZATION: ${{ secrets.YDY_AUTHORIZATION }}
