@@ -536,7 +536,9 @@ def scan(entry, tokens):
     if not runs:
         base["note"] = "还没跑过"
         return base
-    r = runs[0]
+    # 优先展示"在跑/排队"的那一条: 否则一条刚起的新短跑会把还在跑的长任务盖掉,
+    # 卡片上看不出那轮其实已经跑了 5 小时
+    r = next((x for x in runs if x["status"] != "completed"), runs[0])
     base["run_id"] = r["id"]
     base["time"] = bjstr(r["created_at"])
     try:
