@@ -63,7 +63,9 @@ on:
         default: ""
 
 concurrency:
-  group: gd2-teldrive
+  # ⚠️ 与 yd2-teldrive **共用同一个组**: 同一个 teldrive 实例 + 同一条 Telegram 通道
+  # (≈1.9 MiB/s), 同时跑只会互相拖慢并撞 409/504。共用组 = 排队互斥。
+  group: teldrive-upload
   cancel-in-progress: false
 
 permissions:
