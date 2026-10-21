@@ -81,6 +81,7 @@ def cmd_help():
             "/run <流程> [k=v ...] —— 触发, 例:\n"
             "    /run gd-out2\n"
             "    /run gd-out2 only=AGMX-050 apply=true\n"
+            "    /run ydout-in3 apply=false   (只想演练时用)\n"
             "/stop <流程> —— 取消正在跑的那次\n"
             "/disable <流程>  /enable <流程> —— 停用 / 启用")
 
