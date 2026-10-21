@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       apply:
-        description: "true=真搬(上传+归档源), false=只演练"
+        description: "true=真搬(上传+归档源), false=只演练; 默认真跑, 想演练传 apply=false"
         required: false
-        default: "false"
+        default: "true"
       max_ops:
         description: "本轮最多处理多少个文件"
         required: false
