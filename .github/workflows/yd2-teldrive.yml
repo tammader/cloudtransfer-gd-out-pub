@@ -15,11 +15,14 @@ name: yd2-teldrive
 # 需要 Secrets: YDY_AUTHORIZATION / TY139_AUTH / TY139_CLOUD_ID /
 #               TELDRIVE_API_HOST / TELDRIVE_API_KEY / GH_TOKEN(拉补丁 rclone)
 #
-# 与 gd2-teldrive 错开: 那条是 40 */6, 本条 20 */6。
+# 与 gd2-teldrive 错开: 本条 0:20/12:20 UTC, 那条 6:40/18:40 UTC(都是 12 小时一轮)。
+# 改 12 小时的原因: 两边共用 concurrency group `teldrive-upload`, 本条一轮跑约 4 小时,
+# 按 6 小时周期只剩 1.5 小时空档, gd2 排不进来(实测排了 4 小时才摸到 runner, 然后
+# 又撞下一轮, 永久饿死)。现在两边各占 4.5h, 中间留 1.5h 缓冲。
 
 on:
   schedule:
-    - cron: "20 */6 * * *"
+    - cron: "20 0,12 * * *"
   workflow_dispatch:
     inputs:
       apply:
