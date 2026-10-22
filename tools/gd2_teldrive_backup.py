@@ -64,6 +64,7 @@ GB = 1024 ** 3
 MB = 1024 ** 2
 RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
 WORK = os.environ.get("GT_WORK", "/tmp/gd2teldrive")
+STAGE = os.path.join(WORK, "stage")
 
 # 视频扩展名(判到「末尾」, 所以 xxx.part001.mp4 这种切分名也算)
 VIDEO_RE = re.compile(
@@ -215,6 +216,223 @@ def build_dirs(items):
     return dirs
 
 
+# ---------------------------------------------------------------- 传输(落地模式)
+#
+# 为什么必须"先落地再传"(2026-10-22 定论, 有对照实验):
+#   原来是 rclone copy gdrive2: teldrive: **流式直传**, 读端(Google)和写端(Teldrive)
+#   死绑在一起。Teldrive 一个 8Mi 分片要几百 ms~几十秒, 写端一慢就反压读端, Google
+#   的下载流被拖到没数据可送 -> Unikraft 边缘网关 60s 收不到东西 -> 504 -> rclone 判定
+#   整个文件失败, 从第 0 字节重传。450MB 的文件要 57 个分片, 中途必挂, 永远到不了终点。
+#   实测 run #13: 4 小时 / 475 次 504 / 完成 0 个文件 / 速度 200~900 KiB/s。
+#
+#   同一时刻 yd2-teldrive 用「先下载到本地磁盘, 再本地->Teldrive, transfers=1」
+#   对**同一台实例**报 `新传 8 个 / 15.16 GB, 失败 0`。
+#   -> 问题不在 Teldrive 本身, 在流式这种传法。本文件照抄已验证的那条路。
+#
+# 分批而不是一次性全落地: runner 磁盘只有 ~86GB 可用, 而单轮计划可能上百 GB。
+# 每批 --stage-batch-gb(默认 10GB): 下载 -> 上传 -> 删本地, 再来下一批。
+
+
+def _rclone(args, budget_sec, tag):
+    """跑一条 rclone(参数里已含子命令), 用 timeout 包住, 输出经 Python stdout 过脱敏。
+
+    返回 rclone 退出码; 124/130 = 时间到被 timeout 收走(不算失败)。
+    """
+    cmd = ["timeout", "--signal=INT", "--kill-after=120s",
+           "%ds" % max(60, int(budget_sec)), RCLONE] + args
+    log("%s: %s ..." % (tag, " ".join(args[:2])))
+    p = subprocess.Popen(cmd, cwd=WORK, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in p.stdout:
+        print(line.rstrip("\n"), flush=True)
+    return p.wait()
+
+
+def _download_args(a, files_from):
+    """拉 gdrive2 -> 本地磁盘。读本地盘是"即时"的, 可以开点并发吃满带宽。"""
+    return [
+        "copy", SRC, STAGE,
+        "--files-from", files_from,
+        "--size-only",
+        "--transfers", str(max(1, min(a.transfers, 4))),
+        "--checkers", "16",
+        "--retries", "5", "--retries-sleep", "15s",
+        "--low-level-retries", "10", "--contimeout", "60s",
+        "--stats", "1m", "-v",
+    ]
+
+
+def _upload_args(a, files_from):
+    """本地磁盘 -> Teldrive。transfers 固定 1, 串行写, 跟 yd2 那条验证过的路一致。"""
+    args = [
+        "copy", STAGE, DST,
+        "--files-from", files_from,
+        # 用 --size-only: 目标端同大小就跳过, 大小不同(含 0 字节空壳)就覆盖;
+        # 不能用 --ignore-existing —— 那会让 0 字节空壳永远修不回来
+        "--size-only",
+        "--transfers", "1",
+        "--checkers", "1",
+        # 必须关掉单文件多线程上传(默认 4, >255MB 自动启用): 多线程并发往**同一个**
+        # teldrive upload session 写分片, 服务端直接回 409 (conflict)。
+        "--multi-thread-streams", "0",
+        "--teldrive-chunk-size", "%dMi" % a.chunk_mb,
+        # 必须关掉 BLAKE3 树哈希: 它按 16MiB 块算, 分片压到 8Mi 后客户端/服务端
+        # 算出的哈希对不上(rclone 报 corrupted on transfer)。只校验大小足够。
+        "--teldrive-hash-enabled=false",
+        "--retries", str(a.retries),
+        # 504 是边缘抖动, 等一会儿基本都能过; 急着重试反而又撞上去
+        "--retries-sleep", "30s",
+        "--low-level-retries", "10",
+        "--contimeout", "60s",
+        "--stats", "1m", "-v",
+    ]
+    if a.tpslimit and a.tpslimit > 0:
+        args += ["--tpslimit", str(a.tpslimit)]
+    return args
+
+
+def _prune_empty(root):
+    """删掉 stage 里的空目录, 免得越攒越多把磁盘塞满"""
+    for d, _, _ in os.walk(root, topdown=False):
+        if d == root:
+            continue
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass          # 非空/被占用都无所谓
+
+
+def run_staged(a, plan, budget_sec, t0):
+    """落地模式主循环: 分批 下载 -> 上传 -> 删本地。返回 (退出码, 批数)。
+
+    批大小不是固定值, 每批开跑前按「--stage-batch-gb」和「当前可用磁盘 * 0.6」
+    取较小者现算 —— 前面某批失败留下残file 时, 后面的批次会自动缩量而不是撑爆磁盘。
+    """
+    os.makedirs(STAGE, exist_ok=True)
+    todo_all = [(p, s) for _, todo, _ in plan for p, s in todo]
+    deadline = t0 + budget_sec
+    rc_all, n_batch, i = 0, 0, 0
+    log("开跑: 落地模式(下载->上传) / 预算 %d 分钟 / 每批 %.0fGB / 分片 %dMi / 上传串行"
+        % (a.budget_min, a.stage_batch_gb, a.chunk_mb))
+
+    while i < len(todo_all):
+        left = deadline - time.time()
+        if left < 180:
+            log("剩余 %.0f 分钟, 不够再下一批, 收工(下次继续)" % (left / 60))
+            break
+
+        free = shutil.disk_usage(WORK).free
+        # 磁盘兜底: 连下一个文件都装不下就收工(不是按"批次够不够 1GB"判断 —
+        # 单个大文件独占一批时本来就可能接近这个量级)
+        nxt = todo_all[i][1]
+        if free < max(nxt * 1.2, 200 * MB):
+            log("磁盘只剩 %s, 装不下下一个文件(%s), 收工"
+                % (human(free), human(nxt)))
+            break
+        cap = min(a.stage_batch_gb * GB, free * 0.6)
+
+        # 从游标位置往后切一批
+        batch, acc = [], 0
+        while i < len(todo_all):
+            p, s = todo_all[i]
+            if batch and acc + s > cap:
+                break
+            batch.append((p, s))
+            acc += s
+            i += 1
+        if not batch:
+            break
+
+        n_batch += 1
+        bf = os.path.join(WORK, "batch_%03d.txt" % n_batch)
+        with open(bf, "w", encoding="utf-8") as f:
+            for p, _ in batch:
+                f.write(p + "\n")
+        log("---- 第 %d 批: %d 个文件 / %s (磁盘可用 %s) ----"
+            % (n_batch, len(batch), human(acc), human(free)))
+
+        # 1) 下载: 给三成剩余时间(实测 Google -> runner 比 Teldrive 写快一个量级)
+        dl_budget = min(left * 0.35, max(300.0, acc / GB * 8))
+        rc1 = _rclone(_download_args(a, bf), dl_budget, "下载")
+        if rc1 not in (0, 124, 130):
+            log("!! 下载退出码 %d, 照旧往下传(已落地的会传, 没落地的下轮重来)" % rc1)
+
+        # 2) 上传 —— 只为真正落地的文件构造清单: 下载失败的那些不在里面,
+        #    免得 rclone 对着不存在的源文件报 error reading source, 把退出码搞脏。
+        landed = [p for p, _ in batch if os.path.isfile(os.path.join(STAGE, p))]
+        if not landed:
+            log("!! 这批一个文件都没落地(下载全失败), 跳过上传")
+            _prune_empty(STAGE)
+            continue
+        uf = os.path.join(WORK, "up_%03d.txt" % n_batch)
+        with open(uf, "w", encoding="utf-8") as f:
+            for p in landed:
+                f.write(p + "\n")
+        left2 = deadline - time.time()
+        if left2 < 120:
+            log("下载吃完预算, 收工(下次继续)")
+            rc_all = 124
+            break
+        rc2 = _rclone(_upload_args(a, uf), left2, "上传")
+        if rc2 in (124, 130):
+            log("上传到点, 优雅收工(下次继续) —— 这不是失败")
+            rc_all = rc2
+            break
+        if rc2 != 0:
+            rc_all = rc2
+
+        # 3) 清掉这批的本地副本(传成的没必要留, 没传成的下轮重下, 留着只会撑爆磁盘)
+        drop = 0
+        for p, _ in batch:
+            try:
+                os.remove(os.path.join(STAGE, p))
+                drop += 1
+            except OSError:
+                pass
+        _prune_empty(STAGE)
+        log("本地已清 %d 个, 磁盘剩 %s" % (drop, human(shutil.disk_usage(WORK).free)))
+
+    return rc_all, n_batch
+
+
+def run_stream(a, plan, budget_sec):
+    """老的流式直传(gdrive2 -> teldrive 边读边写), 保留只为对照 / 回退。
+
+    ⚠️ 2026-10-22 实测不可用: 一小时 475 次 504, 完成 0 个文件。
+    原因见本文件「传输(落地模式)」那段注释。别在定时任务里用它。
+    """
+    ff = os.path.join(WORK, "files.txt")
+    with open(ff, "w", encoding="utf-8") as f:
+        for _, todo, _ in plan:
+            for p, _ in todo:
+                f.write(p + "\n")
+    log("!! 流式直传(对照模式): 预算 %d 分钟 / 并发 %d / 分片 %dMi"
+        % (a.budget_min, a.transfers, a.chunk_mb))
+    args = [
+        "copy", SRC, DST,
+        "--files-from", ff,
+        "--size-only",
+        "--transfers", str(a.transfers),
+        "--checkers", str(a.checkers),
+        "--multi-thread-streams", "0",
+        "--teldrive-chunk-size", "%dMi" % a.chunk_mb,
+        "--teldrive-hash-enabled=false",
+        "--retries", str(a.retries),
+        "--retries-sleep", "30s",
+        "--low-level-retries", "10",
+        "--contimeout", "60s",
+        "--stats", "1m", "-v",
+    ]
+    if a.tpslimit and a.tpslimit > 0:
+        args += ["--tpslimit", str(a.tpslimit)]
+    rc = _rclone(args, budget_sec, "流式直传")
+    if rc in (124, 130):
+        log("时间预算到点, 优雅收工(下次继续) —— 这不是失败")
+    elif rc != 0:
+        log("!! rclone 退出码 %d —— 看上面日志" % rc)
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="不加=只演练看计划")
@@ -237,6 +455,12 @@ def main():
                     help="每秒最多 API 请求数, 给 teldrive/Telegram 留余量(0=不限)")
     ap.add_argument("--no-clear-sessions", action="store_true",
                     help="不清理上一轮残留的 open upload session(默认会清, 防 409 冲突)")
+    ap.add_argument("--no-stage", action="store_true",
+                    help="关掉落地模式, 回到 gdrive2 -> teldrive 流式直传"
+                         " —— 2026-10-22 实测流式必 504(475 次/0 完成), 只留作对照, 别用")
+    ap.add_argument("--stage-batch-gb", type=float, default=10.0,
+                    help="落地模式每批大小(GB): 下载这么多 -> 传上去 -> 删本地, 再下一批。"
+                         "默认 10; runner 磁盘约 86GB 可用, 脚本还会按实际空闲自动缩量")
     ap.add_argument("--video-only", action="store_true", help="只传视频文件(默认整个文件夹都传)")
     ap.add_argument("--no-fast-list", action="store_true", help="关闭 --fast-list(配额敏感时用)")
     ap.add_argument("--only", default="", help="只处理这一个文件夹(相对路径, 调试用)")
@@ -345,60 +569,12 @@ def main():
         clear_open_sessions()
 
     # ---- 真跑 ----
-    ff = os.path.join(WORK, "files.txt")
-    with open(ff, "w", encoding="utf-8") as f:
-        for _, todo, _ in plan:
-            for p, _ in todo:
-                f.write(p + "\n")
-
     budget_sec = a.budget_min * 60
-    cmd = [
-        # --kill-after: 到点先发 INT 让 rclone 优雅收尾(写完手上这个分片);
-        # 2 分钟还不退就 KILL —— 防止 rclone 卡在某个 504 上把整个 job 拖到
-        # GitHub 350 分钟硬上限被杀, 那时连统计都来不及写(2026-10-19 就这样丢过一轮)。
-        "timeout", "--signal=INT", "--kill-after=120s", "%ds" % budget_sec,
-        RCLONE, "copy", SRC, DST,
-        "--files-from", ff,
-        # 用 --size-only: 目标端同大小就跳过, 大小不同(含 0 字节空壳)就覆盖;
-        # 不能用 --ignore-existing —— 那会让 0 字节空壳永远修不回来
-        "--size-only",
-        "--transfers", str(a.transfers),
-        "--checkers", str(a.checkers),
-        # 必须关掉 rclone 的单文件多线程上传(默认 4, >255MB 的文件自动启用):
-        # 多线程会并发往**同一个** teldrive upload session 写分片, 服务端直接回
-        # `409 (conflict): operation conflicts with current state`, 一轮几百次重试,
-        # 310 分钟只跑出 45 GiB。关掉后单文件单流写, 吞吐回到稳定的 ~8MiB/s。
-        "--multi-thread-streams", "0",
-        "--teldrive-chunk-size", "%dMi" % a.chunk_mb,
-        # 必须关掉 BLAKE3 树哈希: 它按 16MiB 块算, 而我们把分片压到 8Mi 后
-        # 客户端/服务端算出的哈希对不上(rclone 报 corrupted on transfer)。
-        # 关掉后只校验大小, 对视频冷备足够。
-        "--teldrive-hash-enabled=false",
-        "--retries", str(a.retries),
-        # 求稳优先: 重试间隔拉到 30s。504 是 Unikraft 边缘抖动, 等一会儿基本都能过,
-        # 急着 10s 重试反而又撞上去。
-        "--retries-sleep", "30s",
-        "--low-level-retries", "10",
-        "--contimeout", "60s",
-        "--stats", "1m",
-        "-v",
-    ]
-    # 请求速率上限: 给 teldrive/Telegram 留余量, 避免被限流打成 504
-    if a.tpslimit and a.tpslimit > 0:
-        cmd += ["--tpslimit", str(a.tpslimit)]
-    log("开跑: 预算 %d 分钟 / 并发 %d / 分片 %dMi / 重试 %d 次"
-        % (a.budget_min, a.transfers, a.chunk_mb, a.retries))
-    # rclone 的输出必须经 Python 的 stdout 走一道(而不是直接继承 fd),
-    # 否则文件名/路径会原样落进公开仓库的 Actions 日志, logmask 拦不到。
-    p = subprocess.Popen(cmd, cwd=WORK, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in p.stdout:
-        print(line.rstrip("\n"), flush=True)
-    rc = p.wait()
-    if rc in (124, 130):
-        log("时间预算到点, 优雅收工(下次继续) —— 这不是失败")
-    elif rc != 0:
-        log("!! rclone 退出码 %d —— 看上面日志" % rc)
+    if a.no_stage:
+        rc = run_stream(a, plan, budget_sec)
+    else:
+        rc, n_batch = run_staged(a, plan, budget_sec, t0)
+        log("落地模式跑完 %d 批" % n_batch)
 
     # ---- 复核 + 报告 ----
     dst_map2 = {}
@@ -441,7 +617,7 @@ def main():
     new_files = [p for p in dst_map2 if dst_map.get(p) != dst_map2[p]]
     dump_stats({
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "mode": "真跑", "apply": True,
+        "mode": ("真跑-流式" if a.no_stage else "真跑-落地"), "apply": True,
         "event": os.environ.get("TD_EVENT", ""),
         "src_files": len(src_items),
         "video_dirs": len(video_dirs),
