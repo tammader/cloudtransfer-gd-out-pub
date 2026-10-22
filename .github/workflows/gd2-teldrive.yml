@@ -21,12 +21,27 @@ name: gd2-teldrive
 #
 # 需要 Secrets: RCLONE_CONF / PATHS_JSON / PATHS_JSON_TD /
 #               TELDRIVE_API_HOST / TELDRIVE_API_KEY / TG_TOKEN / TG_CHAT_ID / GH_TOKEN
-# 与 yd2-teldrive 错开: 本条 40 */6, 那条 20 */6。
+# 与 yd2-teldrive 错开: 本条 6:40/18:40 UTC, 那条 0:20/12:20 UTC(都 12 小时一轮)。
+#
+# ⚠️ 2026-10-22 起默认「落地模式」(stage=true): 先把文件下载到 runner 磁盘, 再从本地
+#    传到 Teldrive, 一批 10GB 循环。原因见 tools/gd2_teldrive_backup.py 里
+#    「传输(落地模式)」那段: 老的流式直传会让读端和慢写端互相拖死, 实测一轮 475 次
+#    504、完成 0 个文件。要回到老行为只能手动 dispatch 时填 stage=false。
 
 on:
-  # 每 6 小时 (UTC 0:40/6:40/12:40/18:40 = 北京 8:40/14:40/20:40/次日 2:40)
+  # 每 12 小时 (UTC 6:40 / 18:40 = 北京 14:40 / 次日 2:40)
+  #
+  # 为什么从 `40 */6` 改成 12 小时、且排在 6:40/18:40:
+  #   和 yd2-teldrive 共用 concurrency group `teldrive-upload`(互斥排队), 而 yd2 一轮
+  #   要跑约 4.5 小时。按 6 小时周期算, yd2 占掉 4.5h, 只剩 1.5h 空档, gd2 根本排不进
+  #   —— 2026-10-22 实测 #14 排队等了整整 4 小时才摸到 runner, 然后自己还要跑 4.5h,
+  #   直接撞下一轮, 会被永久饿死。
+  #   yd2 改成 0:20 / 12:20 起跑(约 4:50 / 16:50 收工), gd2 接 6:40 / 18:40,
+  #   两边各留 1.5h 缓冲, 再也不打架。
+  #   不心疼"少跑两轮": teldrive 那条 Telegram 管道总共就 ≈1.9MiB/s, 两条同时跑也不会
+  #   更快, 错峰只是把排队空转的时间还回来。
   schedule:
-    - cron: "40 */6 * * *"
+    - cron: "40 6,18 * * *"
   workflow_dispatch:
     inputs:
       apply:
@@ -53,6 +68,14 @@ on:
         description: "本轮最多备份几个文件夹; 0=不限(按总量上限收工)"
         required: false
         default: "0"
+      stage:
+        description: "true=落地模式(默认, 先下载到 runner 磁盘再传, 2026-10-22 起); false=老的流式直传, 必 504, 只做对照"
+        required: false
+        default: "true"
+      stage_batch_gb:
+        description: "落地模式每批大小(GB): 下载这么多 -> 传上去 -> 删本地, 再下一批。默认 10"
+        required: false
+        default: "10"
       video_only:
         description: "true=只传视频文件; false=整个文件夹都传(含字幕/图片)"
         required: false
@@ -182,6 +205,8 @@ jobs:
           MAX_DIRS: ${{ inputs.max_dirs || '0' }}
           VIDEO_ONLY: ${{ inputs.video_only || 'false' }}
           ONLY: ${{ inputs.only || '' }}
+          STAGE: ${{ inputs.stage || 'true' }}
+          STAGE_BATCH_GB: ${{ inputs.stage_batch_gb || '10' }}
           # 开跑前清理上一轮残留的 open upload session(409 冲突的根源), 需要这两个
           TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
           TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
@@ -189,8 +214,11 @@ jobs:
           set -x
           ARGS="--max-transfer-gb $MAX_GB --budget-min $BUDGET"
           ARGS="$ARGS --transfers $TRANSFERS --chunk-mb $CHUNK --max-dirs $MAX_DIRS"
+          ARGS="$ARGS --stage-batch-gb $STAGE_BATCH_GB"
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
           if [ "$VIDEO_ONLY" = "true" ]; then ARGS="$ARGS --video-only"; fi
+          # 默认落地模式(下载到 runner 磁盘再传); 只有显式 stage=false 才回到流式直传
+          if [ "$STAGE" = "false" ]; then ARGS="$ARGS --no-stage"; fi
           if [ -n "$ONLY" ]; then ARGS="$ARGS --only '$ONLY'"; fi
           python3 tools/gd2_teldrive_backup.py $ARGS
 
