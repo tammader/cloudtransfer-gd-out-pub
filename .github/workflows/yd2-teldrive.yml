@@ -71,16 +71,13 @@ jobs:
           python3 --version
 
       - name: 装补丁版 rclone(8Mi 小分片, 绕开边缘网关 8MiB 请求体上限)
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p /tmp/rdl
-          gh release download td-rclone-v1.75.4 \
-            --repo tammader/cloudtransfer-gd-out \
-            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
-          ls -la /tmp/rdl
-          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          # 资产托管在**公开** release(tamd258/rclone), 匿名 curl 即可下载;
+          # 不再依赖私有仓库 tammader/cloudtransfer-gd-out 与 GH_TOKEN
+          TD="https://github.com/tamd258/rclone/releases/download/td-rclone-v1.75.4/rclone-linux-amd64"
+          sudo curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o /usr/local/bin/rclone "$TD"
+          sudo chmod 0755 /usr/local/bin/rclone
           rclone version | head -2
           rclone help backend teldrive > /tmp/td_help.txt && echo "teldrive backend OK"
 

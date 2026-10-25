@@ -132,16 +132,16 @@ jobs:
           echo "===== UTC / 北京 ====="; date -u; TZ=Asia/Shanghai date
 
       - name: 装 rclone（补丁版，允许 8Mi 小分片，绕开 Unikraft 8MiB 请求体上限）
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
           # 上游 fork 把分片强制 ≥64MiB 并对齐 16MiB, 在这里必然 413;
           # 用 build-td-rclone.yml 编出来的补丁版(下限 4MiB / 对齐 1MiB)。
-          # 资产在**私有**仓库的 release 里, 匿名 curl 会 404 -> 必须 gh + token
+          # 资产托管在**公开** release(tamd258/rclone), 匿名 curl 即可下载;
+          # 不再依赖私有仓库 tammader/cloudtransfer-gd-out, 也不再依赖 GH_TOKEN
+          # (2026-10-24 那次全线失败就是 GH_TOKEN 401 导致拉不到补丁版)。
           T="td-rclone-${RCLONE_FORK_VERSION}"
-          gh release download "$T" -R tammader/cloudtransfer-gd-out \
-            -p rclone-linux-amd64 -O /tmp/rclone-td --clobber
+          URL="https://github.com/tamd258/rclone/releases/download/${T}/rclone-linux-amd64"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o /tmp/rclone-td "$URL"
           install -m 0755 /tmp/rclone-td /usr/local/bin/rclone
           echo "===== 版本 ====="
           rclone version > /tmp/td_ver.txt

@@ -47,15 +47,13 @@ jobs:
           rsvg-convert --version
 
       - name: 装 rclone（补丁版，同时支持 teldrive 与各盘 about）
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
           # 官方版没有 teldrive backend; 补丁版是超集, about/size 都照常
-          mkdir -p /tmp/rdl
-          gh release download td-rclone-v1.75.4 --repo tammader/cloudtransfer-gd-out \
-            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
-          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          # 资产托管在**公开** release(tamd258/rclone), 匿名 curl 即可下载
+          TD="https://github.com/tamd258/rclone/releases/download/td-rclone-v1.75.4/rclone-linux-amd64"
+          sudo curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o /usr/local/bin/rclone "$TD"
+          sudo chmod 0755 /usr/local/bin/rclone
           rclone version | head -2
           rclone help backend teldrive > /dev/null && echo "teldrive backend OK"
 
