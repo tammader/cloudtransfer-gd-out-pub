@@ -222,8 +222,12 @@ def dump_stats(st):
         log("统计写入失败(不影响备份): %s" % str(e)[:80])
 
 
-def run_one(src, a, t0):
-    """跑一个盘, 返回统计 dict"""
+def run_one(src, a, t0, t_deadline=None):
+    """跑一个盘, 返回统计 dict
+
+    t0        : 本盘自己的预算起点(不是整个进程的起点, 否则后面的盘永远吃不到预算)
+    t_deadline: 硬截止(GitHub 350 分钟会杀), 到了无论如何停
+    """
     log("=" * 20 + " %s " % src.name + "=" * 20)
     base = "%s/%s" % (DST.rstrip("/"), src.prefix)
     ts = time.time()
@@ -270,6 +274,9 @@ def run_one(src, a, t0):
         if time.time() - t0 > budget:
             log("时间预算到点, 优雅收工(下次继续) —— 这不是失败")
             break
+        if t_deadline and time.time() > t_deadline:
+            log("撞到硬截止(留给收尾/出图), 优雅收工 —— 这不是失败")
+            break
         if done_b >= max_total:
             log("本轮总量到上限 %s, 收工" % human(max_total))
             break
@@ -309,11 +316,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--disk", default="both", choices=("personal", "family", "both"))
     ap.add_argument("--apply", action="store_true", help="不加=只列计划")
-    ap.add_argument("--budget-min", type=int, default=270)
+    ap.add_argument("--budget-min", type=int, default=270,
+                    help="整轮总预算(含列目录), 两盘共用这条总账")
     ap.add_argument("--max-file-gb", type=float, default=2.0)
     ap.add_argument("--max-total-gb", type=float, default=150.0)
     ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--preview", type=int, default=8)
+    ap.add_argument("--reserve-min", type=int, default=15,
+                    help="留给出图/发TG/收尾的尾部时间, 不进传输预算")
+    ap.add_argument("--min-slice-min", type=int, default=45,
+                    help="后跑的盘至少保证这么多分钟, 不够就优先它")
+    ap.add_argument("--rotate", default="auto", choices=("auto", "personal", "family", "none"),
+                    help="先跑哪个盘; auto=按偶数/奇数轮交替, 避免同一盘长期饿死对方")
     a = ap.parse_args()
 
     os.makedirs(WORK, exist_ok=True)
@@ -327,10 +341,51 @@ def main():
     if a.disk in ("family", "both"):
         srcs.append(SrcFamily())
 
+    # ---- 轮换: personal 每轮都能吃满预算, family 就会被永久饿死(10-26 之后就是这个症状) ----
+    rotate = a.rotate
+    if rotate == "auto" and len(srcs) > 1:
+        # 用"当天第几个 6 小时窗口"做奇偶, 不需要额外状态文件
+        slot = int(time.time() // (6 * 3600))
+        rotate = "family" if slot % 2 == 0 else "personal"
+        log("轮换: 本窗口先跑 %s (slot=%d)" % (rotate, slot))
+    if rotate in ("personal", "family") and len(srcs) > 1:
+        srcs.sort(key=lambda s: 0 if s.name == rotate else 1)
+    log("执行顺序: %s" % " -> ".join(s.name for s in srcs))
+
+    # ---- 预算: 总额 a.budget_min, 先扣掉尾部预留, 再在两盘之间分配 ----
+    total_deadline = t0 + a.budget_min * 60
+    hard_deadline = total_deadline - a.reserve_min * 60
+    transfer_budget = max(0.0, a.budget_min - a.reserve_min) * 60
+
     stats = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "apply": bool(a.apply),
              "disks": {}}
-    for src in srcs:
-        stats["disks"][src.name] = run_one(src, a, t0)
+    for idx, src in enumerate(srcs):
+        left = max(0.0, hard_deadline - time.time())
+        remaining_disk = len(srcs) - idx
+        if remaining_disk == 1:
+            slice_s = left                      # 最后一个盘把剩下的全拿走
+        else:
+            # 后面的盘至少留 min_slice_min, 当前盘最多用 剩下 - (剩余盘数-1)*min_slice
+            keep = (remaining_disk - 1) * a.min_slice_min * 60
+            slice_s = max(0.0, min(left - keep, left * 0.6))
+        slice_s = min(slice_s, left)
+
+        if slice_s < 60:
+            log("!! %s 分到的预算是 %.0f 分钟, 不足 1 分钟 -> 本轮跳过它(下轮轮换会先跑它)"
+                % (src.name, slice_s / 60))
+            stats["disks"][src.name] = {
+                "mode": "真跑" if a.apply else "演练", "src_files": 0, "src_bytes": 0,
+                "dst_files": 0, "dst_bytes": 0, "todo_files": 0, "todo_bytes": 0,
+                "new_files": 0, "new_bytes": 0, "fail_files": 0,
+                "skipped_reason": "budget_slice_too_small"}
+            continue
+
+        log("%s 分到预算 %.0f 分钟 (整轮 %d 分, 尾部预留 %d 分)"
+            % (src.name, slice_s / 60, a.budget_min, a.reserve_min))
+        sub = argparse.Namespace(**vars(a))
+        sub.budget_min = slice_s / 60.0
+        stats["disks"][src.name] = run_one(
+            src, sub, t0=time.time(), t_deadline=min(time.time() + slice_s, hard_deadline))
 
     tot = {"new_files": 0, "new_bytes": 0, "todo_files": 0, "todo_bytes": 0,
            "fail_files": 0}
