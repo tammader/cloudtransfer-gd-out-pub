@@ -222,15 +222,18 @@ def dump_stats(st):
         log("统计写入失败(不影响备份): %s" % str(e)[:80])
 
 
-def run_one(src, a, t0, t_deadline=None):
+def run_one(src, a, t0, t_deadline=None, slice_s=None):
     """跑一个盘, 返回统计 dict
 
-    t0        : 本盘自己的预算起点(不是整个进程的起点, 否则后面的盘永远吃不到预算)
-    t_deadline: 硬截止(GitHub 350 分钟会杀), 到了无论如何停
+    t0        : 本盘预算起点 —— 调用方传**真实时钟**(time.time())。
+    slice_s   : 本盘分到的秒数。给了就用它做预算, 不再信 a.budget_min
+                (a.budget_min 现在表示整轮总预算, 由 main 切分)。
+    t_deadline: 真实时钟下的硬截止, 到了无论如何停(留给收尾出图)
     """
     log("=" * 20 + " %s " % src.name + "=" * 20)
     base = "%s/%s" % (DST.rstrip("/"), src.prefix)
     ts = time.time()
+    budget = slice_s if slice_s is not None else a.budget_min * 60
     src_items, ndirs = collect(src)
     log("源端视频 %d 个 / %s (%d 个目录, %.0fs)"
         % (len(src_items), human(sum(s for _, s, _ in src_items)), ndirs,
@@ -264,7 +267,6 @@ def run_one(src, a, t0, t_deadline=None):
                 "todo_files": len(todo), "todo_bytes": sum(s for _, s, _ in todo),
                 "new_files": 0, "new_bytes": 0, "fail_files": 0}
 
-    budget = a.budget_min * 60
     max_total = int(a.max_total_gb * GB)
     done_n = done_b = fail_n = 0
     tmpdir = os.path.join(WORK, "tmp_" + src.name)
@@ -359,8 +361,11 @@ def main():
 
     stats = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "apply": bool(a.apply),
              "disks": {}}
+    now_cursor = t0            # 计划记账游标: 每盘切片首尾相接, 保证总和不超 budget
     for idx, src in enumerate(srcs):
-        left = max(0.0, hard_deadline - time.time())
+        # left 按"计划记账"算, 不按实际流逝算: 上一盘可能提前收工(没活/全失败),
+        # 但它的切片不该被下一盘重复占用 —— 否则总时长会超过 budget-min 被 Actions 掐掉
+        left = max(0.0, hard_deadline - now_cursor)
         remaining_disk = len(srcs) - idx
         if remaining_disk == 1:
             slice_s = left                      # 最后一个盘把剩下的全拿走
@@ -378,14 +383,16 @@ def main():
                 "dst_files": 0, "dst_bytes": 0, "todo_files": 0, "todo_bytes": 0,
                 "new_files": 0, "new_bytes": 0, "fail_files": 0,
                 "skipped_reason": "budget_slice_too_small"}
+            now_cursor += slice_s
             continue
 
         log("%s 分到预算 %.0f 分钟 (整轮 %d 分, 尾部预留 %d 分)"
             % (src.name, slice_s / 60, a.budget_min, a.reserve_min))
-        sub = argparse.Namespace(**vars(a))
-        sub.budget_min = slice_s / 60.0
+        # t0 传真实时钟, 预算用 slice_s 显式给, 两者不再混淆
+        disk_deadline = min(time.time() + slice_s, hard_deadline)
         stats["disks"][src.name] = run_one(
-            src, sub, t0=time.time(), t_deadline=min(time.time() + slice_s, hard_deadline))
+            src, a, t0=time.time(), t_deadline=disk_deadline, slice_s=slice_s)
+        now_cursor += slice_s
 
     tot = {"new_files": 0, "new_bytes": 0, "todo_files": 0, "todo_bytes": 0,
            "fail_files": 0}
