@@ -361,19 +361,20 @@ def main():
 
     stats = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "apply": bool(a.apply),
              "disks": {}}
-    now_cursor = t0            # 计划记账游标: 每盘切片首尾相接, 保证总和不超 budget
+    # 每盘的实际结束时刻(真实时钟)。它只增不减, 所以两盘的总时长天然 <= hard_deadline,
+    # 不管上一盘是跑满还是提前收工 —— 这是"不超发"的唯一可靠保证。
+    wall_cursor = t0
     for idx, src in enumerate(srcs):
-        # left 按"计划记账"算, 不按实际流逝算: 上一盘可能提前收工(没活/全失败),
-        # 但它的切片不该被下一盘重复占用 —— 否则总时长会超过 budget-min 被 Actions 掐掉
-        left = max(0.0, hard_deadline - now_cursor)
+        # left_wall: 从"上一盘实际结束点"到硬截止, 还剩多少秒
+        left_wall = max(0.0, hard_deadline - wall_cursor)
         remaining_disk = len(srcs) - idx
         if remaining_disk == 1:
-            slice_s = left                      # 最后一个盘把剩下的全拿走
+            slice_s = left_wall                 # 最后一个盘把真实剩下的全拿走
         else:
-            # 后面的盘至少留 min_slice_min, 当前盘最多用 剩下 - (剩余盘数-1)*min_slice
+            # 后面的盘至少留 min_slice_min; 当前盘最多用 剩下的 - 保底
             keep = (remaining_disk - 1) * a.min_slice_min * 60
-            slice_s = max(0.0, min(left - keep, left * 0.6))
-        slice_s = min(slice_s, left)
+            slice_s = max(0.0, min(left_wall - keep, left_wall * 0.6))
+        slice_s = min(slice_s, left_wall)
 
         if slice_s < 60:
             log("!! %s 分到的预算是 %.0f 分钟, 不足 1 分钟 -> 本轮跳过它(下轮轮换会先跑它)"
@@ -383,7 +384,6 @@ def main():
                 "dst_files": 0, "dst_bytes": 0, "todo_files": 0, "todo_bytes": 0,
                 "new_files": 0, "new_bytes": 0, "fail_files": 0,
                 "skipped_reason": "budget_slice_too_small"}
-            now_cursor += slice_s
             continue
 
         log("%s 分到预算 %.0f 分钟 (整轮 %d 分, 尾部预留 %d 分)"
@@ -392,7 +392,8 @@ def main():
         disk_deadline = min(time.time() + slice_s, hard_deadline)
         stats["disks"][src.name] = run_one(
             src, a, t0=time.time(), t_deadline=disk_deadline, slice_s=slice_s)
-        now_cursor += slice_s
+        # 游标推进到"本盘实际结束点": 跑满了就是 disk_deadline, 提前收工就是现在
+        wall_cursor = max(wall_cursor, min(time.time(), disk_deadline))
 
     tot = {"new_files": 0, "new_bytes": 0, "todo_files": 0, "todo_bytes": 0,
            "fail_files": 0}
