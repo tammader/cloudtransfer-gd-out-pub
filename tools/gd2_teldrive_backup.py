@@ -303,15 +303,20 @@ def _prune_empty(root):
 
 
 def run_staged(a, plan, budget_sec, t0):
-    """落地模式主循环: 分批 下载 -> 上传 -> 删本地。返回 (退出码, 批数)。
+    """落地模式主循环: 分批 下载 -> 上传 -> 删本地。返回 (退出码, 批数, 实做量)。
 
     批大小不是固定值, 每批开跑前按「--stage-batch-gb」和「当前可用磁盘 * 0.6」
     取较小者现算 —— 前面某批失败留下残file 时, 后面的批次会自动缩量而不是撑爆磁盘。
+
+    第三个返回值是**本轮真正切进批里的文件数和字节数**, 不是 plan 的全量:
+    进度条的分母必须用它。旧代码拿 plan_bytes(整轮计划 2912 GB)当分母,
+    实际只做几十 GB, 进度永远停在 5% 附近, 看着像卡死。
     """
     os.makedirs(STAGE, exist_ok=True)
     todo_all = [(p, s) for _, todo, _ in plan for p, s in todo]
     deadline = t0 + budget_sec
     rc_all, n_batch, i = 0, 0, 0
+    did_bytes, did_files = 0, 0
     log("开跑: 落地模式(下载->上传) / 预算 %d 分钟 / 每批 %.0fGB / 分片 %dMi / 上传串行"
         % (a.budget_min, a.stage_batch_gb, a.chunk_mb))
 
@@ -331,6 +336,23 @@ def run_staged(a, plan, budget_sec, t0):
             break
         cap = min(a.stage_batch_gb * GB, free * 0.6)
 
+        # 磁盘小的时候把批切碎, 不要"一批装下所有能装的东西"。
+        # 2026-10-27 run 40595914103: 磁盘只剩 7.68 GB -> cap 4.6 GB -> 一批 8 个文件,
+        # 8 个里有 7 个卡在 504, 整轮 270 分钟就耗在这一批上, 最后只成 1 个。
+        # 而 run 40696898122 磁盘 87 GB, 切成 3 批 58 个文件, 撞了 504 就换下一批,
+        # 那些文件下一批重传时基本都过了(日志里多次 "Attempt 2/5 succeeded")。
+        # 结论: 批数比批大小重要 —— 磁盘小时宁可 1GB 一批, 也要留出多轮换血的机会。
+        SHRUNK_CAP = 1024.0 * 1024 * 1024          # 1GB
+        # 判据是"磁盘装不下一个正常批", 不是"cap 被压小了":
+        # cap 被压小可能是磁盘真紧张(405: 7.68GB -> 4.6GB), 也可能只是标称值
+        # 本来就没顶满(406: 87GB 磁盘, cap = 10GB 标称, 但没必要再切碎)。
+        if free < a.stage_batch_gb * 3 * GB and free >= 4 * SHRUNK_CAP:
+            # 磁盘只够装两三个正常批时切碎, 换取多批换血;
+            # 再小(<4GB)就别切了 —— cap 会小到装不下单个文件, 那批永远切不出来。
+            log("磁盘偏小(%s), 批大小 %s -> %s 以保留多批换血"
+                % (human(free), human(cap), human(SHRUNK_CAP)))
+            cap = min(cap, SHRUNK_CAP)
+
         # 从游标位置往后切一批
         batch, acc = [], 0
         while i < len(todo_all):
@@ -344,6 +366,8 @@ def run_staged(a, plan, budget_sec, t0):
             break
 
         n_batch += 1
+        did_bytes += acc
+        did_files += len(batch)
         bf = os.path.join(WORK, "batch_%03d.txt" % n_batch)
         with open(bf, "w", encoding="utf-8") as f:
             for p, _ in batch:
@@ -373,6 +397,10 @@ def run_staged(a, plan, budget_sec, t0):
             log("下载吃完预算, 收工(下次继续)")
             rc_all = 124
             break
+        # 给整批留满剩余预算, 不要按文件数封顶。
+        # 2026-10-27 run 40595914103 的教训是反过来的: 那一轮 8 个文件里 7 个卡在
+        # 504, 需要的就是"慢慢磨到成功"(de992058 磨了 1h44m 才 Copied)。
+        # 按文件数给每批封顶会让这批更早放弃, 把本来能成的也丢掉。
         rc2 = _rclone(_upload_args(a, uf), left2, "上传")
         if rc2 in (124, 130):
             log("上传到点, 优雅收工(下次继续) —— 这不是失败")
@@ -392,7 +420,7 @@ def run_staged(a, plan, budget_sec, t0):
         _prune_empty(STAGE)
         log("本地已清 %d 个, 磁盘剩 %s" % (drop, human(shutil.disk_usage(WORK).free)))
 
-    return rc_all, n_batch
+    return rc_all, n_batch, {"bytes": did_bytes, "files": did_files}
 
 
 def run_stream(a, plan, budget_sec):
@@ -568,13 +596,36 @@ def main():
     if not a.no_clear_sessions:
         clear_open_sessions()
 
+    # ---- 统计基准: 必须在「删空壳 + 清 session」之后重取 ----
+    # 为什么不能直接用上面的 dst_map: 那个清单是在删空壳之前建的, 空壳被删掉后
+    # 又重建, 大小从 0 变真值, 会被误算成"本轮新增"; 更糟的是删掉后本轮没覆盖到的
+    # 空壳会从 lst 里消失, dst_files 反而下降 —— 两个数字一起失真。
+    # (2026-10-28 run 40696898122: 实传 58 个文件, 但按旧基准算出来只有 1 个)
+    base_map = {}
+    for it in lsjson(DST, allow_missing=True):
+        if not it.get("IsDir"):
+            base_map[it["Path"]] = int(it.get("Size", 0) or 0)
+    log("统计基准(清空壳/清 session 之后): %d 个" % len(base_map))
+
+    # ---- 磁盘预检: 落地模式要先把文件下到本地, 磁盘不够就别硬切批 ----
+    # 2026-10-27 run 40595914103: runner 只剩 7.68 GB, cap 被压到 4.6 GB,
+    # 第一批塞 4.09 GB 后撞上 504 风暴, 拖到预算耗尽, 整轮只啃完一批。
+    free_now = shutil.disk_usage(WORK).free
+    if free_now < 8 * GB:
+        raise SystemExit(
+            "!! runner 磁盘只有 %.1f GB 可用, 落地模式至少要 8 GB\n"
+            "   先清 /tmp 或换更大磁盘再跑; 不要用 --stage-batch-gb 硬顶" % (free_now / GB))
+    log("磁盘预检: 可用 %s (OK)" % human(free_now))
+
     # ---- 真跑 ----
     budget_sec = a.budget_min * 60
+    did = {"bytes": 0, "files": 0}
     if a.no_stage:
         rc = run_stream(a, plan, budget_sec)
     else:
-        rc, n_batch = run_staged(a, plan, budget_sec, t0)
-        log("落地模式跑完 %d 批" % n_batch)
+        rc, n_batch, did = run_staged(a, plan, budget_sec, t0)
+        log("落地模式跑完 %d 批 / 实切 %d 个文件 %s"
+            % (n_batch, did["files"], human(did["bytes"])))
 
     # ---- 复核 + 报告 ----
     dst_map2 = {}
@@ -613,8 +664,21 @@ def main():
     log("报告已写到 报告区: %s" % ("OK" if rr.returncode == 0 else "失败 " + rr.stderr.strip()[:200]))
 
     # ---- 出图/发 Telegram 用的统计 ----
-    # 本轮新增 = 跑完后目标端有, 而开跑前没有(或大小不同)的文件
-    new_files = [p for p in dst_map2 if dst_map.get(p) != dst_map2[p]]
+    # 本轮新增 = 跑完后目标端有、且大小 > 0，而**统计基准**(清空壳/清 session 之后)
+    # 里没有或大小不同的文件。
+    #   - 用 base_map 而不是 dst_map: dst_map 是删空壳之前的清单, 空壳 0 字节 ->
+    #     真值会被当成新增(假涨); 空壳删掉后本轮没覆盖到的, 会从 lst 里消失,
+    #     dst_files 反而下降(假跌)。两个假象一起把差值压到只剩 1 个。
+    #   - 排除 size == 0: 本轮没传完的 0 字节壳不算"新增"。
+    new_files = [p for p in dst_map2
+                 if dst_map2[p] > 0 and base_map.get(p, -1) != dst_map2[p]]
+    new_bytes = sum(dst_map2[p] for p in new_files)
+    # 顺带把"目标端累计"跟基准分开报, 涨跌一眼能看出来
+    dst_delta = len(dst_map2) - len(base_map)
+    lost = [p for p in base_map if p not in dst_map2]
+    log("本轮新增 %d 个 / %s; 目标端 %d -> %d (%+d); 消失 %d 个"
+        % (len(new_files), human(new_bytes), len(base_map), len(dst_map2),
+           dst_delta, len(lost)))
     dump_stats({
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "mode": ("真跑-流式" if a.no_stage else "真跑-落地"), "apply": True,
@@ -625,7 +689,11 @@ def main():
         "plan_detail": [{"dir": d or "(根目录)",
                          "n": len(todo), "bytes": need} for d, todo, need in plan[:8]],
         "dst_files": len(dst_map2), "dst_bytes": sum(dst_map2.values()),
-        "new_files": len(new_files), "new_bytes": sum(dst_map2[p] for p in new_files),
+        "base_files": len(base_map), "dst_delta": dst_delta, "lost_files": len(lost),
+        "new_files": len(new_files), "new_bytes": new_bytes,
+        # 进度条分母: 本轮真正切进批的量, 不是 plan 的全量(2912 GB)。
+        # 旧版拿 plan_bytes 当分母, 实际只做几十 GB, 进度永远停 5%。
+        "run_files": did["files"], "run_bytes": did["bytes"],
         "done_dirs": len(done_dirs), "left_dirs": len(todo_left),
         "left_detail": [{"dir": d or "(根目录)", "n": n, "bytes": s}
                         for d, n, s in todo_left[:8]],
