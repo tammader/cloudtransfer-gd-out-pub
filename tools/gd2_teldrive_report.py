@@ -182,7 +182,10 @@ def render_svg(s):
         y = 168
         if apply_:
             # ---- 本轮进度条 ----
-            plan = float(d.get("plan_bytes", 0) or 0)
+            # 分母用 run_bytes(本轮真正切进批的量), 不用 plan_bytes(整轮计划全量)。
+            # plan 可能是 2912 GB, 而一轮只做几十 GB; 拿全量当分母, 进度永远 ~5%,
+            # 看着像卡死。老 stats 没有 run_bytes 时回退到 plan_bytes(兼容旧数据)。
+            plan = float(d.get("run_bytes") or d.get("plan_bytes", 0) or 0)
             done = float(d.get("new_bytes", 0) or 0)
             pct = min(1.0, done / plan) if plan else 0.0
             L.append('<text x="20" y="%d" font-size="12" fill="%s">'
@@ -254,6 +257,12 @@ def build_caption(s):
            % (head, d.get("ts", ""), d.get("new_files", 0),
               fmt_size(d.get("new_bytes", 0)),
               d.get("dst_files", 0), fmt_size(d.get("dst_bytes", 0))))
+    # 目标端文件数的涨跌单独打一行: 光看"新增 1 个"分不清是统计口径问题还是真没传
+    if d.get("base_files") is not None:
+        txt += "\n目标端 开跑 %d → 收工 %d (%+d)" % (
+            d.get("base_files", 0), d.get("dst_files", 0), d.get("dst_delta", 0))
+        if d.get("lost_files"):
+            txt += "，消失 %d 个" % d["lost_files"]
     if d.get("budget_hit"):
         txt += "\n⏱ 时间预算到点，下次接着传"
     if d.get("left_dirs"):
