@@ -473,10 +473,20 @@ def main():
     ap.add_argument("--transfers", type=int, default=3,
                     help="并发文件数。求稳默认 3(Telegram 侧并发高容易 504/限流)")
     ap.add_argument("--checkers", type=int, default=8)
-    ap.add_argument("--chunk-mb", type=int, default=8,
-                    help="Teldrive 分片(MB)。实测 Unikraft 网关单请求体上限 8MiB"
-                         " (8Mi OK / 9Mi 起 413 Request Entity Too Large), 默认 8;"
-                         " 调大必炸, 调小只会更慢")
+    ap.add_argument("--chunk-mb", type=int, default=4,
+                    help="Teldrive 分片(MB)。默认 4。"
+                         "硬上限是 Unikraft 网关: 8MiB 是请求体上限(9Mi 起 413),"
+                         "但真正的杀手是**60 秒无数据超时** —— 一片必须在 60s 内传完,"
+                         "否则边缘网关回 504、rclone 从第 0 字节重传整个文件。"
+                         "换算: 需要的最低速率 = 分片MiB * 1024 / 60 KiB/s,"
+                         "即 4Mi 需 68 KiB/s、6Mi 需 102 KiB/s、8Mi 需 136 KiB/s。"
+                         "2026-10-30 实测: 8Mi 在 ~133 KiB/s 下每个文件都死在 ~22MiB(4%)"
+                         "反复 504, 整轮 12 个文件成 0; 同一条管道同一天改 4Mi 后"
+                         "单文件连续推进 17 分钟无一次 504。"
+                         "所以 8Mi 在这条管道上不是'临界'而是'必挂', 6Mi 只剩 1.3 倍余量"
+                         "也会抖; 4Mi 有 2 倍余量。"
+                         "注意调小不会变慢: 瓶颈是 Telegram 管道的带宽, 不是分片大小,"
+                         "4Mi 时每片只需 30s, 远没到超时, 放大分片省不到时间只增加风险。")
     ap.add_argument("--retries", type=int, default=5,
                     help="失败重试次数; 求稳可以调大(默认 5, 配 30s 间隔)")
     ap.add_argument("--tpslimit", type=float, default=10.0,
