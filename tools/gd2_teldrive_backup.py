@@ -7,6 +7,16 @@
   3) 目标端已有且同名同大小的文件跳过; 整个目录都齐了就跳过这个目录
   4) 按本轮总量预算(--max-transfer-gb)挑若干个目录, 到量收工下次继续
   5) 目标端保持原目录结构: teldrive:gd2-backup/<原目录相对路径>/...
+  6) 单文件超过 --max-file-gb(默认 1.5) 的直接跳过并列进报告 —— 见下方说明
+
+为什么要有单文件上限(2026-10-30):
+  这条 Teldrive 管道实测 ~125 KiB/s, 单文件传完所需时间 = 大小 / 125KiB/s:
+      1.5 GB -> 3.4h(能完)   2 GB -> 4.7h(超预算)   3 GB -> 7.0h(永远传不完)
+  而每轮预算只有 270~330 分钟。传不完不会"下次接着传": rclone 每轮都是全新
+  copy, 半截 session 被 clear_open_sessions() 清掉, 下轮 --size-only 又不匹配,
+  于是从第 0 字节重来。更糟的是 pending 按待传量降序, 这种大文件所在目录会
+  一直排最前, 每轮把预算吃光, 小文件永远轮不到。
+  所以超限文件必须跳过并显式列出, 不能让它悄悄占着队首。
 
 为什么必须用 tgdrive/rclone fork:
   官方 rclone **没有** teldrive backend。fork 是官方版的超集, 同一个二进制
@@ -542,6 +552,12 @@ def run_stream(a, plan, budget_sec):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="不加=只演练看计划")
+    ap.add_argument("--max-file-gb", type=float, default=1.5,
+                    help="单文件大小上限(GB), 默认 1.5。超过的直接跳过并写进报告。"
+                         "依据: 实测管道 ~125KiB/s, 1.5GB 需 3.4h(能传完), "
+                         "2GB 需 4.7h(超过 270min 预算传不完), 3GB 需 7h(永远传不完)。"
+                         "超限文件每轮都会重传且必然失败, 还会占住队首吃光预算, "
+                         "所以宁可跳过。设 0 = 不限制(不推荐)")
     ap.add_argument("--max-transfer-gb", type=float, default=150.0,
                     help="本轮总量上限(GB); 实测 ~8MiB/s, 270 分钟约 130GB, 默认 150 够用")
     ap.add_argument("--budget-min", type=int, default=270,
@@ -614,6 +630,12 @@ def main():
     # 为什么要降序: 以前是按字母序, 一个 263 GiB 的大目录排在零碎小目录后面,
     # 小目录先占满 plan 之后, 大目录因为「塞不下」被整段跳过 —— 于是每轮只啃几 GB 零头,
     # 大头永远排队等下一轮, 等于饿死。降序让大目录每轮第一个吃预算, 稳步收敛。
+    # 单文件上限: 超过 max_file_bytes 的直接跳过, 并单独记下来列进报告。
+    # 这些文件在这条管道上永远传不完(见文件头说明), 留着只会每轮重传、吃光预算、
+    # 还把 pending 排序顶到最前, 让小文件饿死。
+    max_file_bytes = int(a.max_file_gb * GB) if a.max_file_gb and a.max_file_gb > 0 else 0
+    skipped_big = []          # [(path, size)] 本轮因超限被跳过的文件
+
     pending = []
     for d in video_dirs:
         if a.only and d != a.only:
@@ -621,10 +643,28 @@ def main():
         e = video_dirs[d]
         files = e["files"] if not a.video_only else [x for x in e["files"] if is_video(x[0])]
         todo = [(p, s) for p, s in files if dst_map.get(p) != s]
+        if max_file_bytes:
+            kept = []
+            for p, s in todo:
+                if s > max_file_bytes:
+                    skipped_big.append((p, s))
+                else:
+                    kept.append((p, s))
+            todo = kept
         if not todo:
             continue                       # 这个文件夹已经全备份过了
         pending.append((d, todo, sum(s for _, s in todo)))
     pending.sort(key=lambda x: (-x[2], x[0]))
+
+    if skipped_big:
+        skipped_big.sort(key=lambda x: -x[1])
+        log("!! 单文件超过 %.2f GB 而跳过 %d 个 / %s (这段速率下传不完, 列进报告)"
+            % (a.max_file_gb, len(skipped_big),
+               human(sum(s for _, s in skipped_big))))
+        for p, s in skipped_big[:a.preview]:
+            log("   - %s (%s)" % (mask_dir(p), human(s)))
+        if len(skipped_big) > a.preview:
+            log("   ... 其余 %d 个省略" % (len(skipped_big) - a.preview))
 
     plan, planned_bytes = [], 0
     for d, todo, need in pending:
@@ -742,6 +782,14 @@ def main():
     lines.append("仍有残留  : %d 个目录" % len(todo_left))
     lines.append("耗时      : %.1f 分钟" % ((time.time() - t0) / 60))
     lines.append("")
+    if skipped_big:
+        lines.append("")
+        lines.append("---- 超限跳过(> %.2f GB, 当前速率下传不完) ----" % a.max_file_gb)
+        for p, s in skipped_big[:100]:
+            lines.append("%s  (%s)" % (p, human(s)))
+        if len(skipped_big) > 100:
+            lines.append("... 其余 %d 个省略" % (len(skipped_big) - 100))
+    lines.append("")
     lines.append("---- 未完成明细(下次会重挑) ----")
     for d, n, s in todo_left[:300]:
         lines.append("%s  (缺 %d 个 / %s)" % (d or "(根目录)", n, human(s)))
@@ -782,6 +830,8 @@ def main():
         # 进度条分母: 本轮真正切进批的量, 不是 plan 的全量(2912 GB)。
         # 旧版拿 plan_bytes 当分母, 实际只做几十 GB, 进度永远停 5%。
         "run_files": did["files"], "run_bytes": did["bytes"],
+        "skipped_big": len(skipped_big),
+        "skipped_big_bytes": sum(s for _, s in skipped_big),
         "done_dirs": len(done_dirs), "left_dirs": len(todo_left),
         "left_detail": [{"dir": d or "(根目录)", "n": n, "bytes": s}
                         for d, n, s in todo_left[:8]],

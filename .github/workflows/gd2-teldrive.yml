@@ -40,8 +40,13 @@ on:
   #   两边各留 1.5h 缓冲, 再也不打架。
   #   不心疼"少跑两轮": teldrive 那条 Telegram 管道总共就 ≈1.9MiB/s, 两条同时跑也不会
   #   更快, 错峰只是把排队空转的时间还回来。
+  #
+  # 2026-10-30 调整: yd2-teldrive 已手动停用(等 gd2 全部传完再启用), 整条
+  #   `teldrive-upload` 队列空出来了, 所以 gd2 从每 12 小时 2 轮加密到每 6 小时 4 轮,
+  #   把原本空转的 15 小时用起来。4 轮 x 270min ≈ 18h + 装环境开销, 24h 基本填满。
+  #   等 yd2 恢复时必须把这条改回 "40 6,18 * * *", 否则两条会互相排队。
   schedule:
-    - cron: "40 6,18 * * *"
+    - cron: "40 0,6,12,18 * * *"
   workflow_dispatch:
     inputs:
       apply:
@@ -52,6 +57,10 @@ on:
         description: "本轮传输总量上限(GB); 实测 ~8MiB/s, 270 分钟约 130GB, 默认 150 够用"
         required: false
         default: "150"
+      max_file_gb:
+        description: "单文件大小上限(GB), 默认 1.5; 超过的直接跳过并写进报告。依据: 管道 ~125KiB/s, 1.5GB 需 3.4h 能传完, 2GB 需 4.7h 超过预算传不完(会每轮重传、吃光预算、让小文件饿死)。0=不限制"
+        required: false
+        default: "1.5"
       budget_min:
         description: "本轮时间预算(分钟)。job 硬上限 350, 默认 270 留 80 分钟收尾(曾有一轮卡到 350 被强杀)"
         required: false
@@ -199,9 +208,10 @@ jobs:
           # 触发来源, 打进报告图副标题, 一眼分清定时/手动
           TD_EVENT: ${{ github.event_name }}
           MAX_GB: ${{ inputs.max_transfer_gb || '150' }}
+          MAX_FILE_GB: ${{ inputs.max_file_gb || '1.5' }}
           BUDGET: ${{ inputs.budget_min || '270' }}
           TRANSFERS: ${{ inputs.transfers || '3' }}
-          CHUNK: ${{ inputs.chunk_mb || '8' }}
+          CHUNK: ${{ inputs.chunk_mb || '4' }}
           MAX_DIRS: ${{ inputs.max_dirs || '0' }}
           VIDEO_ONLY: ${{ inputs.video_only || 'false' }}
           ONLY: ${{ inputs.only || '' }}
@@ -212,7 +222,7 @@ jobs:
           TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
         run: |
           set -x
-          ARGS="--max-transfer-gb $MAX_GB --budget-min $BUDGET"
+          ARGS="--max-transfer-gb $MAX_GB --max-file-gb $MAX_FILE_GB --budget-min $BUDGET"
           ARGS="$ARGS --transfers $TRANSFERS --chunk-mb $CHUNK --max-dirs $MAX_DIRS"
           ARGS="$ARGS --stage-batch-gb $STAGE_BATCH_GB"
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
