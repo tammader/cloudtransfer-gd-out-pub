@@ -53,6 +53,20 @@ RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
 GB = 1024 ** 3
 MB = 1024 ** 2
 
+# Teldrive 分片大小。默认 4Mi, 可用 YD2_TD_CHUNK 覆盖(例如 "6Mi")。
+# 为什么不再是 8Mi(2026-10-30 实测, gd2-teldrive 同一条 Teldrive 管道):
+#   除 Unikraft 网关 8MiB 请求体上限(9Mi 起 413)外, 真正杀人的是**60 秒无数据超时**
+#   —— 一片必须在 60s 内传完, 否则边缘网关回 504, rclone 从第 0 字节重传整个文件。
+#   需要的最低速率 = 分片MiB * 1024 / 60 KiB/s:
+#       4Mi = 68 KiB/s    6Mi = 102 KiB/s    8Mi = 136 KiB/s
+#   实测该管道只有 ~125-133 KiB/s, 8Mi 就卡在临界以下: 每个文件都死在 ~22MiB(4%)
+#   反复 504, 整轮 12 个文件成 0。同一天同管道改 4Mi 后, 单文件连续推进 59 分钟
+#   零次 504(1% -> 80%)。所以 8Mi 在这条管道上是"必挂"不是"临界", 6Mi 只剩
+#   1.3 倍余量也会抖, 4Mi 有近 2 倍余量。
+#   注意分片调小不会变慢: 瓶颈是管道带宽而不是分片大小, 4Mi 时一片只需约 30s,
+#   远没到 60s 超时; 放大分片省不到时间, 只增加 504 风险。
+TD_CHUNK = (os.environ.get("YD2_TD_CHUNK") or "4Mi").strip()
+
 VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv",
              ".m4v", ".ts", ".mpg", ".mpeg", ".rmvb", ".rm", ".3gp",
              ".vob", ".divx", ".f4v", ".asf")
@@ -195,8 +209,8 @@ def fetch(src, it, size, dest, retries=3):
 def upload(local, remote, retries=3):
     cmd = [
         RCLONE, "copyto", local, remote,
-        "--teldrive-chunk-size", "8Mi",
-        "--teldrive-hash-enabled=false",     # 8Mi 分片下树哈希必不匹配
+        "--teldrive-chunk-size", TD_CHUNK,
+        "--teldrive-hash-enabled=false",     # 小分片下树哈希必不匹配(按 16MiB 块算)
         "--multi-thread-streams", "0",       # 多线程写同一 session -> 409
         "--transfers", "1", "--checkers", "1",
         "--retries", str(retries), "--retries-sleep", "30s",
