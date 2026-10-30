@@ -61,9 +61,9 @@ on:
         required: false
         default: "3"
       chunk_mb:
-        description: "Teldrive 分片大小(MB)。Unikraft 网关实测单请求体上限 8MiB(9Mi 起 413), 所以默认 8; 调大必炸"
+        description: "Teldrive 分片大小(MB), 默认 4。除 8MiB 请求体上限(9Mi 起 413)外, 真正约束是网关 60s 无数据超时: 一片必须在 60s 内传完, 否则 504 后从第0字节重传。需最低速率 = 分片MiB*1024/60 KiB/s (4Mi=68, 6Mi=102, 8Mi=136); 2026-10-30 实测 8Mi 在 ~133KiB/s 下每个文件都死在 ~22MiB, 4Mi 连续 17 分钟 0 次 504"
         required: false
-        default: "8"
+        default: "4"
       max_dirs:
         description: "本轮最多备份几个文件夹; 0=不限(按总量上限收工)"
         required: false
