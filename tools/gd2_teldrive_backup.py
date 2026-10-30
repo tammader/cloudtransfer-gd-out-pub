@@ -302,6 +302,59 @@ def _prune_empty(root):
             pass          # 非空/被占用都无所谓
 
 
+def _stage_files(root):
+    """列出 stage 里的文件: [(绝对路径, 大小, mtime)], 按 mtime 从旧到新。"""
+    out = []
+    for d, _, fs in os.walk(root):
+        for f in fs:
+            p = os.path.join(d, f)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            out.append((p, st.st_size, st.st_mtime))
+    out.sort(key=lambda x: x[2])
+    return out
+
+
+def _trim_stage(a):
+    """按磁盘压力清理 stage 里上一轮留下的本地副本。
+
+    为什么不"收工就清"(2026-10-30 定论, 方案 Y):
+      run 40982196440 里 0791ebde.mkv 传到 80% 时预算到点, 旧代码把整批
+      `os.remove` 掉 —— 59 分钟的下载白做, 下轮还得从 Google Drive 重下。
+      而 Teldrive 的半截 session 本来就不可续(clear_open_sessions 会清掉),
+      所以"保留本地文件"救不回远端进度, 但能省掉一次完整重下, 而且让
+      下轮 --size-only 对已传完的文件直接跳过, 不做无意义的重复上传。
+
+    清理规则(只在真正紧张时动手):
+      * 可用磁盘 >= KEEP_LOW_GB   -> 什么都不做
+      * 否则从最旧的文件开始删, 直到可用磁盘回到 KEEP_TARGET_GB
+    这样常态下文件会留到下一轮被复用, 只有磁盘吃紧时才牺牲最旧的那批。
+    """
+    KEEP_LOW_GB = 20.0
+    KEEP_TARGET_GB = 30.0
+    free = shutil.disk_usage(WORK).free
+    if free >= KEEP_LOW_GB * GB:
+        return
+    files = _stage_files(STAGE)
+    if not files:
+        return
+    log("磁盘只剩 %s (< %.0fGB), 清理 stage 旧文件"
+        % (human(free), KEEP_LOW_GB))
+    freed = 0
+    for p, sz, _ in files:
+        if shutil.disk_usage(WORK).free >= KEEP_TARGET_GB * GB:
+            break
+        try:
+            os.remove(p)
+            freed += sz
+        except OSError:
+            pass
+    _prune_empty(STAGE)
+    log("  清掉 %s, 磁盘剩 %s" % (human(freed), human(shutil.disk_usage(WORK).free)))
+
+
 def run_staged(a, plan, budget_sec, t0):
     """落地模式主循环: 分批 下载 -> 上传 -> 删本地。返回 (退出码, 批数, 实做量)。
 
@@ -313,6 +366,12 @@ def run_staged(a, plan, budget_sec, t0):
     实际只做几十 GB, 进度永远停在 5% 附近, 看着像卡死。
     """
     os.makedirs(STAGE, exist_ok=True)
+    # 先看上一轮留下了什么: 常态下不动它(下轮直接复用), 磁盘吃紧才清旧的
+    kept = _stage_files(STAGE)
+    if kept:
+        log("stage 里有上一轮留下的 %d 个文件 / %s"
+            % (len(kept), human(sum(x[1] for x in kept))))
+    _trim_stage(a)
     todo_all = [(p, s) for _, todo, _ in plan for p, s in todo]
     deadline = t0 + budget_sec
     rc_all, n_batch, i = 0, 0, 0
@@ -376,10 +435,31 @@ def run_staged(a, plan, budget_sec, t0):
             % (n_batch, len(batch), human(acc), human(free)))
 
         # 1) 下载: 给三成剩余时间(实测 Google -> runner 比 Teldrive 写快一个量级)
-        dl_budget = min(left * 0.35, max(300.0, acc / GB * 8))
-        rc1 = _rclone(_download_args(a, bf), dl_budget, "下载")
-        if rc1 not in (0, 124, 130):
-            log("!! 下载退出码 %d, 照旧往下传(已落地的会传, 没落地的下轮重来)" % rc1)
+        #    本地已经有的(上一轮留下的)不再重复下载 —— 那是纯粹的时间浪费。
+        #    大小对得上才算可复用: 半截文件不能直接传, 会让 Teldrive 收到残缺数据。
+        have, miss = [], []
+        for p, s in batch:
+            full = os.path.join(STAGE, p)
+            try:
+                ok = os.path.isfile(full) and os.path.getsize(full) == s
+            except OSError:
+                ok = False
+            (have if ok else miss).append(p)
+        if have:
+            have_set = set(have)
+            have_bytes = sum(sz for p, sz in batch if p in have_set)
+            log("   本地已有 %d/%d 个完整文件, 跳过下载: %s"
+                % (len(have), len(batch), human(have_bytes)))
+        if miss:
+            with open(bf, "w", encoding="utf-8") as f:
+                for p in miss:
+                    f.write(p + "\n")
+            dl_budget = min(left * 0.35, max(300.0, acc / GB * 8))
+            rc1 = _rclone(_download_args(a, bf), dl_budget, "下载")
+            if rc1 not in (0, 124, 130):
+                log("!! 下载退出码 %d, 照旧往下传(已落地的会传, 没落地的下轮重来)" % rc1)
+        else:
+            log("   这批全部在本地, 不用下载")
 
         # 2) 上传 —— 只为真正落地的文件构造清单: 下载失败的那些不在里面,
         #    免得 rclone 对着不存在的源文件报 error reading source, 把退出码搞脏。
@@ -404,21 +484,19 @@ def run_staged(a, plan, budget_sec, t0):
         rc2 = _rclone(_upload_args(a, uf), left2, "上传")
         if rc2 in (124, 130):
             log("上传到点, 优雅收工(下次继续) —— 这不是失败")
+            log("本地副本全部保留(%d 个), 下轮直接复用, 不重复下载"
+                % len(batch))
             rc_all = rc2
             break
         if rc2 != 0:
             rc_all = rc2
 
-        # 3) 清掉这批的本地副本(传成的没必要留, 没传成的下轮重下, 留着只会撑爆磁盘)
-        drop = 0
-        for p, _ in batch:
-            try:
-                os.remove(os.path.join(STAGE, p))
-                drop += 1
-            except OSError:
-                pass
-        _prune_empty(STAGE)
-        log("本地已清 %d 个, 磁盘剩 %s" % (drop, human(shutil.disk_usage(WORK).free)))
+        # 3) 不再删本地副本 —— 见 _trim_stage 的说明(方案 Y, 2026-10-30)。
+        #    已传完的: 下轮 --size-only 会跳过, 不做重复上传;
+        #    没传完的: 下轮重新传, 但省掉一次从 Google Drive 的完整下载。
+        #    真正需要腾磁盘时由下次开跑的 _trim_stage 按压力统一处理。
+        log("本批完成, 本地保留 %d 个(下轮复用), 磁盘剩 %s"
+            % (len(batch), human(shutil.disk_usage(WORK).free)))
 
     return rc_all, n_batch, {"bytes": did_bytes, "files": did_files}
 
