@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """gdrive2 -> Teldrive 冷备份: 自动找出「含视频的文件夹」, 整个文件夹备份
 
 扫描逻辑(按文件夹为单位, 不是按单个文件):
@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -75,6 +76,18 @@ MB = 1024 ** 2
 RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
 WORK = os.environ.get("GT_WORK", "/tmp/gd2teldrive")
 STAGE = os.path.join(WORK, "stage")
+
+# ---- 预算硬截止(run #41 之后加的) ----
+# _DEADLINE = t0 + budget_sec 的绝对时间戳; _rclone 每次调用都按它现算配额,
+# 这样就算调用方传了个过期的 budget_sec, 也不会让单条 rclone 超时跑飞。
+_DEADLINE = None
+# timeout 先发 SIGTERM 等这么久, 还不走就 SIGKILL
+KILL_AFTER_SEC = 60
+# 单条 rclone 最多给它这么长的「优雅收尾 + 读尾巴」窗口, 超过就强杀断管道
+HARD_GRACE_SEC = 45 * 60
+# Windows 上没有 SIGKILL(Python 只有 SIGTERM/SIGINT/SIGBREAK), CI 是 Linux 无所谓,
+# 但本机调试时不能因此崩掉 —— 缺就退回 SIGTERM。
+_SIG_HARD = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 # 视频扩展名(判到「末尾」, 所以 xxx.part001.mp4 这种切分名也算)
 VIDEO_RE = re.compile(
@@ -247,15 +260,84 @@ def _rclone(args, budget_sec, tag):
     """跑一条 rclone(参数里已含子命令), 用 timeout 包住, 输出经 Python stdout 过脱敏。
 
     返回 rclone 退出码; 124/130 = 时间到被 timeout 收走(不算失败)。
+
+    ⚠️ 2026-11-01 run #41 的教训(288 分钟被 runner 判"lost communication"):
+
+    `timeout --signal=INT` 只是**发信号**, 不是保证结束。rclone 收 INT 后要
+    优雅收尾(写完当前分片、flush 状态、退上传 session), 在 40~50 KiB/s 的
+    Telegram 管道上, 一次 flush 就能磨十几分钟; `--kill-after=120s` 期间
+    子进程还在吐输出, 我们又在 `for line in p.stdout` 里同步读 —— 只要
+    rclone 的孙进程还握着管道, readline 就永远不返回, `p.wait()` 根本轮不到。
+    结果: 脚本自以为"到点收工", 实际卡在读取上, 一路拖到 runner 看门狗
+    把整台机器判失联。
+
+    修法两层, 缺一不可:
+      1) 外层从"信任 timeout 的秒数"改成"按 deadline 现算" —— 传进来的
+         budget_sec 可能已经是几分钟前的旧值, 每次都拿当前时间重新截断;
+      2) 读取循环改成非阻塞 + 绝对硬截止: 到点先 SIGTERM, 再 SIGKILL,
+         然后**主动关掉管道**, 不管孙进程死活都返回, 绝不把 wait() 挂在
+         一个不吐数据的管道上。
     """
-    cmd = ["timeout", "--signal=INT", "--kill-after=120s",
-           "%ds" % max(60, int(budget_sec)), RCLONE] + args
-    log("%s: %s ..." % (tag, " ".join(args[:2])))
+    # ---- 1) 按绝对 deadline 现算配额, 不信任调用方传的时间 ----
+    global _DEADLINE
+    sec = max(0, int(budget_sec))
+    if _DEADLINE is not None:
+        sec = min(sec, max(0, int(_DEADLINE - time.time())))
+    # 给 rclone 自己留的优雅收尾时间不能超过剩余额度, 否则 timeout 反而拖长
+    sec = max(0, min(sec, HARD_GRACE_SEC))
+
+    if sec <= 0:
+        log("%s: 已到预算硬截止, 直接跳过(不启动 rclone)" % tag)
+        return 124
+
+    cmd = ["timeout", "--signal=TERM", "--kill-after=%ds" % KILL_AFTER_SEC,
+           "%ds" % sec, RCLONE] + args
+    log("%s: %s ... (上限 %ds)" % (tag, " ".join(args[:2]), sec))
+    hard_stop = time.time() + sec + KILL_AFTER_SEC + 30
+
     p = subprocess.Popen(cmd, cwd=WORK, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in p.stdout:
-        print(line.rstrip("\n"), flush=True)
-    return p.wait()
+                         stderr=subprocess.STDOUT, text=True, bufsize=1,
+                         start_new_session=True)
+
+    def _kill(sig):
+        try:
+            os.killpg(os.getpgid(p.pid), sig)
+        except Exception:
+            try:
+                p.send_signal(sig)
+            except Exception:
+                pass
+
+    try:
+        while True:
+            line = p.stdout.readline()
+            if line == "":                      # 管道 EOF -> rclone 真结束了
+                break
+            print(line.rstrip("\n"), flush=True)
+            if time.time() > hard_stop:
+                # 到绝对硬截止: 管道还没断说明有孙进程攥着 stdout,
+                # 不能再等 —— 杀掉整组并主动断开, 否则就是 run #41 那个死法
+                log("!! %s: 超过硬截止仍未结束, 强杀进程组并断开管道" % tag)
+                _kill(signal.SIGTERM)
+                time.sleep(3)
+                _kill(_SIG_HARD)
+                break
+    finally:
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
+
+    try:
+        rc = p.wait(timeout=max(1, int(hard_stop - time.time()) + 30))
+    except subprocess.TimeoutExpired:
+        log("!! %s: wait 超时, 强杀" % tag)
+        _kill(_SIG_HARD)
+        try:
+            rc = p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            rc = 124
+    return rc
 
 
 def _download_args(a, files_from):
@@ -747,6 +829,12 @@ def main():
 
     # ---- 真跑 ----
     budget_sec = a.budget_min * 60
+    # 绝对硬截止: 从这里开始,_rclone 每一次调用都按它现算配额(run #41 的修法)。
+    # 注意 t0 是 main 刚进来时打的点, 它前面还有 源端列目录 / 目标端列目录 /
+    # 删空壳 / 清 session 这几步 —— 那些步骤本身也吃时间, 所以 deadline 必须
+    # 基于 t0 而不是"现在 + budget", 否则整轮总时长 = 预算 + 前面那几步。
+    global _DEADLINE
+    _DEADLINE = t0 + budget_sec
     did = {"bytes": 0, "files": 0}
     if a.no_stage:
         rc = run_stream(a, plan, budget_sec)
