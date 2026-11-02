@@ -92,6 +92,10 @@ HARD_GRACE_SEC = 45 * 60
 # 但本机调试时不能因此崩掉 —— 缺就退回 SIGTERM。
 _SIG_HARD = getattr(signal, "SIGKILL", signal.SIGTERM)
 
+# --no-fast-list 的开关(默认 False = 用 --fast-list)。在 main() 里按参数设置,
+# lsjson() 读它。必须给个模块级默认值, 否则 lsjson 先于 main 赋值被调用会 NameError。
+_NO_FAST = False
+
 # 视频扩展名(判到「末尾」, 所以 xxx.part001.mp4 这种切分名也算)
 VIDEO_RE = re.compile(
     r"\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|mpg|mpeg|m2ts|ts|rmvb|rm|3gp|vob|divx|f4v|asf)$",
@@ -211,9 +215,10 @@ def clear_open_sessions(limit=2000):
 
 def lsjson(remote, allow_missing=False):
     """allow_missing=True 时, 目标目录还不存在不算错误(首次备份就是这种情况), 返回空清单"""
-    r = subprocess.run(
-        [RCLONE, "lsjson", remote, "-R", "--files-only", "--fast-list", "--no-modtime"],
-        capture_output=True, text=True)
+    cmd = [RCLONE, "lsjson", remote, "-R", "--files-only", "--no-modtime"]
+    if not _NO_FAST:
+        cmd.append("--fast-list")
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         err = r.stderr.strip()
         if allow_missing and ("directory not found" in err or "not found" in err):
@@ -352,6 +357,7 @@ def _rclone(args, budget_sec, tag):
     th = threading.Thread(target=_reader, daemon=True)
     th.start()
 
+    hard_stopped = False
     try:
         while True:
             try:
@@ -363,6 +369,7 @@ def _rclone(args, budget_sec, tag):
                     _kill(signal.SIGTERM)
                     time.sleep(3)
                     _kill(_SIG_HARD)
+                    hard_stopped = True
                     break
                 continue
             if item is _EOF:
@@ -373,6 +380,7 @@ def _rclone(args, budget_sec, tag):
                 _kill(signal.SIGTERM)
                 time.sleep(3)
                 _kill(_SIG_HARD)
+                hard_stopped = True
                 break
     finally:
         try:
@@ -385,10 +393,16 @@ def _rclone(args, budget_sec, tag):
     except subprocess.TimeoutExpired:
         log("!! %s: wait 超时, 强杀" % tag)
         _kill(_SIG_HARD)
+        hard_stopped = True
         try:
             rc = p.wait(timeout=15)
         except subprocess.TimeoutExpired:
             rc = 124
+    # 硬截止是我们**主动**杀掉的 —— 语义上就是"预算到点", 必须归一化成 124。
+    # 否则 p.wait() 会返回负数信号码(Linux 上是 -9/-15), 调用方 rc in (124, 130)
+    # 判不到, 把"优雅收工"当成崩溃报进 stats(budget_hit=False), Telegram 图也会标失败。
+    if hard_stopped:
+        return 124
     return rc
 
 
