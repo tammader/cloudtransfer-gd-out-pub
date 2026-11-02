@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """gdrive2 -> Teldrive 冷备份: 自动找出「含视频的文件夹」, 整个文件夹备份
 
 扫描逻辑(按文件夹为单位, 不是按单个文件):
@@ -83,7 +83,10 @@ STAGE = os.path.join(WORK, "stage")
 _DEADLINE = None
 # timeout 先发 SIGTERM 等这么久, 还不走就 SIGKILL
 KILL_AFTER_SEC = 60
-# 单条 rclone 最多给它这么长的「优雅收尾 + 读尾巴」窗口, 超过就强杀断管道
+# ⚠️ 只当「到点之后的收尾宽限」用, **绝不要拿去封顶 rclone 的总时长**。
+# run #44 就是这么翻车的: 用 min(sec, HARD_GRACE_SEC) 封顶, 把本该跑 240 分钟的
+# 上传砍成 45 分钟, 一批 9.5GB 传 4% 就被切断, 整轮新增 0 个文件。
+# 现在它只参与 hard_stop = sec + KILL_AFTER_SEC + 30 的计算。
 HARD_GRACE_SEC = 45 * 60
 # Windows 上没有 SIGKILL(Python 只有 SIGTERM/SIGINT/SIGBREAK), CI 是 Linux 无所谓,
 # 但本机调试时不能因此崩掉 —— 缺就退回 SIGTERM。
@@ -283,8 +286,14 @@ def _rclone(args, budget_sec, tag):
     sec = max(0, int(budget_sec))
     if _DEADLINE is not None:
         sec = min(sec, max(0, int(_DEADLINE - time.time())))
-    # 给 rclone 自己留的优雅收尾时间不能超过剩余额度, 否则 timeout 反而拖长
-    sec = max(0, min(sec, HARD_GRACE_SEC))
+
+    # ⚠️ 2026-11-02 run #44 的教训: 这里**不能**再按 HARD_GRACE_SEC 封顶。
+    # HARD_GRACE_SEC 的语义是「到点之后还允许拖多久收尾」, 不是「单条 rclone
+    # 最多跑多久」。我一开始写成 sec = min(sec, HARD_GRACE_SEC), 结果上传那条
+    # 本该跑 240 分钟的 rclone 被硬砍到 45 分钟(日志 "(上限 2700s)"),
+    # 一批 9.5GB 传了 4% 就"优雅收工", 整轮新增 0 个文件。
+    # 真正的时长约束只有两个: deadline(整轮预算) 和调用方传的 budget_sec。
+    # 收尾宽限已经体现在下面的 hard_stop = sec + KILL_AFTER_SEC 里了。
 
     if sec <= 0:
         log("%s: 已到预算硬截止, 直接跳过(不启动 rclone)" % tag)
