@@ -293,7 +293,6 @@ def _rclone(args, budget_sec, tag):
     # 本该跑 240 分钟的 rclone 被硬砍到 45 分钟(日志 "(上限 2700s)"),
     # 一批 9.5GB 传了 4% 就"优雅收工", 整轮新增 0 个文件。
     # 真正的时长约束只有两个: deadline(整轮预算) 和调用方传的 budget_sec。
-    # 收尾宽限已经体现在下面的 hard_stop = sec + KILL_AFTER_SEC 里了。
 
     if sec <= 0:
         log("%s: 已到预算硬截止, 直接跳过(不启动 rclone)" % tag)
@@ -302,7 +301,17 @@ def _rclone(args, budget_sec, tag):
     cmd = ["timeout", "--signal=TERM", "--kill-after=%ds" % KILL_AFTER_SEC,
            "%ds" % sec, RCLONE] + args
     log("%s: %s ... (上限 %ds)" % (tag, " ".join(args[:2]), sec))
-    hard_stop = time.time() + sec + KILL_AFTER_SEC + 30
+
+    # ---- 2) 硬截止用**绝对时间**算, 不能用 time.time() 再滚一遍 ----
+    # 旧写法 hard_stop = time.time() + sec + KILL_AFTER_SEC + 30 有两个毛病:
+    #   a) 双重宽限: 有 _DEADLINE 时 sec 已经是"到 deadline 还剩多少", 再加
+    #      90 秒就等于允许超出整轮预算 90 秒; 每批都多 90 秒, 攒起来可观。
+    #   b) 真正的死点不在这里(见下面的读取循环), 光算对不算数。
+    hard_stop = time.time() + sec + KILL_AFTER_SEC
+    if _DEADLINE is not None:
+        # 有整轮 deadline 时, 单条 rclone 的收尾绝不能越过它 —— 收尾宽限
+        # 只允许在"这一条自己的预算用完"后发生, 不允许把整轮拖长。
+        hard_stop = min(hard_stop, _DEADLINE + KILL_AFTER_SEC)
 
     p = subprocess.Popen(cmd, cwd=WORK, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, bufsize=1,
@@ -317,15 +326,49 @@ def _rclone(args, budget_sec, tag):
             except Exception:
                 pass
 
+    # ---- 3) 读取循环必须**可被打断**, 否则 run #41 会重演 ----
+    # 旧写法 while True: line = p.stdout.readline() 的致命问题:
+    #   readline() 是阻塞的。rclone 只要还没死但也不吐数据(卡在 TCP 重传 /
+    #   服务端 hang 住), readline 就永远不返回, 循环里 time.time() > hard_stop
+    #   那一行**根本执行不到**, 硬截止形同虚设。
+    # 改成: 独立线程只负责 readline 塞进队列, 主线程用 queue.get(timeout=)
+    # 带超时地取。这样主线程每隔一小会儿就能醒来看一次表, 到点必定能强杀。
+    # (不用 select: Windows 的 select 不支持管道, 本机调试会直接报错。)
+    import queue as _queue
+    import threading
+
+    q = _queue.Queue()
+    _EOF = object()
+
+    def _reader():
+        try:
+            for line in p.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            q.put(_EOF)
+
+    th = threading.Thread(target=_reader, daemon=True)
+    th.start()
+
     try:
         while True:
-            line = p.stdout.readline()
-            if line == "":                      # 管道 EOF -> rclone 真结束了
+            try:
+                item = q.get(timeout=1.0)
+            except _queue.Empty:
+                # 没新输出, 但进程可能还活着 —— 这正是要检查硬截止的时刻
+                if time.time() > hard_stop:
+                    log("!! %s: 超过硬截止仍未结束(且无输出), 强杀进程组并断开管道" % tag)
+                    _kill(signal.SIGTERM)
+                    time.sleep(3)
+                    _kill(_SIG_HARD)
+                    break
+                continue
+            if item is _EOF:
                 break
-            print(line.rstrip("\n"), flush=True)
+            print(item.rstrip("\n"), flush=True)
             if time.time() > hard_stop:
-                # 到绝对硬截止: 管道还没断说明有孙进程攥着 stdout,
-                # 不能再等 —— 杀掉整组并主动断开, 否则就是 run #41 那个死法
                 log("!! %s: 超过硬截止仍未结束, 强杀进程组并断开管道" % tag)
                 _kill(signal.SIGTERM)
                 time.sleep(3)
@@ -564,9 +607,26 @@ def run_staged(a, plan, budget_sec, t0):
 
         # 2) 上传 —— 只为真正落地的文件构造清单: 下载失败的那些不在里面,
         #    免得 rclone 对着不存在的源文件报 error reading source, 把退出码搞脏。
-        landed = [p for p, _ in batch if os.path.isfile(os.path.join(STAGE, p))]
+        #
+        # ⚠️ 2026-11-02 审计: 旧写法只判 os.path.isfile(), 不判大小。下载被
+        # timeout 收走(rc1=124)时会留下**半截文件**, 半截文件也会通过 isfile(),
+        # 于是被塞进上传清单, 把残缺数据推给 Teldrive。上面 have/miss 的判定
+        # 明明用了 getsize() == s, 这里却没用 —— 同一个判据两处不一致。
+        # 现在统一成「存在 且 大小完全相等」才算落地; 半截的留到下一轮重新下载
+        # (rclone copy --size-only 会把它补齐)。
+        landed, partial = [], []
+        for p, s in batch:
+            full = os.path.join(STAGE, p)
+            try:
+                ok = os.path.isfile(full) and os.path.getsize(full) == s
+            except OSError:
+                ok = False
+            (landed if ok else partial).append(p)
+        if partial:
+            log("   有 %d 个文件未完整落地(半截/缺失), 本轮不上传: 下轮重新下载"
+                % len(partial))
         if not landed:
-            log("!! 这批一个文件都没落地(下载全失败), 跳过上传")
+            log("!! 这批一个文件都没完整落地(下载全失败), 跳过上传")
             _prune_empty(STAGE)
             continue
         uf = os.path.join(WORK, "up_%03d.txt" % n_batch)
