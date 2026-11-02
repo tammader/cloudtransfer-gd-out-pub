@@ -222,15 +222,17 @@ jobs:
           TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
         run: |
           set -x
-          ARGS="--max-transfer-gb $MAX_GB --max-file-gb $MAX_FILE_GB --budget-min $BUDGET"
-          ARGS="$ARGS --transfers $TRANSFERS --chunk-mb $CHUNK --max-dirs $MAX_DIRS"
-          ARGS="$ARGS --stage-batch-gb $STAGE_BATCH_GB"
-          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
-          if [ "$VIDEO_ONLY" = "true" ]; then ARGS="$ARGS --video-only"; fi
+          # 用数组而不是拼字符串: 拼字符串时 --only 'X' 里的引号不会被再次解析,
+          # 路径带空格会被 shell 拆成两个参数(argparse: unrecognized arguments)。
+          ARGV=(--max-transfer-gb "$MAX_GB" --max-file-gb "$MAX_FILE_GB" --budget-min "$BUDGET"
+                --transfers "$TRANSFERS" --chunk-mb "$CHUNK" --max-dirs "$MAX_DIRS"
+                --stage-batch-gb "$STAGE_BATCH_GB")
+          if [ "$APPLY" = "true" ]; then ARGV+=(--apply); fi
+          if [ "$VIDEO_ONLY" = "true" ]; then ARGV+=(--video-only); fi
           # 默认落地模式(下载到 runner 磁盘再传); 只有显式 stage=false 才回到流式直传
-          if [ "$STAGE" = "false" ]; then ARGS="$ARGS --no-stage"; fi
-          if [ -n "$ONLY" ]; then ARGS="$ARGS --only '$ONLY'"; fi
-          python3 tools/gd2_teldrive_backup.py $ARGS
+          if [ "$STAGE" = "false" ]; then ARGV+=(--no-stage); fi
+          if [ -n "$ONLY" ]; then ARGV+=(--only "$ONLY"); fi
+          python3 tools/gd2_teldrive_backup.py "${ARGV[@]}"
 
       - name: 出报告图并发 Telegram
         if: always()
