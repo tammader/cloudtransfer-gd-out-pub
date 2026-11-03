@@ -1,0 +1,67 @@
+
+name: td-usage
+
+# 只读查询: 统计 teldrive 目标端占用多少 GB / 多少个文件。不动任何数据。
+on:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "要统计的远程路径"
+        required: false
+        default: "teldrive:"
+
+permissions:
+  contents: read
+
+jobs:
+  usage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 装补丁版 rclone
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 \
+            --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -2
+
+      - name: 配 teldrive 远端
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+        run: |
+          set -euo pipefail
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" >/dev/null
+          echo "远端已配置"
+
+      - name: 统计占用
+        env:
+          P: ${{ inputs.path || 'teldrive:' }}
+        run: |
+          set -euo pipefail
+          echo "=== rclone size $P (--json) ==="
+          rclone size "$P" --json 2>/dev/null | tee /tmp/size.json
+          echo ""
+          echo "=== 人读格式 ==="
+          rclone size "$P" 2>&1 | tail -5
+          echo ""
+          echo "=== 顶层目录各占多少 ==="
+          rclone size "$P" --max-depth 1 2>/dev/null | tail -30 || true
+          echo ""
+          echo "=== 汇总 ==="
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/size.json'))
+          n = d.get('count', 0); b = d.get('bytes', 0)
+          print("文件数 count = %d" % n)
+          print("总大小 bytes = %d" % b)
+          print("总大小 GiB   = %.3f" % (b / 1024**3))
+          print("总大小 GB    = %.3f" % (b / 1000**3))
+          print("平均单文件   = %.1f MiB" % ((b / n / 1024**2) if n else 0))
+          PY
