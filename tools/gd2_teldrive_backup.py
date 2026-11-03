@@ -213,8 +213,19 @@ def clear_open_sessions(limit=2000):
     return n
 
 
-def lsjson(remote, allow_missing=False):
-    """allow_missing=True 时, 目标目录还不存在不算错误(首次备份就是这种情况), 返回空清单"""
+def lsjson(remote, allow_missing=False, soft=False):
+    """列远端清单。
+
+    allow_missing=True 时, 目标目录还不存在不算错误(首次备份就是这种情况), 返回空清单。
+
+    soft=True 时**失败不抛 SystemExit, 而是返回 None** —— 给「收尾复核」用。
+    2026-11-02 run #47 的教训: 备份本身完全成功(3 批 / 54 个文件 / 28.62 GB),
+    上传跑满 270 分钟后立刻做收尾复核, 此时 Teldrive API 刚被 4.5 小时高频写入
+    轰炸过, /api/v1/me 直接 connection refused。旧代码在这里 raise SystemExit,
+    把一次**完全成功的备份**打成 job failure, stats.json 也没写出来,
+    于是 Telegram 收到的是"异常卡片" —— 实际数据一个没丢。
+    收尾复核只是个统计口径, 它挂了不该否定前面几小时的成果。
+    """
     cmd = [RCLONE, "lsjson", remote, "-R", "--files-only", "--no-modtime"]
     if not _NO_FAST:
         cmd.append("--fast-list")
@@ -224,10 +235,16 @@ def lsjson(remote, allow_missing=False):
         if allow_missing and ("directory not found" in err or "not found" in err):
             log("目标端 %s 还不存在 -> 当作空清单(首次备份会自动创建)" % remote)
             return []
+        if soft:
+            log("!! 列目录失败(软失败, 不中断) %s: %s" % (remote, err[:300]))
+            return None
         raise SystemExit("!! 列目录失败 %s: %s" % (remote, err[:400]))
     try:
         return json.loads(r.stdout)
     except Exception as e:
+        if soft:
+            log("!! 解析 lsjson 失败(软失败, 不中断): %s" % e)
+            return None
         raise SystemExit("!! 解析 lsjson 失败: %s" % e)
 
 
@@ -927,20 +944,33 @@ def main():
             % (n_batch, did["files"], human(did["bytes"])))
 
     # ---- 复核 + 报告 ----
-    dst_map2 = {}
-    for it in lsjson(DST, allow_missing=True):
-        if not it.get("IsDir"):
-            dst_map2[it["Path"]] = int(it.get("Size", 0) or 0)
+    # 收尾复核用 soft=True: 备份已经跑完了, 这一步只是为了算"本轮新增/还剩多少",
+    # 它挂了不能反过来否定前面的成果(run #47 就是这么被判 failure 的)。
+    dst_map2 = None
+    lst2 = lsjson(DST, allow_missing=True, soft=True)
+    if lst2 is not None:
+        dst_map2 = {}
+        for it in lst2:
+            if not it.get("IsDir"):
+                dst_map2[it["Path"]] = int(it.get("Size", 0) or 0)
+    else:
+        log("!! 收尾复核列目录失败 —— 跳过增量统计, 但备份结果不受影响")
 
     done_dirs, todo_left = [], []
-    for d, todo, need in plan:
-        ok = [(p, s) for p, s in todo if dst_map2.get(p) == s]
-        miss = [(p, s) for p, s in todo if dst_map2.get(p) != s]
-        if miss:
-            todo_left.append((d, len(miss), sum(s for _, s in miss)))
-        else:
-            done_dirs.append(d)
-    log("本轮整目录完成 %d 个, 仍有残留 %d 个" % (len(done_dirs), len(todo_left)))
+    if dst_map2 is None:
+        # 复核不可用: 不能假装"全部完成", 也不能假装"全部残留"。
+        # 用本批实切量如实汇报, 目录级结论留到下一轮复核时再定。
+        log("!! 复核跳过: 本轮实切 %d 个文件 / %s, 目录级完成数本轮未知"
+            % (did["files"], human(did["bytes"])))
+    else:
+        for d, todo, need in plan:
+            ok = [(p, s) for p, s in todo if dst_map2.get(p) == s]
+            miss = [(p, s) for p, s in todo if dst_map2.get(p) != s]
+            if miss:
+                todo_left.append((d, len(miss), sum(s for _, s in miss)))
+            else:
+                done_dirs.append(d)
+        log("本轮整目录完成 %d 个, 仍有残留 %d 个" % (len(done_dirs), len(todo_left)))
 
     lines = []
     lines.append("gdrive2 -> Teldrive 备份报告 (含视频文件夹)")
@@ -977,15 +1007,23 @@ def main():
     #     真值会被当成新增(假涨); 空壳删掉后本轮没覆盖到的, 会从 lst 里消失,
     #     dst_files 反而下降(假跌)。两个假象一起把差值压到只剩 1 个。
     #   - 排除 size == 0: 本轮没传完的 0 字节壳不算"新增"。
-    new_files = [p for p in dst_map2
-                 if dst_map2[p] > 0 and base_map.get(p, -1) != dst_map2[p]]
-    new_bytes = sum(dst_map2[p] for p in new_files)
-    # 顺带把"目标端累计"跟基准分开报, 涨跌一眼能看出来
-    dst_delta = len(dst_map2) - len(base_map)
-    lost = [p for p in base_map if p not in dst_map2]
-    log("本轮新增 %d 个 / %s; 目标端 %d -> %d (%+d); 消失 %d 个"
-        % (len(new_files), human(new_bytes), len(base_map), len(dst_map2),
-           dst_delta, len(lost)))
+    #   - 复核失败(dst_map2 is None)时: 增量统计无意义, 置 None 并在 note 里写明,
+    #     让报告图显示"复核失败但已实传 X", 而不是整轮判失败。
+    if dst_map2 is None:
+        new_files, new_bytes = [], 0
+        dst_delta, lost = None, []
+        log("本轮新增 (复核失败, 无法统计); 本轮实传 %d 个 / %s"
+            % (did["files"], human(did["bytes"])))
+    else:
+        new_files = [p for p in dst_map2
+                     if dst_map2[p] > 0 and base_map.get(p, -1) != dst_map2[p]]
+        new_bytes = sum(dst_map2[p] for p in new_files)
+        # 顺带把"目标端累计"跟基准分开报, 涨跌一眼能看出来
+        dst_delta = len(dst_map2) - len(base_map)
+        lost = [p for p in base_map if p not in dst_map2]
+        log("本轮新增 %d 个 / %s; 目标端 %d -> %d (%+d); 消失 %d 个"
+            % (len(new_files), human(new_bytes), len(base_map), len(dst_map2),
+               dst_delta, len(lost)))
     dump_stats({
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "mode": ("真跑-流式" if a.no_stage else "真跑-落地"), "apply": True,
@@ -995,9 +1033,11 @@ def main():
         "plan_dirs": len(plan), "plan_bytes": planned_bytes,
         "plan_detail": [{"dir": d or "(根目录)",
                          "n": len(todo), "bytes": need} for d, todo, need in plan[:8]],
-        "dst_files": len(dst_map2), "dst_bytes": sum(dst_map2.values()),
+        "dst_files": (len(dst_map2) if dst_map2 is not None else None),
+        "dst_bytes": (sum(dst_map2.values()) if dst_map2 is not None else None),
         "base_files": len(base_map), "dst_delta": dst_delta, "lost_files": len(lost),
         "new_files": len(new_files), "new_bytes": new_bytes,
+        "review_ok": dst_map2 is not None,
         # 进度条分母: 本轮真正切进批的量, 不是 plan 的全量(2912 GB)。
         # 旧版拿 plan_bytes 当分母, 实际只做几十 GB, 进度永远停 5%。
         "run_files": did["files"], "run_bytes": did["bytes"],
@@ -1012,6 +1052,9 @@ def main():
         "src": SRC, "dst": DST,
         "note": ("时间预算到点, 优雅收工(下次继续)" if rc in (124, 130)
                  else ("rclone 退出码 %d" % rc if rc != 0 else "")),
+        "review_note": ("" if dst_map2 is not None
+                        else "收尾复核列目录失败, 增量统计缺失; 本轮实传 %d 个 / %s"
+                             % (did["files"], human(did["bytes"]))),
     })
 
 
