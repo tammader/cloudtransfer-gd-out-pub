@@ -131,6 +131,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      # ---- 自愈 1/2: 实例存活检查(第一步, 不需要 rclone) ----
+      # 2026-11-04 加。实例跑久了 MTProto 连接会卡死, 表现为上传 100% 504,
+      # 但 API / DB 全都正常(state 一直是 running)。这里先确保实例没被挂起;
+      # 真正的判死活在备份前那一步做(必须真传一个文件才算数)。
+      - name: 实例自检 + 唤醒(Unikraft)
+        continue-on-error: true
+        env:
+          UKC_TOKEN: ${{ secrets.UKC_TOKEN }}
+          UKC_METRO: ${{ secrets.UKC_METRO }}
+          UUID: ${{ secrets.UKC_INSTANCE_UUID }}
+        run: |
+          set +e
+          B64=$(printf '%s' "$UKC_TOKEN" | base64 -w0)
+          BASE="https://api.$UKC_METRO.unikraft.cloud/v1/instances/$UUID"
+          get_state() {
+            curl -s --max-time 30 -H "Authorization: Bearer $B64" "$BASE" \
+              | jq -r '.data.instances[0].state // "unknown"'
+          }
+          S=$(get_state)
+          echo "实例初始状态: $S"
+          if [ "$S" != "running" ]; then
+            echo "不是 running -> 尝试启动"
+            curl -s --max-time 30 -X PUT -H "Authorization: Bearer $B64" "$BASE/start" >/dev/null
+            for i in $(seq 1 45); do
+              sleep 2
+              S=$(get_state)
+              [ "$S" = "running" ] && break
+            done
+            echo "启动后状态: $S"
+          fi
+
       - name: 取仓库
         uses: actions/checkout@v4
 
@@ -209,6 +240,62 @@ jobs:
           rclone listremotes
           echo "===== 连通性测试 ====="
           rclone lsd teldrive: 2>&1 | head -10 || echo "(根目录为空或列不出, 继续)"
+
+      # ---- 自愈 2/2: 上传通路自检, 不通就重启实例 ----
+      # 判据必须是真的传一个 1MiB 文件 —— state=running 不代表能上传
+      # (2026-11-04 那次就是 running 但上传 100% 504, initConnection 重试耗尽)。
+      # 放在这里而不是第一步: 上面第 4 步才装 rclone, 第 7 步才配好 teldrive 远端。
+      - name: 上传自检 + 自愈重启
+        id: selfheal
+        continue-on-error: true
+        env:
+          UKC_TOKEN: ${{ secrets.UKC_TOKEN }}
+          UKC_METRO: ${{ secrets.UKC_METRO }}
+          UUID: ${{ secrets.UKC_INSTANCE_UUID }}
+        run: |
+          set +e
+          probe() {
+            dd if=/dev/urandom of=/tmp/hp.bin bs=1M count=1 status=none
+            TS=$(date +%s)
+            rclone copyto /tmp/hp.bin "teldrive:diag-upload/heal-$TS.bin" \
+              --teldrive-chunk-size 1Mi --teldrive-hash-enabled=false \
+              --multi-thread-streams 0 --transfers 1 --checkers 1 \
+              --retries 1 --low-level-retries 2 --timeout 180s -q 2>/dev/null
+            RC=$?
+            [ "$RC" = "0" ] && rclone deletefile "teldrive:diag-upload/heal-$TS.bin" >/dev/null 2>&1
+            return $RC
+          }
+
+          echo "=== 上传自检(1MiB) ==="
+          if probe; then
+            echo "上传正常, 不重启"
+            echo "healed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "!!! 上传失败 -> 重启 Unikraft 实例"
+          B64=$(printf '%s' "$UKC_TOKEN" | base64 -w0)
+          BASE="https://api.$UKC_METRO.unikraft.cloud/v1/instances/$UUID"
+          get_state() {
+            curl -s --max-time 30 -H "Authorization: Bearer $B64" "$BASE" \
+              | jq -r '.data.instances[0].state // "unknown"'
+          }
+          curl -s --max-time 30 -X PUT -H "Authorization: Bearer $B64" "$BASE/stop" >/dev/null
+          for i in $(seq 1 40); do sleep 2; [ "$(get_state)" = "stopped" ] && break; done
+          echo "停止后: $(get_state)"
+          curl -s --max-time 30 -X PUT -H "Authorization: Bearer $B64" "$BASE/start" >/dev/null
+          for i in $(seq 1 60); do sleep 2; [ "$(get_state)" = "running" ] && break; done
+          echo "启动后: $(get_state)"
+          sleep 10
+
+          echo "=== 重启后复测 ==="
+          if probe; then
+            echo "自愈成功, 继续备份"
+            echo "healed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "!!! 自愈失败 —— 备份大概率仍传不上去, 但照常继续跑(不中断)"
+            echo "healed=failed" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 跑 gd2 -> teldrive 备份
         env:
