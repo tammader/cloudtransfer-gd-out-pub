@@ -1,0 +1,117 @@
+
+name: td-diag
+
+# 只读诊断: 分层定位 teldrive 写入为什么 504
+#   第1层 API 可达性 -> 第2层 DB 写入(mkdir, 不碰 Telegram) -> 第3层 Telegram 写入
+#   哪一层先挂, 就说明问题在哪一层。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 装补丁版 rclone
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 \
+            --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -1
+
+      - name: 第1层 —— API 可达性 + 认证
+        env:
+          HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          echo "HOST 前缀: ${HOST:0:8}...  长度=${#HOST}"
+          echo "KEY  长度: ${#KEY}"
+          echo ""
+          echo "--- 1a) /api/v1/me  带 X-Api-Key ---"
+          curl -s -o /tmp/a.json -w 'status=%{http_code} time=%{time_total}s\n' \
+            --max-time 60 -H "X-Api-Key: $KEY" "$HOST/api/v1/me"
+          head -c 200 /tmp/a.json; echo
+          echo "--- 1b) /api/v1/me  带 Bearer ---"
+          curl -s -o /tmp/b.json -w 'status=%{http_code} time=%{time_total}s\n' \
+            --max-time 60 -H "Authorization: Bearer $KEY" "$HOST/api/v1/me"
+          head -c 200 /tmp/b.json; echo
+          echo "--- 1c) 列 open 上传会话(X-Api-Key) ---"
+          curl -s -o /tmp/up.json -w 'status=%{http_code} time=%{time_total}s\n' \
+            --max-time 90 -H "X-Api-Key: $KEY" \
+            "$HOST/api/v1/uploads?limit=200&state=open"
+          python3 - <<'PY'
+          import json
+          try:
+              d = json.load(open('/tmp/up.json'))
+              items = d.get('items') or []
+              print("open sessions 数量 =", len(items))
+              for it in items[:8]:
+                  print("   id=%s name=%s state=%s" % (it.get('id'), str(it.get('name'))[:40], it.get('state')))
+          except Exception as e:
+              print("解析失败:", e)
+              print(open('/tmp/up.json').read()[:300])
+          PY
+
+      - name: 第2层 —— DB 写入(mkdir, 不碰 Telegram)
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+        run: |
+          set +e
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" >/dev/null
+          TS=$(date +%s)
+          echo "--- 2a) mkdir teldrive:diag-$TS ---"
+          S=$(date +%s)
+          rclone mkdir "teldrive:diag-$TS" -vv 2>&1 | tail -12
+          RC=$?
+          E=$(date +%s)
+          echo "rc=$RC  用时 $((E-S))s"
+          echo "--- 2b) 列顶层目录确认 ---"
+          rclone lsd teldrive: 2>&1 | tail -8
+          echo "--- 2c) 清理 ---"
+          S=$(date +%s)
+          rclone rmdir "teldrive:diag-$TS" -vv 2>&1 | tail -6
+          E=$(date +%s)
+          echo "rmdir 用时 $((E-S))s"
+
+      - name: 第3层 —— Telegram 写入(1MiB 单分片)
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+        run: |
+          set +e
+          dd if=/dev/urandom of=/tmp/t.bin bs=1M count=1 status=none
+          TS=$(date +%s)
+          echo "--- 上传 1MiB, 1Mi 分片, 单次不重试 ---"
+          S=$(date +%s)
+          rclone copyto /tmp/t.bin "teldrive:diag-upload/$TS.bin" \
+            --teldrive-chunk-size 1Mi \
+            --teldrive-hash-enabled=false \
+            --multi-thread-streams 0 \
+            --transfers 1 --checkers 1 \
+            --retries 1 --low-level-retries 2 \
+            --contimeout 30s --timeout 300s \
+            --stats 10s -vv 2>&1 | tail -25
+          RC=${PIPESTATUS[0]}
+          E=$(date +%s)
+          echo "=== RC=$RC  用时 $((E-S))s ==="
+          echo "--- 目标端是否可见 ---"
+          rclone lsl "teldrive:diag-upload/" 2>&1 | tail -5
+
+      - name: 汇总判定
+        if: always()
+        run: |
+          echo "判定口径:"
+          echo "  第1层 401/超时 -> API key 或实例不可用"
+          echo "  第2层 mkdir 慢/失败 -> DB 层坏了(实例侧问题)"
+          echo "  第2层快 + 第3层 504 -> Telegram 上传链路坏(session 失效/限流)"
