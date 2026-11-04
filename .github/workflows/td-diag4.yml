@@ -1,0 +1,33 @@
+name: td-diag4
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 探测 bots / sessions / channels
+        env:
+          HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          for p in \
+            "/api/v1/bots" \
+            "/api/v1/sessions" \
+            "/api/v1/channels" \
+            "/api/v1/channels/3916553172" \
+            "/api/v1/jobs" \
+            "/api/v1/users" \
+            "/api/v1/uploads?limit=5&state=open" \
+            "/api/v1/me" ; do
+            code=$(curl -s -o /tmp/r.json -w '%{http_code}' --max-time 30 -H "X-Api-Key: $KEY" "$HOST$p")
+            printf '### %s  ->  %s\n' "$p" "$code"
+            head -c 700 /tmp/r.json
+            printf '\n\n'
+          done
