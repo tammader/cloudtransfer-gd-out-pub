@@ -1,0 +1,36 @@
+name: td-diag3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: jobs 全量 + 频道详情
+        env:
+          HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          echo "=== /api/v1/jobs 全量 ==="
+          curl -s --max-time 60 -H "X-Api-Key: $KEY" "$HOST/api/v1/jobs" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);t=d.get('tasks') or [];print('tasks=%d'%len(t));
+import collections;
+c=collections.Counter((x.get('status'),x.get('type')) for x in t);
+[print('  %-12s %-40s %d'%(k[0],k[1],v)) for k,v in sorted(c.items())];
+print();
+[print('FAILED:',json.dumps(x,ensure_ascii=False)[:400]) for x in t if x.get('status') in ('failed','error','pending','active')]"
+          echo ""
+          echo "=== 频道详情 ==="
+          curl -s --max-time 60 -H "X-Api-Key: $KEY" "$HOST/api/v1/channels" | python3 -m json.tool
+          echo ""
+          echo "=== 尝试刷新频道健康度 ==="
+          for p in "/api/v1/channels/3916553172" "/api/v1/channels/3916553172/health" "/api/v1/channels/refresh"; do
+            code=$(curl -s -o /tmp/c.json -w '%{http_code}' --max-time 30 -H "X-Api-Key: $KEY" "$HOST$p")
+            printf '%-42s %s  ' "$p" "$code"; head -c 200 /tmp/c.json | tr '\n' ' '; echo
+          done
