@@ -1,0 +1,97 @@
+name: td-verify-new
+
+# 验证任一 teldrive 实例(换 metro 后用): 填域名即可, 不动 GitHub Secret。
+# 四层检查: Web UI -> API/身份 -> 频道健康度 -> 1MiB 上传(决定性)
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: "要验证的域名, 如 xxx.was.unikraft.app"
+        required: true
+      do_upload:
+        description: "true=做 1MiB 上传实测"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 装补丁版 rclone
+        if: inputs.do_upload == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 \
+            --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -1
+
+      - name: 1) Web UI 可达
+        env:
+          D: ${{ inputs.domain }}
+        run: |
+          set +e
+          D="${D#https://}"; D="${D%/}"
+          echo "目标: https://$D"
+          code=$(curl -s -o /tmp/root.html -w '%{http_code}' --max-time 30 "https://$D/")
+          echo "根路径 HTTP $code"
+          grep -o '<title>[^<]*</title>' /tmp/root.html || echo "(无 title)"
+
+      - name: 2) API 身份
+        env:
+          D: ${{ inputs.domain }}
+          KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          D="${D#https://}"; D="${D%/}"
+          code=$(curl -s -o /tmp/me.json -w '%{http_code}' --max-time 40 \
+                 -H "X-Api-Key: $KEY" "https://$D/api/v1/me")
+          echo "/api/v1/me -> $code"
+          jq -r '"userId=\(.userId) username=\(.username) role=\(.role)"' /tmp/me.json 2>/dev/null \
+            || head -c 200 /tmp/me.json
+
+      - name: 3) 频道健康度
+        env:
+          D: ${{ inputs.domain }}
+          KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          D="${D#https://}"; D="${D%/}"
+          curl -s --max-time 40 -H "X-Api-Key: $KEY" "https://$D/api/v1/channels" -o /tmp/ch.json
+          jq -c '.items[]? | {id,name,selected,health}' /tmp/ch.json 2>/dev/null || head -c 300 /tmp/ch.json
+
+      - name: 4) 1MiB 上传实测(决定性)
+        if: inputs.do_upload == 'true'
+        env:
+          D: ${{ inputs.domain }}
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          D="${D#https://}"; D="${D%/}"
+          rclone config create teldrive teldrive \
+            api_host="https://$D" api_key="$TELDRIVE_API_KEY" >/dev/null
+          dd if=/dev/urandom of=/tmp/v.bin bs=1M count=1 status=none
+          TS=$(date +%s)
+          S=$(date +%s)
+          rclone copyto /tmp/v.bin "teldrive:diag-upload/verify-$TS.bin" \
+            --teldrive-chunk-size 1Mi --teldrive-hash-enabled=false \
+            --multi-thread-streams 0 --transfers 1 --checkers 1 \
+            --retries 1 --low-level-retries 2 --timeout 300s -v 2>&1 | tail -12
+          RC=${PIPESTATUS[0]}
+          E=$(date +%s)
+          echo "=== 上传 RC=$RC 用时 $((E-S))s ==="
+          if [ "$RC" = "0" ]; then
+            echo "RESULT: 上传成功 —— 该 metro 的 IP 可用"
+            rclone deletefile "teldrive:diag-upload/verify-$TS.bin" 2>&1 | tail -2
+            echo "(已清理测试文件)"
+          else
+            echo "RESULT: 上传失败 —— 该 metro 也不可用"
+          fi
