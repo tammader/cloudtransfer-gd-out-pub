@@ -1,0 +1,46 @@
+
+name: td-diag2
+
+# 追查 Telegram 上传层: 完整 /me + 逐个探测 teldrive 端点, 找 session/频道/任务状态
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 探测端点
+        env:
+          HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          echo "=== 完整 /api/v1/me ==="
+          curl -s --max-time 60 -H "X-Api-Key: $KEY" "$HOST/api/v1/me" \
+            | python3 -m json.tool 2>/dev/null || echo "(非 JSON)"
+          echo ""
+          echo "=== 逐端点探测 ==="
+          for p in \
+            "/api/v1/jobs" \
+            "/api/v1/jobs?limit=20" \
+            "/api/v1/config" \
+            "/api/v1/health" \
+            "/api/v1/stats" \
+            "/api/v1/users" \
+            "/api/v1/channels" \
+            "/api/v1/sessions" \
+            "/api/v1/user/sessions" \
+            "/api/v1/files?path=/" \
+            "/api/v1/fs/list" \
+            "/health" \
+            "/" ; do
+            code=$(curl -s -o /tmp/r.json -w '%{http_code}' --max-time 30 \
+                   -H "X-Api-Key: $KEY" "$HOST$p")
+            printf '%-32s %s  ' "$p" "$code"
+            head -c 160 /tmp/r.json | tr '\n' ' '
+            echo
+          done
