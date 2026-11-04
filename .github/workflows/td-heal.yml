@@ -1,0 +1,116 @@
+name: td-heal
+
+# Teldrive 自愈: 检查上传是否可用, 不可用就重启 Unikraft 实例。
+# 背景: 2026-11-04 实例跑久了 MTProto 连接会卡死(initConnection retryUntilAck 耗尽),
+#       表现为上传 100% 504, 但 API/DB 都正常。重启实例即可恢复, 无需换 metro。
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "status=只检查 / restart=强制重启 / auto=上传失败才重启"
+        required: false
+        default: "status"
+
+permissions:
+  contents: read
+
+jobs:
+  heal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 装补丁版 rclone
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 \
+            --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -1
+
+      - name: 1) 实例状态
+        env:
+          UKC_TOKEN: ${{ secrets.UKC_TOKEN }}
+          UKC_METRO: ${{ secrets.UKC_METRO }}
+          UUID: ${{ secrets.UKC_INSTANCE_UUID }}
+        run: |
+          set +e
+          B64=$(printf '%s' "$UKC_TOKEN" | base64 -w0)
+          curl -s --max-time 30 -H "Authorization: Bearer $B64" \
+            "https://api.$UKC_METRO.unikraft.cloud/v1/instances/$UUID" \
+            | jq -r '.data.instances[0] | "state=\(.state)  start_count=\(.start_count)"'
+          echo "(token 长度: ${#UKC_TOKEN})"
+
+      - name: 2) 上传实测(1MiB)
+        id: probe
+        env:
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" >/dev/null
+          dd if=/dev/urandom of=/tmp/h.bin bs=1M count=1 status=none
+          TS=$(date +%s)
+          S=$(date +%s)
+          rclone copyto /tmp/h.bin "teldrive:diag-upload/heal-$TS.bin" \
+            --teldrive-chunk-size 1Mi --teldrive-hash-enabled=false \
+            --multi-thread-streams 0 --transfers 1 --checkers 1 \
+            --retries 1 --low-level-retries 2 --timeout 300s -v 2>&1 | tail -8
+          RC=${PIPESTATUS[0]}
+          E=$(date +%s)
+          echo "上传 RC=$RC 用时 $((E-S))s"
+          if [ "$RC" = "0" ]; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            rclone deletefile "teldrive:diag-upload/heal-$TS.bin" >/dev/null 2>&1
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 3) 重启实例(按需)
+        if: inputs.action == 'restart' || (inputs.action == 'auto' && steps.probe.outputs.result != 'ok')
+        env:
+          UKC_TOKEN: ${{ secrets.UKC_TOKEN }}
+          UKC_METRO: ${{ secrets.UKC_METRO }}
+          UUID: ${{ secrets.UKC_INSTANCE_UUID }}
+        run: |
+          set +e
+          B64=$(printf '%s' "$UKC_TOKEN" | base64 -w0)
+          BASE="https://api.$UKC_METRO.unikraft.cloud/v1/instances/$UUID"
+          get_state() { curl -s --max-time 30 -H "Authorization: Bearer $B64" "$BASE" \
+                        | jq -r '.data.instances[0].state'; }
+
+          echo "=== 停止 ($(get_state)) ==="
+          curl -s --max-time 30 -X PUT -H "Authorization: Bearer $B64" "$BASE/stop" >/dev/null
+          for i in $(seq 1 40); do sleep 2; [ "$(get_state)" = "stopped" ] && break; done
+          echo "停止后: $(get_state)"
+
+          echo "=== 启动 ==="
+          curl -s --max-time 30 -X PUT -H "Authorization: Bearer $B64" "$BASE/start" >/dev/null
+          for i in $(seq 1 60); do sleep 2; [ "$(get_state)" = "running" ] && break; done
+          echo "启动后: $(get_state)"
+          sleep 10
+
+      - name: 4) 重启后复测
+        if: inputs.action == 'restart' || (inputs.action == 'auto' && steps.probe.outputs.result != 'ok')
+        env:
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" >/dev/null
+          dd if=/dev/urandom of=/tmp/h2.bin bs=1M count=1 status=none
+          TS=$(date +%s)
+          S=$(date +%s)
+          rclone copyto /tmp/h2.bin "teldrive:diag-upload/heal-$TS.bin" \
+            --teldrive-chunk-size 1Mi --teldrive-hash-enabled=false \
+            --multi-thread-streams 0 --transfers 1 --checkers 1 \
+            --retries 1 --low-level-retries 2 --timeout 300s -v 2>&1 | tail -8
+          RC=${PIPESTATUS[0]}
+          E=$(date +%s)
+          echo "复测 RC=$RC 用时 $((E-S))s"
+          [ "$RC" = "0" ] && echo "自愈成功" || echo "自愈失败, 需要人工介入"
