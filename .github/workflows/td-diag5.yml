@@ -1,0 +1,26 @@
+name: td-diag5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 抓非 completed 任务完整报错
+        env:
+          HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          KEY: ${{ secrets.TELDRIVE_API_KEY }}
+        run: |
+          set +e
+          curl -s --max-time 60 -H "X-Api-Key: $KEY" "$HOST/api/v1/jobs" -o /tmp/j.json
+          echo "=== 任务总数与状态分布 ==="
+          jq -r '.tasks | length' /tmp/j.json
+          jq -r '.tasks | group_by(.status)[] | "\(.[0].status)  \(length)"' /tmp/j.json
+          echo ""
+          echo "=== 非 completed 任务(完整 message) ==="
+          jq -r '.tasks[] | select(.status != "completed") | "---\nid=\(.id) status=\(.status) type=\(.type)\nmsg=\(.message // "(无)")\nerrors=\((.errors // []) | join(" | "))"' /tmp/j.json
