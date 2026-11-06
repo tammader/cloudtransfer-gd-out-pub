@@ -40,9 +40,12 @@ jobs:
           DY_WORK: /tmp/dywork
           DY_TD_DST: teldrive:douyin-test
           DOUYIN_FAV_JSON: /tmp/dy.json
+          TD_CHUNK: "4Mi"
+          TD_UP_CONC: "4"
         run: |
           set -euo pipefail
           cp tools/_dy_sample.json /tmp/dy.json
-          python3 tools/douyin_teldrive.py --apply --max-files 3 --budget-min 20 --max-total-gb 1 --preview 5
+          echo "chunk=$TD_CHUNK conc=$TD_UP_CONC"
+          python3 tools/douyin_teldrive.py --apply --max-files 3 --budget-min 25 --max-total-gb 1 --preview 5
           echo "=== 目标端回读 ==="
           rclone lsjson teldrive:douyin-test -R --files-only 2>&1 | head -20
