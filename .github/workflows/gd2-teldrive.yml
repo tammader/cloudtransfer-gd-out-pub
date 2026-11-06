@@ -62,6 +62,10 @@ on:
         description: "true=真传(默认), false=只演练看计划(不传任何东西)"
         required: false
         default: "true"
+      min_kbps:
+        description: "自愈测速阈值(KiB/s): 开跑前传 4MiB 测速, 低于此值就重启实例。默认 200"
+        required: false
+        default: "200"
       max_transfer_gb:
         description: "本轮传输总量上限(GB); 实测 ~8MiB/s, 270 分钟约 130GB, 默认 150 够用"
         required: false
@@ -241,39 +245,55 @@ jobs:
           echo "===== 连通性测试 ====="
           rclone lsd teldrive: 2>&1 | head -10 || echo "(根目录为空或列不出, 继续)"
 
-      # ---- 自愈 2/2: 上传通路自检, 不通就重启实例 ----
-      # 判据必须是真的传一个 1MiB 文件 —— state=running 不代表能上传
-      # (2026-11-04 那次就是 running 但上传 100% 504, initConnection 重试耗尽)。
-      # 放在这里而不是第一步: 上面第 4 步才装 rclone, 第 7 步才配好 teldrive 远端。
-      - name: 上传自检 + 自愈重启
+      # ---- 自愈 2/2: 上传测速, 速度不达标就重启实例 ----
+      # 2026-11-04 加。实例跑久了 MTProto 连接会退化, 但**不报错** ——
+      # 表现是上传速度从 ~1.8MB/s 掉到几十 KiB/s, 一轮 4.5 小时只传 2 个文件。
+      # 判据必须用速度, 不能用文件数: 文件大小差异太大(平均 550MB/个),
+      # "传 2 个"既可能是速度烂, 也可能只是文件大。
+      # 实测对比: 重启后 #51 传 19.1GB, 不重启 #55 只传 1.08GB(差 18 倍)。
+      # 放在这里而不是第一步: 第 5 步才装 rclone, 第 8 步才配好 teldrive 远端。
+      - name: 上传测速 + 自愈重启
         id: selfheal
         continue-on-error: true
         env:
           UKC_TOKEN: ${{ secrets.UKC_TOKEN }}
           UKC_METRO: ${{ secrets.UKC_METRO }}
           UUID: ${{ secrets.UKC_INSTANCE_UUID }}
+          MIN_KBPS: ${{ inputs.min_kbps || '200' }}
         run: |
           set +e
-          probe() {
-            dd if=/dev/urandom of=/tmp/hp.bin bs=1M count=1 status=none
+          measure() {
+            dd if=/dev/urandom of=/tmp/sp.bin bs=1M count=4 status=none
             TS=$(date +%s)
-            rclone copyto /tmp/hp.bin "teldrive:diag-upload/heal-$TS.bin" \
+            rclone copyto /tmp/sp.bin "teldrive:diag-upload/sp-$TS.bin" \
               --teldrive-chunk-size 1Mi --teldrive-hash-enabled=false \
               --multi-thread-streams 0 --transfers 1 --checkers 1 \
-              --retries 1 --low-level-retries 2 --timeout 180s -q 2>/dev/null
+              --retries 1 --low-level-retries 2 --timeout 300s -q 2>/dev/null
             RC=$?
-            [ "$RC" = "0" ] && rclone deletefile "teldrive:diag-upload/heal-$TS.bin" >/dev/null 2>&1
+            E=$(date +%s)
+            SEC=$(( E - TS )); [ "$SEC" -lt 1 ] && SEC=1
+            if [ "$RC" = "0" ]; then
+              KBPS=$(( 4 * 1024 / SEC ))
+              echo "  测得: 4MiB / ${SEC}s = ${KBPS} KiB/s"
+              rclone deletefile "teldrive:diag-upload/sp-$TS.bin" >/dev/null 2>&1
+            else
+              KBPS=0
+              echo "  上传失败 RC=$RC (耗时 ${SEC}s)"
+            fi
             return $RC
           }
 
-          echo "=== 上传自检(1MiB) ==="
-          if probe; then
-            echo "上传正常, 不重启"
+          echo "=== 上传测速(阈值 ${MIN_KBPS} KiB/s) ==="
+          measure
+          OK=$?
+          echo "当前速度: ${KBPS} KiB/s"
+          if [ "$OK" = "0" ] && [ "$KBPS" -ge "$MIN_KBPS" ]; then
+            echo "速度达标, 不重启"
             echo "healed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "!!! 上传失败 -> 重启 Unikraft 实例"
+          echo "!!! 速度不达标(${KBPS} < ${MIN_KBPS}) -> 重启 Unikraft 实例"
           B64=$(printf '%s' "$UKC_TOKEN" | base64 -w0)
           BASE="https://api.$UKC_METRO.unikraft.cloud/v1/instances/$UUID"
           get_state() {
@@ -289,12 +309,15 @@ jobs:
           sleep 10
 
           echo "=== 重启后复测 ==="
-          if probe; then
-            echo "自愈成功, 继续备份"
+          measure
+          OK2=$?
+          echo "复测速度: ${KBPS} KiB/s"
+          if [ "$OK2" = "0" ] && [ "$KBPS" -ge "$MIN_KBPS" ]; then
+            echo "自愈成功"
             echo "healed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "!!! 自愈失败 —— 备份大概率仍传不上去, 但照常继续跑(不中断)"
-            echo "healed=failed" >> "$GITHUB_OUTPUT"
+            echo "!!! 重启后仍只有 ${KBPS} KiB/s —— 可能是 Telegram 侧限流, 照常继续跑"
+            echo "healed=still_slow" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 跑 gd2 -> teldrive 备份
