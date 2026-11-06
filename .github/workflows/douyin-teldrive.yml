@@ -1,0 +1,112 @@
+name: douyin-teldrive
+
+# 抖音收藏 -> teldrive 备份
+#
+# 流程: headless Chromium 拦截收藏 XHR 取清单(douyin_fetch.py)
+#        -> 逐个下载 -> 补丁版 rclone copyto 上传 teldrive。
+#
+# 为什么用真实浏览器而不是纯 API:
+#   抖音收藏接口要 a_bogus/X-Bogus 签名, 算法常变。让页面自己发请求、我们只拦截
+#   响应, 天然免维护签名 —— 长期最稳。
+#
+# ⚠️ 与 gd2-teldrive / yd2-teldrive **共用 concurrency 组 teldrive-upload**:
+#    同一个 teldrive 实例, Telegram 总带宽 ≈1.9 MiB/s, 同时跑会互抢带宽并撞 409/504。
+#    共用组 = 天然排队互斥。本条排在每天 04:40 UTC (12:40 北京), 避开另两条。
+#
+# 需要 Secrets: DOUYIN_COOKIE / TELDRIVE_API_HOST / TELDRIVE_API_KEY / GH_TOKEN
+
+on:
+  schedule:
+    - cron: "40 4 * * *"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真传, false=只演练"
+        required: false
+        default: "true"
+      budget_min:
+        description: "本轮时间预算(分钟)"
+        required: false
+        default: "60"
+      max_files:
+        description: "本轮最多真传几个(0=不限)"
+        required: false
+        default: "40"
+      max_file_gb:
+        description: "单文件上限(GB)"
+        required: false
+        default: "0.5"
+      max_total_gb:
+        description: "本轮总量上限(GB)"
+        required: false
+        default: "5"
+
+concurrency:
+  group: teldrive-upload
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 Python + 依赖
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m pip install --quiet --disable-pip-version-check playwright
+          python3 -m playwright install --with-deps chromium
+          echo "playwright chromium OK"
+
+      - name: 装补丁版 rclone(8Mi 小分片, 绕开边缘网关请求体上限)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rdl
+          gh release download td-rclone-v1.75.4 \
+            --repo tammader/cloudtransfer-gd-out \
+            --pattern 'rclone-linux-amd64' --dir /tmp/rdl --clobber
+          sudo install -m 0755 /tmp/rdl/rclone-linux-amd64 /usr/local/bin/rclone
+          rclone version | head -2
+          rclone help backend teldrive > /tmp/td_help.txt && echo "teldrive backend OK"
+
+      - name: 添加 teldrive 远端
+        env:
+          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+        run: |
+          set -euo pipefail
+          rclone config create teldrive teldrive \
+            api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" >/dev/null
+          rclone lsd teldrive: 2>&1 | head -5 || echo "(列不出, 继续)"
+
+      - name: 跑 抖音收藏 -> teldrive
+        env:
+          APPLY: ${{ inputs.apply || 'true' }}
+          BUDGET: ${{ inputs.budget_min || '60' }}
+          MAX_FILES: ${{ inputs.max_files || '40' }}
+          MAX_FILE_GB: ${{ inputs.max_file_gb || '0.5' }}
+          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '5' }}
+          DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+          TD_STATS_JSON: /tmp/dywork/stats.json
+          LOG_MASK: "1"
+        run: |
+          set -x
+          ARGS="--budget-min $BUDGET --max-files $MAX_FILES \
+                --max-file-gb $MAX_FILE_GB --max-total-gb $MAX_TOTAL_GB"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; fi
+          python3 tools/douyin_teldrive.py $ARGS
+
+      - name: 统计
+        if: always()
+        run: |
+          echo "===== 本轮统计 ====="
+          cat /tmp/dywork/stats.json 2>/dev/null || echo "(无统计文件)"
+          df -h / | tail -1
