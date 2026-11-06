@@ -1,0 +1,59 @@
+name: douyin-fetch-check
+
+# 临时验证用：只取数 + 下载 1 个，不上传，不进 teldrive-upload 并发组。
+# 目的：快速确认 GitHub runner 能用 DOUYIN_COOKIE 拿到收藏清单并下载。
+on:
+  workflow_dispatch:
+    inputs:
+      max:
+        description: "取数上限"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装依赖
+        run: |
+          python3 -m pip install --quiet playwright
+          python3 -m playwright install --with-deps chromium
+
+      - name: 取数
+        env:
+          DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+          MAX: ${{ inputs.max || '20' }}
+        run: |
+          set -euo pipefail
+          python3 tools/douyin_fetch.py --out /tmp/fav.json --max "$MAX"
+          python3 - <<'PY'
+          import json
+          d = json.load(open('/tmp/fav.json'))
+          print('count =', d['count'])
+          for it in d['items'][:10]:
+              print(it['aweme_id'], it.get('size'), repr(it.get('desc'))[:40])
+          PY
+
+      - name: 下载第一个验证
+        if: always()
+        env:
+          DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request
+          d = json.load(open('/tmp/fav.json'))
+          if d['items']:
+              it = d['items'][0]
+              url = (it.get('url_list') or [it['url']])[0]
+              op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.douyin.com/'})
+              with op.open(req, timeout=60) as r:
+                  data = r.read()
+              print('downloaded', len(data), 'expect', it.get('size'), 'match', len(data) == it.get('size'))
+          PY
