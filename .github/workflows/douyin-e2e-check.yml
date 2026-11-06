@@ -1,6 +1,6 @@
 name: douyin-e2e-check
 
-# 端到端验证：用本机取数的真实抖音清单 → 下载 → 上传云端 teldrive。
+# 分级尺寸测试: 找出 Unikraft 网关单传上限。
 on:
   workflow_dispatch:
 
@@ -10,7 +10,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -34,18 +34,17 @@ jobs:
             api_host="$TELDRIVE_API_HOST" api_key="$TELDRIVE_API_KEY" > /dev/null
           rclone lsd teldrive: 2>&1 | head -7
 
-      - name: 下载真实抖音视频并上传
+      - name: 分级尺寸上传
         env:
           DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
           DY_WORK: /tmp/dywork
-          DY_TD_DST: teldrive:douyin-test
+          DY_TD_DST: teldrive:douyin-graded
           DOUYIN_FAV_JSON: /tmp/dy.json
           TD_CHUNK: "4Mi"
           TD_UP_CONC: "4"
         run: |
           set -euo pipefail
-          cp tools/_dy_sample.json /tmp/dy.json
-          echo "chunk=$TD_CHUNK conc=$TD_UP_CONC"
-          python3 tools/douyin_teldrive.py --apply --max-files 3 --budget-min 25 --max-total-gb 1 --preview 5
+          cp tools/_dy_graded.json /tmp/dy.json
+          python3 tools/douyin_teldrive.py --apply --max-files 10 --budget-min 45 --max-total-gb 1 --preview 10
           echo "=== 目标端回读 ==="
-          rclone lsjson teldrive:douyin-test -R --files-only 2>&1 | head -20
+          rclone lsjson teldrive:douyin-graded -R --files-only 2>&1 | head -20
