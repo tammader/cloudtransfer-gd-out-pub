@@ -147,13 +147,14 @@ def fetch(url, dest, retries=3):
 def upload(local, remote, retries=3):
     cmd = [
         RCLONE, "copyto", local, remote,
-        "--teldrive-chunk-size", "8Mi",
+        "--teldrive-chunk-size", os.environ.get("TD_CHUNK", "8Mi"),
         "--teldrive-hash-enabled=false",     # 8Mi 分片下树哈希必不匹配
+        "--teldrive-upload-concurrency", os.environ.get("TD_UP_CONC", "1"),
         "--multi-thread-streams", "0",       # 多线程写同一 session -> 409
         "--transfers", "1", "--checkers", "1",
         "--retries", str(retries), "--retries-sleep", "30s",
         "--low-level-retries", "10", "--contimeout", "60s",
-        "--stats", "0", "-v",
+        "--timeout", "0", "--stats", "0", "-v",
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
