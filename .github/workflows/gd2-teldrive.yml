@@ -54,8 +54,12 @@ on:
   #   拉开到 12 小时间隔后: 每轮之间留约 9 小时空档, Teldrive 侧有充分时间
   #   落库 / 退 session / 恢复 API, 下一轮开跑时连得上。
   #   日传量从 ~114 GB 降到 ~57 GB, 但单轮成功率优先。
-  schedule:
-    - cron: "40 6,18 * * *"
+  # Paused 2026-11-07: Teldrive upload is rate-limited by Telegram
+  #   (restart no longer helps: ~190 KiB/s before and after, 277x 504 per round).
+  #   Pausing scheduled runs for one day to let the account recover.
+  #   To resume: just uncomment the cron line below.
+  # schedule:
+  #   - cron: "40 6,18 * * *"
   workflow_dispatch:
     inputs:
       apply:
