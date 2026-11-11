@@ -81,9 +81,40 @@ def cmd_help():
             "/run <流程> [k=v ...] —— 触发, 例:\n"
             "    /run gd-out2\n"
             "    /run gd-out2 only=AGMX-050 apply=true\n"
-            "    /run ydout-in3 apply=false   (只想演练时用)\n"
+            "/sub [N] —— 快捷触发字幕批量(默认1组, large-v3+硬字幕; N=本批组数)\n"
+            "/subfix —— 快捷补烧/修复: 重译日文残留并重烧硬字幕\n"
             "/stop <流程> —— 取消正在跑的那次\n"
             "/disable <流程>  /enable <流程> —— 停用 / 启用")
+
+
+def cmd_sub(args):
+    """快捷触发字幕批量: 默认 1 组, large-v3, 硬字幕开。可 /sub N 指定本批组数。"""
+    n = args[0] if args and args[0].isdigit() else "1"
+    repo = "tammader/cloudtransfer-subtitle"
+    wf = "subtitle-translate.yml"
+    tok = tokens().get("A") or ""
+    inputs = {"apply": "true", "limit_groups": n, "whisper_model": "large-v3",
+              "burn_video": "true", "batch_tag": "tg_%d" % int(time.time())}
+    st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (repo, wf), tok,
+                   {"ref": "main", "inputs": inputs})
+    if st in (204, 201, 200):
+        return "✅ 已触发字幕批量(本批 %s 组, large-v3+硬字幕)\nhttps://github.com/%s/actions" % (n, repo)
+    return "❌ 触发失败 (%s)：%s" % (st, d.get("_err", "")[:220])
+
+
+def cmd_subfix(args):
+    """快捷修复: 对已有 srt 重译日文残留并重烧(limit 可控, 默认只跑 1 组测试)"""
+    n = args[0] if args and args[0].isdigit() else "1"
+    repo = "tammader/cloudtransfer-subtitle"
+    wf = "subtitle-translate.yml"
+    tok = tokens().get("A") or ""
+    inputs = {"apply": "true", "limit_groups": n, "fix_srt": "true",
+              "burn_video": "true", "batch_tag": "tgfix_%d" % int(time.time())}
+    st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (repo, wf), tok,
+                   {"ref": "main", "inputs": inputs})
+    if st in (204, 201, 200):
+        return "✅ 已触发字幕修复(最多 %s 组, 重译日文残留+重烧)\nhttps://github.com/%s/actions" % (n, repo)
+    return "❌ 触发失败 (%s)：%s" % (st, d.get("_err", "")[:220])
 
 
 def cmd_list():
@@ -188,6 +219,10 @@ def handle(text):
         return cmd_status()
     if c == "/run":
         return cmd_run(a)
+    if c == "/sub":
+        return cmd_sub(a)
+    if c == "/subfix":
+        return cmd_subfix(a)
     if c == "/stop":
         return cmd_stop(a)
     if c == "/disable":
