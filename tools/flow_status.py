@@ -65,6 +65,8 @@ WATCH = [
     # teldrive 冷备两条(2026-10-20 纳入总览): 都跑在公开仓库, 周期 6h
     ("tammader/cloudtransfer-gd-out-pub", "yd2-teldrive.yml", "yd2-teldrive", 6, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "gd2-teldrive.yml", "gd2-teldrive", 6, "A"),
+    # 字幕批量(日文->中文 srt+硬字幕): 公开仓库, 手动触发(0)
+    ("tammader/cloudtransfer-subtitle", "subtitle-translate.yml", "subtitle", 0, "A"),
 ]
 
 NAMES = [e[2] for e in WATCH]
@@ -106,6 +108,7 @@ DESC_FALLBACK = "（未配置说明）"
 DESC_DEFAULT = {
     "yd2-teldrive": "移动云盘 → teldrive 冷备",
     "gd2-teldrive": "gdrive2 → teldrive 冷备",
+    "subtitle": "日文视频 → 中文 srt + 硬字幕",
 }
 
 
