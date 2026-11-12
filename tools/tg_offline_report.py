@@ -56,6 +56,11 @@ def build_report(token=None):
         lines.append('   %s' % run.get('html_url', ''))
     lines.append('🔄 已提交离线：%d 个' % len(offlined))
     lines.append('📥 已下载并传 gd6：%d 个' % len(done))
+    q = st.get('offline_quota') or {}
+    if q.get('date'):
+        used = q.get('used') or {}
+        lines.append('🗓 今日离线额度(%s)：账号A %s / 账号B %s（上限30）' % (
+            q.get('date'), used.get('0', 0), used.get('1', 0)))
     if total_links:
         try:
             remain = int(total_links) - len(done)
