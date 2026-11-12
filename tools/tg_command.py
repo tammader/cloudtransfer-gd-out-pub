@@ -27,6 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import flow_status as fs          # 复用: 监控清单 / 扫描 / 发消息
+import tg_javdb_report as jr      # JavDB 评论区报告
+import tg_offline_report as orpt  # JavDB 离线->gd6 流程报告
 
 BJ = timezone(timedelta(hours=8))
 API = "https://api.github.com"
@@ -78,43 +80,14 @@ def cmd_help():
     return ("可用命令:\n"
             "/list  —— 列出所有流程名\n"
             "/status —— 立即查一遍当前状态\n"
+            "/javdb —— JavDB 评论区 magnet/ed2k 报告（带重跑按钮）\n"
+            "/offline —— JavDB 离线→下载→传gd6 流程进度（带触发按钮）\n"
             "/run <流程> [k=v ...] —— 触发, 例:\n"
             "    /run gd-out2\n"
             "    /run gd-out2 only=AGMX-050 apply=true\n"
-            "/sub [N] —— 快捷触发字幕批量(默认1组, large-v3+硬字幕; N=本批组数)\n"
-            "/subfix —— 快捷补烧/修复: 重译日文残留并重烧硬字幕\n"
+            "    /run ydout-in3 apply=false   (只想演练时用)\n"
             "/stop <流程> —— 取消正在跑的那次\n"
             "/disable <流程>  /enable <流程> —— 停用 / 启用")
-
-
-def cmd_sub(args):
-    """快捷触发字幕批量: 默认 1 组, large-v3, 硬字幕开。可 /sub N 指定本批组数。"""
-    n = args[0] if args and args[0].isdigit() else "1"
-    repo = "tammader/cloudtransfer-subtitle"
-    wf = "subtitle-translate.yml"
-    tok = tokens().get("A") or ""
-    inputs = {"apply": "true", "limit_groups": n, "whisper_model": "large-v3",
-              "burn_video": "true", "batch_tag": "tg_%d" % int(time.time())}
-    st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (repo, wf), tok,
-                   {"ref": "main", "inputs": inputs})
-    if st in (204, 201, 200):
-        return "✅ 已触发字幕批量(本批 %s 组, large-v3+硬字幕)\nhttps://github.com/%s/actions" % (n, repo)
-    return "❌ 触发失败 (%s)：%s" % (st, d.get("_err", "")[:220])
-
-
-def cmd_subfix(args):
-    """快捷修复: 对已有 srt 重译日文残留并重烧(limit 可控, 默认只跑 1 组测试)"""
-    n = args[0] if args and args[0].isdigit() else "1"
-    repo = "tammader/cloudtransfer-subtitle"
-    wf = "subtitle-translate.yml"
-    tok = tokens().get("A") or ""
-    inputs = {"apply": "true", "limit_groups": n, "fix_srt": "true",
-              "burn_video": "true", "batch_tag": "tgfix_%d" % int(time.time())}
-    st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (repo, wf), tok,
-                   {"ref": "main", "inputs": inputs})
-    if st in (204, 201, 200):
-        return "✅ 已触发字幕修复(最多 %s 组, 重译日文残留+重烧)\nhttps://github.com/%s/actions" % (n, repo)
-    return "❌ 触发失败 (%s)：%s" % (st, d.get("_err", "")[:220])
 
 
 def cmd_list():
@@ -204,6 +177,73 @@ def cmd_toggle(args, enable):
     return "❌ 操作失败 (%s)：%s" % (st2, d2.get("_err", "")[:200])
 
 
+def cmd_javdb():
+    """生成并发送 JavDB 评论区报告，带 inline 按钮（重跑/刷新）"""
+    try:
+        text, n = jr.build_report()
+    except Exception as e:
+        return "❌ 读取报告失败：%s" % str(e)[:180]
+    d = jr.send_report(text, with_button=True)
+    if d.get("ok"):
+        return None  # 已由 send_report 发出，不再重复回一条
+    return "❌ 发送失败：%s" % str(d.get("err", ""))[:180]
+
+
+def cmd_offline():
+    """JavDB 离线->下载->gd6 流程报告（带按钮）"""
+    try:
+        text = orpt.build_report()
+    except Exception as e:
+        return "❌ 读取离线流程报告失败：%s" % str(e)[:180]
+    d = orpt.send_report(text, with_button=True)
+    if d.get("ok"):
+        return None
+    return "❌ 发送失败：%s" % str(d.get("err", ""))[:180]
+
+
+def tg_answer_cb(cb_id, text=""):
+    fs.tg_call("answerCallbackQuery", {"callback_query_id": cb_id, "text": text[:180]})
+
+
+def handle_callback(cb):
+    """处理 inline 按钮回调。返回要回给用户的话（None=已自行发送）。"""
+    data = cb.get("data") or ""
+    if data == "javdb_refresh":
+        return cmd_javdb()
+    if data == "offline_refresh":
+        return cmd_offline()
+    if data == "offline_rerun":
+        repo = os.environ.get("OFFLINE_REPO", "tammader/javdb-offline-gd6")
+        wf = "offline-download-gd6.yml"
+        tok = tokens().get("A") or os.environ.get("GH_TOKEN", "")
+        st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (repo, wf), tok,
+                       {"ref": "main", "inputs": {}})
+        if st in (204, 200, 201):
+            time.sleep(6)
+            st2, d2 = gh_api("GET", "/repos/%s/actions/workflows/%s/runs?per_page=1" % (repo, wf), tok)
+            url = ""
+            if st2 == 200 and (d2.get("workflow_runs") or []):
+                url = d2["workflow_runs"][0].get("html_url") or ""
+            return "⚡ 已触发离线+搬运流程（每天各盘30额度，自动跑批次）\n%s" % url
+        return "❌ 触发失败(%s)：%s" % (st, str(d.get("_err", ""))[:180])
+    if data == "javdb_rerun":
+        # 触发 javdb-comment-links workflow（如果已在 WATCH，或按仓库/文件名直接触发）
+        repo = os.environ.get("JAVDB_REPO", "tammader/javdb-comment-links")
+        wf = os.environ.get("JAVDB_WF", "javdb-comment-links.yml")
+        tok = tokens().get("A") or os.environ.get("GH_TOKEN", "")
+        st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (repo, wf), tok,
+                       {"ref": "main", "inputs": {}})
+        if st in (204, 200, 201):
+            time.sleep(6)
+            st2, d2 = gh_api("GET", "/repos/%s/actions/workflows/%s/runs?per_page=1" % (repo, wf), tok)
+            url = ""
+            if st2 == 200 and (d2.get("workflow_runs") or []):
+                url = d2["workflow_runs"][0].get("html_url") or ""
+            return "⚡ 已触发 JavDB 抓取，跑完会自动发新报告\n%s" % url
+        return "❌ 触发失败(%s)：%s" % (st, str(d.get("_err", ""))[:180])
+    return "未知按钮 %r" % data
+
+
 def handle(text):
     parts = text.strip().split()
     if not parts:
@@ -217,12 +257,14 @@ def handle(text):
     if c == "/status":
         tg_send("⏳ 正在查各流程状态…")
         return cmd_status()
+    if c in ("/javdb", "/报告"):
+        tg_send("⏳ 正在生成 JavDB 报告…")
+        return cmd_javdb()
+    if c in ("/offline", "/离线"):
+        tg_send("⏳ 正在查离线流程进度…")
+        return cmd_offline()
     if c == "/run":
         return cmd_run(a)
-    if c == "/sub":
-        return cmd_sub(a)
-    if c == "/subfix":
-        return cmd_subfix(a)
     if c == "/stop":
         return cmd_stop(a)
     if c == "/disable":
@@ -235,7 +277,7 @@ def handle(text):
 def get_updates(offset, wait=50):
     tok = os.environ.get("TG_TOKEN", "")
     url = ("https://api.telegram.org/bot%s/getUpdates?timeout=%d&allowed_updates=%s"
-           % (tok, wait, urllib.parse.quote('["message"]')))
+           % (tok, wait, urllib.parse.quote('["message","callback_query"]')))
     if offset:
         url += "&offset=%d" % offset
     try:
@@ -265,6 +307,23 @@ def main():
             continue
         for u in d.get("result") or []:
             offset = max(offset, int(u.get("update_id", 0)) + 1)
+            # --- 按钮回调 ---
+            cb = u.get("callback_query")
+            if cb:
+                cchat = str(((cb.get("message") or {}).get("chat") or {}).get("id") or "")
+                if cchat != chat:
+                    log("忽略非授权 callback (chat=%s)" % (cchat[:4] + "***"))
+                    continue
+                n_cmd += 1
+                tg_answer_cb(cb.get("id"), "处理中…")
+                try:
+                    rep = handle_callback(cb)
+                    if rep:
+                        tg_send(rep)
+                except Exception as e:
+                    log("!! 回调异常: %s" % str(e)[:150])
+                    tg_send("❌ 回调出错：%s" % str(e)[:200])
+                continue
             msg = u.get("message") or {}
             ch = str((msg.get("chat") or {}).get("id") or "")
             text = (msg.get("text") or "").strip()
