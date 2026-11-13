@@ -204,6 +204,18 @@ def make_139():
         return None
 
 
+def _retry(fn, tries=3, delay=3.0, what="139 API"):
+    """139 API 偶发 DNS/网络抖动(实测见过 Temporary failure in name resolution), 重试几次再放弃"""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            log("   ! %s 第 %d 次失败(%s), %.0fs 后重试" % (what, i + 1, str(e)[:70], delay))
+            time.sleep(delay)
+
+
 class T139(object):
     """用 139 OpenAPI 直接看目标目录(相对个人云根; 挂载名要剥掉)"""
 
@@ -220,12 +232,12 @@ class T139(object):
             if cur in self.ids:
                 pid = self.ids[cur]
                 continue
-            hit = self.c.find_dir(seg, parent=pid)
+            hit = _retry(lambda s=seg, p=pid: self.c.find_dir(s, parent=p), what="139 找目录")
             if not hit:
-                r = self.c.mkdir(seg, parent=pid)
+                r = _retry(lambda s=seg, p=pid: self.c.mkdir(s, parent=p), what="139 建目录")
                 if not r.get("success"):
                     raise RuntimeError("建目录 %s 失败: %s" % (cur, str(r.get("message"))[:70]))
-                hit = self.c.find_dir(seg, parent=pid)
+                hit = _retry(lambda s=seg, p=pid: self.c.find_dir(s, parent=p), what="139 找目录")
                 if not hit:
                     raise RuntimeError("建目录 %s 后仍找不到" % cur)
             self.ids[cur] = hit["id"]
@@ -233,12 +245,9 @@ class T139(object):
         return pid
 
     def list_files(self, sub=""):
-        """{名字: 字节}(只看文件)"""
-        out = {}
-        for x in self.c.list_dir(self.dir_id(sub)):
-            if not x["is_dir"]:
-                out[x["name"]] = x["size"]
-        return out
+        """{名字: 字节}(只看文件); 一次调用一次性拿全"""
+        items = _retry(lambda: self.c.list_dir(self.dir_id(sub)), what="139 列目录")
+        return {x["name"]: x["size"] for x in items if not x["is_dir"]}
 
     def size_of(self, rel):
         parent, _, name = rel.rpartition("/")
@@ -365,7 +374,7 @@ def tg_send(text):
 
 # ---------------- 每日额度账本(北京自然日) ----------------
 def today_bj():
-    return (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d")
+    return (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)).strftime("%Y-%m-%d")
 
 
 def load_daily(path):
@@ -583,7 +592,7 @@ def main():
             % (os.environ.get("GY_PROGRESS_SEC", "15"), os.environ.get("GY_HB_SEC", "30")))
         SENT_T0[0] = time.time()
         threading.Thread(target=heartbeat,
-                         args=(a.parallel, GY_DAILY_GB, sum(s for _, s in plan), daily),
+                         args=(a.parallel, GY_DAILY_GB, sum(s for _, s in plan), len(plan), daily),
                          daemon=True).start()
         pending = list(plan)
         idx = [0]
