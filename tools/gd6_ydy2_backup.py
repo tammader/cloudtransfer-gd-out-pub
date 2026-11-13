@@ -87,6 +87,7 @@ def human(b):
 SENT_LOCK = threading.Lock()
 SENT_BYTES = [0]          # 已写进 socket 的字节(会因本地缓冲虚高, 别当速率看)
 DONE_BYTES = [0]          # 已校验通过(真正落盘)的字节 —— 速率看这个
+INFLIGHT = {}             # 文件名 -> 开工时间(未校验完成的那些)
 SENT_T0 = [time.time()]
 STOP_HB = [False]
 
@@ -99,8 +100,10 @@ def heartbeat(parallel, interval=None):
         now = time.time()
         with SENT_LOCK:
             cur, dn = SENT_BYTES[0], DONE_BYTES[0]
-        log("[心跳] 并发 %d | 已校验 %s | 在途 %s | 近 %.0fs 完成 %.2f MB/s | 累计 %.2f MB/s | %.1f 分钟"
-            % (parallel, human(dn), human(max(cur - dn, 0)),
+            infl = ", ".join("%s(%.1f 分钟)" % (k[:34], (now - v) / 60)
+                             for k, v in list(INFLIGHT.items())[:6])
+        log("[心跳] 并发 %d | 已校验 %s | 在传 %d 个%s | 近 %.0fs 完成 %.2f MB/s | 累计 %.2f MB/s | %.1f 分钟"
+            % (parallel, human(dn), len(INFLIGHT), (" [" + infl + "]") if infl else "",
                (dn - prev_done) / max(now - prev_t, 1e-6) / MB, interval,
                dn / max(now - SENT_T0[0], 1e-6) / MB, (now - SENT_T0[0]) / 60))
         prev_t, prev_done = now, dn
@@ -382,7 +385,13 @@ def main():
             if r.returncode != 0 or not os.path.exists(lp) or os.path.getsize(lp) != size:
                 return ("fail", "下载失败/大小不符 %s" % (r.stderr or "")[:80], 0.0)
             log("   ⬆ 开始上传 %s (%s)" % (rel, human(size)))
-            els = alist_put(remote, lp, size, label=rel)
+            with SENT_LOCK:
+                INFLIGHT[rel] = time.time()
+            try:
+                els = alist_put(remote, lp, size, label=rel)
+            finally:
+                with SENT_LOCK:
+                    INFLIGHT.pop(rel, None)
             got = alist_get(remote, refresh=True)
             if not got or got[0] != size:
                 return ("fail", "上传后校验不符(远端 %s / 本地 %s)" % (got[0] if got else "?", size), els)
