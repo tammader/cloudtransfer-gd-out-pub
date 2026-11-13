@@ -39,9 +39,9 @@ on:
         required: false
         default: ""
       parallel:
-        description: "并发传几个文件; 5 并发实测聚合约 3.8~4.7 MB/s(单流只有 0.45)"
+        description: "并发传几个文件; 实测 4 并发聚合 3.79 MB/s > 5 并发 1.94 MB/s(单流仅 0.45), 默认 4"
         required: false
-        default: "5"
+        default: "4"
 
 concurrency:
   group: gd6-ydy2-backup
