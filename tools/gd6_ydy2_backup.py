@@ -88,13 +88,21 @@ def human(b):
 SENT_LOCK = threading.Lock()
 SENT_BYTES = [0]          # 已写进 socket 的字节(本地缓冲会虚高, 只做参考)
 DONE_BYTES = [0]          # 已校验通过(真正落盘)的字节 —— 速率/进度都以它为准
+DONE_N = [0]              # 已完成的文件数
 INFLIGHT = {}             # 文件名 -> (开工时间, 字节)
+OBS = []                  # 本轮实测的单文件速率(MB/s), 用来滚动更新预估
+PRIOR = [float(os.environ.get("GY_PERFILE_PRIOR", "1.2"))]   # 单文件预估速率(MB/s), 首轮兜底
 SENT_T0 = [time.time()]
 STOP_HB = [False]
 
 
-def heartbeat(parallel, cap_gb, plan_bytes, daily, interval=None):
-    """每 interval 秒报一次: 本轮进度% + 在传文件(已跑/预计剩余) + 实测速率 + 预估总剩余"""
+def heartbeat(parallel, cap_gb, plan_bytes, plan_n, daily, interval=None):
+    """每 interval 秒一行: 本轮进度 + 每个在传文件的已跑/预计剩余 + 实测速率 + 预估总剩余
+
+    说明: 单个文件的**中途字节进度**在客户端看不到 —— 我的 PUT 只覆盖 "runner→alist" 这一段
+    (本地几秒就灌完), 真正慢的 "alist→139" 发生在服务端, HTTP 响应要等它整段传完才回来。
+    所以中途用「已跑时长 / 按实测单文件速率的预计剩余」来表达进度, 文件传完才计入字节统计。
+    """
     interval = interval or float(os.environ.get("GY_HB_SEC", "30"))
     prev_t, prev_done = time.time(), 0
     while not STOP_HB[0]:
@@ -102,26 +110,23 @@ def heartbeat(parallel, cap_gb, plan_bytes, daily, interval=None):
         now = time.time()
         with SENT_LOCK:
             dn = DONE_BYTES[0]
+            dnn = DONE_N[0]
             infl = [(k, v[0], v[1]) for k, v in list(INFLIGHT.items())]
             dgb = daily.get("gb", 0.0)
         dt = max(now - prev_t, 1e-6)
         inst = (dn - prev_done) / dt / MB
-        el = max(now - SENT_T0[0], 1e-6)
-        avg = dn / el / MB
+        pr = PRIOR[0]
         pct = 100.0 * dn / plan_bytes if plan_bytes else 0.0
-        eta_min = ((plan_bytes - dn) / (avg * MB) / 60) if avg > 0 and plan_bytes > dn else 0.0
+        left_b = max(plan_bytes - dn, 0)
+        eta = left_b / MB / pr / max(parallel, 1) / 60
         det = []
         for k, t0, sz in infl[:6]:
             spent = (now - t0) / 60
-            if avg > 0 and sz:
-                left = max(sz / (avg * MB) / 60 - spent, 0.0)
-                det.append("%s(已 %.1f 分钟, 估剩 %.1f)" % (k[:28], spent, left))
-            else:
-                det.append("%s(已 %.1f 分钟)" % (k[:28], spent))
-        log("[心跳] 并发 %d | 本轮 %.2f/%.2f GB (%.1f%%) | 本日 %.2f/%.0f GB | 在传 %d: %s "
-            "| 近 %d 秒 %.2f MB/s | 本轮均 %.2f MB/s | 估剩 %.1f 分钟"
-            % (parallel, dn / GB, plan_bytes / GB, pct, dgb, cap_gb, len(infl),
-               "; ".join(det) or "-", int(dt), inst, avg, eta_min))
+            det.append("%s(已 %.1f 分钟, 估剩 %.1f)" % (k[:28], spent, max(sz / MB / pr / 60 - spent, 0.0)))
+        log("[心跳] 并发 %d | 本轮 %d/%d 个 %.2f/%.2f GB (%.1f%%) | 本日 %.2f/%.0f GB | 在传 %d: %s "
+            "| 近 %d 秒完成 %.2f MB/s | 单文件估 %.2f MB/s | 估剩 %.1f 分钟"
+            % (parallel, dnn, plan_n, dn / GB, plan_bytes / GB, pct, dgb, cap_gb, len(infl),
+               "; ".join(det) or "-", int(dt), inst, pr, eta))
         prev_t, prev_done = now, dn
 
 
