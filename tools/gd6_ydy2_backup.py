@@ -570,7 +570,7 @@ def main():
             got, vsrc = verify_target(rel)
             if not got or got != size:
                 return ("fail", "上传后校验不符(远端 %s / 本地 %s, 来源 %s)" % (got if got else "?", size, vsrc), els)
-            return ("ok", "", els)
+            return ("ok", vsrc, els)
         except Exception as e:
             return ("fail", str(e)[:130], 0.0)
         finally:
@@ -617,8 +617,8 @@ def main():
                             daily["gb"] += size / GB
                             sp = size / max(els, 0.001) / MB
                             speeds.append(sp)
-                        log("   ✓ %s 用时 %.0fs (%.1f MB/s) | 校验 OK | 今日累计 %.2f GB / %.0f GB"
-                            % (rel, els, sp, daily["gb"], GY_DAILY_GB))
+                        log("   ✓ %s 用时 %.0fs (%.1f MB/s) | 校验 OK(%s) | 今日累计 %.2f GB / %.0f GB"
+                            % (rel, els, sp, msg or "-", daily["gb"], GY_DAILY_GB))
                         with lock:
                             if sent % 5 == 0:
                                 save_state(STATE, done)
