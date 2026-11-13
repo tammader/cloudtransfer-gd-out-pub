@@ -71,6 +71,9 @@ def conf_path():
 CONF = conf_path()
 
 
+VIDEO_RE = re.compile(r"\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|mpg|mpeg|m2ts|ts|rmvb|rm|3gp|vob|divx|f4v|asf)$", re.I)
+
+
 def log(m):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), m), flush=True)
 
@@ -427,6 +430,8 @@ def main():
 
     SRC = pathcfg.require("GY_SRC")
     DST = pathcfg.require("GY_DST_DIR").rstrip("/")
+    SUBDIR = pathcfg.get("GY_SRC_SUBDIR", "").strip("/")        # 只备份这个子目录; 目标端按同名目录镜像
+    VIDEO_ONLY = pathcfg.get("GY_VIDEO_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
     _mount, _, DST_INNER = DST.strip("/").partition("/")      # /ydy2/ycl -> 挂载名 ydy2 + 内路径 ycl
     DST_INNER = DST_INNER.strip("/")
     REPORT = pathcfg.get("GY_REPORT", "")
@@ -465,7 +470,12 @@ def main():
         else:
             log("!! 目标目录 %s 读不到(演练不创建; 真跑会自动 mkdir)" % DST)
 
-    src = src_list(SRC)
+    src_path = (SRC.rstrip("/") + "/" + SUBDIR) if SUBDIR else SRC
+    if SUBDIR:
+        log("范围: 只处理 %s (目标端镜像成 %s/%s/)" % (src_path, DST, SUBDIR))
+    src = src_list(src_path)
+    if SUBDIR:                                                 # 把子目录名拼进相对路径 -> 目标端保持同名目录
+        src = {SUBDIR + "/" + k: v for k, v in src.items()}
     log("源文件 %d 个 / %s" % (len(src), human(sum(src.values()))))
     if not src:
         log("源端是空的, 收工")
@@ -513,8 +523,15 @@ def main():
         return ((g[0], "alist") if g else (None, "none"))
 
     todo, skip_done, conflict, oversize = [], [], [], []
+    nonvideo, empty = [], []
     for rel, size in sorted(src.items()):
         if a.only and a.only not in rel:
+            continue
+        if VIDEO_ONLY and not VIDEO_RE.search(rel):
+            nonvideo.append((rel, size))
+            continue
+        if size <= 0:                       # 0 字节空文件: 传过去也没意义, 跳过
+            empty.append((rel, size))
             continue
         if size > a.max_file_mb * MB:
             oversize.append((rel, size))
@@ -547,8 +564,8 @@ def main():
             break
         plan.append((rel, size))
         acc += size
-    log("候选 %d 个 | 已在目标/清单 %d | 冲突(同名不同大小) %d | 超单文件上限 %d"
-        % (len(todo), len(skip_done), len(conflict), len(oversize)))
+    log("候选 %d 个 | 已在目标/清单 %d | 冲突(同名不同大小) %d | 超单文件上限 %d | 非视频跳过 %d | 空文件跳过 %d"
+        % (len(todo), len(skip_done), len(conflict), len(oversize), len(nonvideo), len(empty)))
     log("本轮计划 %d 个 / %s (本轮上限 %.0f GB = min(%.0f, 今日剩 %.2f); 队列里还有 %d 个)"
         % (len(plan), human(sum(s for _, s in plan)), cap_gb, a.max_total_gb, remain_gb,
            len(todo) - len(plan)))
@@ -629,9 +646,9 @@ def main():
                         log("   ✓ %s 用时 %.0fs (%.1f MB/s) | 校验 OK(%s) | 今日累计 %.2f GB / %.0f GB"
                             % (rel, els, sp, msg or "-", daily["gb"], GY_DAILY_GB))
                         with lock:
+                            save_daily(GY_DAILY, daily)      # 每完成 1 个就落账(轮次被取消也不会少记)
                             if sent % 5 == 0:
                                 save_state(STATE, done)
-                                save_daily(GY_DAILY, daily)
                     else:
                         with lock:
                             failed.append("%s: %s" % (rel, msg))
@@ -658,6 +675,8 @@ def main():
                                       ("  例: " + ", ".join(x[0] for x in conflict[:3])) if conflict else ""),
              "超单文件上限  : %d 个(> %d MB)%s" % (len(oversize), a.max_file_mb,
                                               ("  例: " + ", ".join("%s(%s)" % (x[0], human(x[1])) for x in oversize[:3])) if oversize else ""),
+             "非视频跳过    : %d 个%s" % (len(nonvideo), "  (GY_VIDEO_ONLY=1 时生效)" if nonvideo else ""),
+             "空文件跳过    : %d 个" % len(empty),
              "本轮计划      : %d 个 / %s (上限 %.0f GB)" % (len(plan), human(sum(s for _, s in plan)), cap_gb),
              "本轮实传      : %d 个 / %s" % (sent, human(sent_bytes)),
              "今日额度      : 已用 %.2f GB / 上限 %.0f GB (北京 %s), 剩余 %.2f GB"
