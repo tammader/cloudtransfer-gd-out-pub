@@ -27,6 +27,7 @@
 import argparse
 import concurrent.futures
 import configparser
+import datetime
 import io
 import json
 import os
@@ -276,6 +277,45 @@ def tg_send(text):
         return False
 
 
+# ---------------- 每日额度账本(北京自然日) ----------------
+def today_bj():
+    return (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+def load_daily(path):
+    """-> {'date': 今天, 'gb': 今天已上传多少 GB}"""
+    blank = {"date": today_bj(), "gb": 0.0}
+    if not path:
+        return blank
+    tmp = os.path.join(WORK, "daily.json")
+    os.makedirs(WORK, exist_ok=True)
+    r = rclone(["copyto", path, tmp, "--retries", "2"], timeout=600)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        log("   (今日账本读不到, 当 0 起算: %s)" % (r.stderr or "").strip()[:80])
+        return blank
+    try:
+        d = json.load(io.open(tmp, encoding="utf-8"))
+        if d.get("date") != today_bj():
+            log("   账本是 %s 的, 跨天了 -> 从 0 重新记" % d.get("date"))
+            return blank
+        return {"date": today_bj(), "gb": float(d.get("gb") or 0)}
+    except Exception:
+        return blank
+
+
+def save_daily(path, d):
+    if not path:
+        return True
+    os.makedirs(WORK, exist_ok=True)
+    tmp = os.path.join(WORK, "daily_out.json")
+    io.open(tmp, "w", encoding="utf-8", newline="\n").write(
+        json.dumps({"date": d["date"], "gb": round(d["gb"], 3),
+                    "note": "gd6:out3 -> ydy2/ycl 每日上传量(北京自然日)"},
+                   ensure_ascii=False, indent=1))
+    r = rclone(["copyto", tmp, path, "--retries", "3"], timeout=900)
+    return r.returncode == 0
+
+
 # ---------------- 主流程 ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -294,6 +334,8 @@ def main():
     DST = pathcfg.require("GY_DST_DIR").rstrip("/")
     REPORT = pathcfg.get("GY_REPORT", "")
     STATE = pathcfg.get("GY_STATE", "")
+    GY_DAILY = pathcfg.get("GY_DAILY", "")
+    GY_DAILY_GB = float(pathcfg.get("GY_DAILY_GB", "500"))
     t0 = time.time()
     os.makedirs(WORK, exist_ok=True)
 
@@ -358,18 +400,28 @@ def main():
             continue
         todo.append((rel, size))
 
+    # ---- 每日额度(北京自然日) ----
+    daily = load_daily(GY_DAILY)
+    remain_gb = max(0.0, GY_DAILY_GB - daily["gb"])
+    log("今日(北京 %s)已上传 %.2f GB / 上限 %.0f GB | 本日剩余额度 %.2f GB"
+        % (daily["date"], daily["gb"], GY_DAILY_GB, remain_gb))
+    cap_gb = min(a.max_total_gb, remain_gb)
+
     plan_bytes = sum(s for _, s in todo)
     plan = []
     acc = 0.0
     for rel, size in todo:
-        if len(plan) >= a.max_files or acc + size > a.max_total_gb * GB:
+        if len(plan) >= a.max_files or acc + size > cap_gb * GB:
             break
         plan.append((rel, size))
         acc += size
     log("候选 %d 个 | 已在目标/清单 %d | 冲突(同名不同大小) %d | 超单文件上限 %d"
         % (len(todo), len(skip_done), len(conflict), len(oversize)))
-    log("本轮计划 %d 个 / %s (剩余 %d 个下轮继续)"
-        % (len(plan), human(sum(s for _, s in plan)), len(todo) - len(plan)))
+    log("本轮计划 %d 个 / %s (本轮上限 %.0f GB = min(%.0f, 今日剩 %.2f); 队列里还有 %d 个)"
+        % (len(plan), human(sum(s for _, s in plan)), cap_gb, a.max_total_gb, remain_gb,
+           len(todo) - len(plan)))
+    if a.apply and (remain_gb <= 0 or not plan):
+        log("今日额度已用完或没有可传的 -> 本轮空跑收工(不下不发)")
 
     sent, sent_bytes, failed = 0, 0, []
     speeds = []
@@ -437,12 +489,15 @@ def main():
                             sent_bytes += size
                             done[rel] = size
                             DONE_BYTES[0] += size
+                            daily["gb"] += size / GB
                             sp = size / max(els, 0.001) / MB
                             speeds.append(sp)
-                        log("   ✓ %s 用时 %.0fs (%.1f MB/s) | 校验 OK" % (rel, els, sp))
+                        log("   ✓ %s 用时 %.0fs (%.1f MB/s) | 校验 OK | 今日累计 %.2f GB / %.0f GB"
+                            % (rel, els, sp, daily["gb"], GY_DAILY_GB))
                         with lock:
                             if sent % 5 == 0:
                                 save_state(STATE, done)
+                                save_daily(GY_DAILY, daily)
                     else:
                         with lock:
                             failed.append("%s: %s" % (rel, msg))
@@ -452,6 +507,7 @@ def main():
                 log("到时间预算, 收工(剩 %d 个下轮继续)" % len(pending))
         STOP_HB[0] = True
     save_state(STATE, done)
+    save_daily(GY_DAILY, daily)
 
     # ---- 汇总 ----
     if a.apply:
@@ -468,8 +524,10 @@ def main():
                                       ("  例: " + ", ".join(x[0] for x in conflict[:3])) if conflict else ""),
              "超单文件上限  : %d 个(> %d MB)%s" % (len(oversize), a.max_file_mb,
                                               ("  例: " + ", ".join("%s(%s)" % (x[0], human(x[1])) for x in oversize[:3])) if oversize else ""),
-             "本轮计划      : %d 个 / %s" % (len(plan), human(sum(s for _, s in plan))),
+             "本轮计划      : %d 个 / %s (上限 %.0f GB)" % (len(plan), human(sum(s for _, s in plan)), cap_gb),
              "本轮实传      : %d 个 / %s" % (sent, human(sent_bytes)),
+             "今日额度      : 已用 %.2f GB / 上限 %.0f GB (北京 %s), 剩余 %.2f GB"
+             % (daily["gb"], GY_DAILY_GB, daily["date"], max(0.0, GY_DAILY_GB - daily["gb"])),
              "失败          : %d 个" % len(failed),
              "耗时          : %.1f 分钟" % ((time.time() - t0) / 60)]
     if speeds:
