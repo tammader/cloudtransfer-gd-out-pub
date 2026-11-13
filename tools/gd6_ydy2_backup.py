@@ -179,6 +179,72 @@ def alist_mkdir(path):
     return alist_post("/api/fs/mkdir", {"path": path})
 
 
+# ---------------- 139 个人云 OpenAPI(校验/列目录更可靠) ----------------
+# 为什么需要它: alist 的 139Yun 驱动对**子目录**列目录会报 `object not found`
+# (本流程实测: /ydy2 根能列, /ydy2/ycl 列不了), 于是增量判断只能靠清单兜底 ——
+# 既看不见目标盘里原有的文件, 上传后的回读校验也会假失败。
+# 139 自己的 OpenAPI 没这个问题: 有 id、有大小、无 30 分钟缓存, 且 ydy2-transfer
+# 在生产里就是这么列的(同一份 tools/ty_cloud_personal.py)。
+def make_139():
+    auth = os.environ.get("YDY_AUTHORIZATION", "").strip()
+    if not auth:
+        log("   (没有 YDY_AUTHORIZATION, 校验/列目录退回 alist)")
+        return None
+    try:
+        sys.path.insert(0, HERE)
+        from ty_cloud_personal import TyPersonal
+        c = TyPersonal(auth)
+        if not c.login():
+            log("   !! 139 API 登录失败(授权大概过期了), 退回 alist")
+            return None
+        log("   139 API 就绪: %s | 授权还剩 %.1f 天" % (c.host[:40], c.expires_in_days()))
+        return c
+    except Exception as e:
+        log("   !! 139 API 初始化失败(%s), 退回 alist" % str(e)[:90])
+        return None
+
+
+class T139(object):
+    """用 139 OpenAPI 直接看目标目录(相对个人云根; 挂载名要剥掉)"""
+
+    def __init__(self, c, inner):
+        self.c, self.inner, self.ids = c, inner.strip("/"), {"": "/"}
+
+    def dir_id(self, sub=""):
+        key = (self.inner + ("/" + sub if sub else "")).strip("/")
+        if key in self.ids:
+            return self.ids[key]
+        pid, cur = "/", ""
+        for seg in key.split("/"):
+            cur = (cur + "/" + seg) if cur else seg
+            if cur in self.ids:
+                pid = self.ids[cur]
+                continue
+            hit = self.c.find_dir(seg, parent=pid)
+            if not hit:
+                r = self.c.mkdir(seg, parent=pid)
+                if not r.get("success"):
+                    raise RuntimeError("建目录 %s 失败: %s" % (cur, str(r.get("message"))[:70]))
+                hit = self.c.find_dir(seg, parent=pid)
+                if not hit:
+                    raise RuntimeError("建目录 %s 后仍找不到" % cur)
+            self.ids[cur] = hit["id"]
+            pid = hit["id"]
+        return pid
+
+    def list_files(self, sub=""):
+        """{名字: 字节}(只看文件)"""
+        out = {}
+        for x in self.c.list_dir(self.dir_id(sub)):
+            if not x["is_dir"]:
+                out[x["name"]] = x["size"]
+        return out
+
+    def size_of(self, rel):
+        parent, _, name = rel.rpartition("/")
+        return self.list_files(parent).get(name)
+
+
 class _Progress(object):
     """给 http.client 当 body: 边发边报进度 + 瞬时/均值速度(Actions 日志能看, 带换行)"""
 
@@ -352,6 +418,8 @@ def main():
 
     SRC = pathcfg.require("GY_SRC")
     DST = pathcfg.require("GY_DST_DIR").rstrip("/")
+    _mount, _, DST_INNER = DST.strip("/").partition("/")      # /ydy2/ycl -> 挂载名 ydy2 + 内路径 ycl
+    DST_INNER = DST_INNER.strip("/")
     REPORT = pathcfg.get("GY_REPORT", "")
     STATE = pathcfg.get("GY_STATE", "")
     GY_DAILY = pathcfg.get("GY_DAILY", "")
@@ -363,6 +431,18 @@ def main():
     log("模式 %s | 单文件上限 %d MB | 本轮上限 %d 个 / %.0f GB | 时间预算 %d 分钟"
         % ("真传(--apply)" if a.apply else "演练", a.max_file_mb, a.max_files,
            a.max_total_gb, a.budget_min))
+
+    # ---- 139 API(优先): 列目录/校验都用它, alist 只当兜底 ----
+    c139 = make_139()
+    t139 = None
+    if c139 is not None:
+        try:
+            t139 = T139(c139, DST_INNER)
+            _have = t139.list_files("")
+            log("   目标(139 API) %s: 现有文件 %d 个 / %s" % (DST_INNER, len(_have), human(sum(_have.values()))))
+        except Exception as e:
+            log("   !! 139 API 读目标目录失败(%s) -> 退回 alist" % str(e)[:90])
+            t139 = None
 
     # 目标目录
     d = alist_get(DST, refresh=True)
@@ -390,7 +470,18 @@ def main():
 
     def target_has(rel):
         parent, _, name = rel.rpartition("/")
-        key = parent
+        if t139 is not None:                       # 139 API: 无缓存, 看得见目标盘原有文件
+            key = ("139", parent)
+            if key not in cache:
+                try:
+                    cache[key] = t139.list_files(parent)
+                except Exception as e:
+                    log("   !! 139 列目录失败(退 alist): %s" % str(e)[:80])
+                    cache[key] = None
+            files = cache.get(key)
+            if files is not None:
+                return (files[name], False) if name in files else None
+        key = ("alist", parent)
         if key not in cache:
             p = DST + ("/" + parent if parent else "")
             try:
@@ -399,6 +490,18 @@ def main():
                 log("   !! 列目标目录 %s 失败(用清单兜底): %s" % (p, str(e)[:100]))
                 cache[key] = {}
         return cache[key].get(name)
+
+    def verify_target(rel):
+        """回读目标文件大小 -> (字节 or None, 来源)"""
+        if t139 is not None:
+            try:
+                v = t139.size_of(rel)
+                if v is not None:
+                    return v, "139"
+            except Exception:
+                pass
+        g = alist_get(DST + "/" + rel, refresh=True)
+        return ((g[0], "alist") if g else (None, "none"))
 
     todo, skip_done, conflict, oversize = [], [], [], []
     for rel, size in sorted(src.items()):
@@ -464,9 +567,9 @@ def main():
             finally:
                 with SENT_LOCK:
                     INFLIGHT.pop(rel, None)
-            got = alist_get(remote, refresh=True)
-            if not got or got[0] != size:
-                return ("fail", "上传后校验不符(远端 %s / 本地 %s)" % (got[0] if got else "?", size), els)
+            got, vsrc = verify_target(rel)
+            if not got or got != size:
+                return ("fail", "上传后校验不符(远端 %s / 本地 %s, 来源 %s)" % (got if got else "?", size, vsrc), els)
             return ("ok", "", els)
         except Exception as e:
             return ("fail", str(e)[:130], 0.0)
