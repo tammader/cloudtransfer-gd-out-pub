@@ -81,6 +81,50 @@ def is_list_key(v):
     return isinstance(v, str) and "," in v
 
 
+def is_json_str(v):
+    """PATHS_JSON 里有些 key 的值本身是 JSON 字符串(FS_QUOTA/FS_DESC/_WORDS 这类)"""
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    return (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}"))
+
+
+def deep_transform(v, a):
+    """递归: 字符串叶子按规则改写; 值是 JSON 字符串的 -> 解析-改-再按原形态写回。返回 (新值, 命中数)"""
+    if isinstance(v, dict):
+        out, n = {}, 0
+        for k, x in v.items():
+            nv, m = deep_transform(x, a)
+            out[k] = nv
+            n += m
+        return out, n
+    if isinstance(v, list):
+        out, n = [], 0
+        for x in v:
+            nv, m = deep_transform(x, a)
+            out.append(nv)
+            n += m
+        return out, n
+    if is_json_str(v):
+        try:
+            inner = json.loads(v)
+        except Exception:
+            return transform_value(v, a)
+        ni, m = deep_transform(inner, a)
+        if not m:
+            return v, 0
+        return json.dumps(ni, ensure_ascii=False), m
+    if isinstance(v, str):
+        return transform_value(v, a)
+    return v, 0
+
+
+def is_old_ref(s, a):
+    """这个字符串是不是指向旧盘(远端名/挂载名两种形态都算)"""
+    t = (s or "").strip()
+    return t in (a.old_remote, a.old_remote + ":", a.old_mount, a.old_mount.rstrip("/"))
+
+
 def transform_value(v, a):
     """把一个配置值里的 OneDrive2 引用改到新盘。返回 (新值, 命中数)"""
     if not isinstance(v, str):
@@ -161,6 +205,26 @@ def set_secret(name, value, tok):
     return st in (201, 204)
 
 
+def drop_quota_rows(v, a):
+    """FS_QUOTA(可能是 list, 也可能是 JSON 字符串): 把 'a' 指向旧盘的行摘掉"""
+    was_str = is_json_str(v)
+    try:
+        arr = json.loads(v) if was_str else v
+    except Exception:
+        return v, []
+    if not isinstance(arr, list):
+        return v, []
+    kept, dropped = [], []
+    for q in arr:
+        if isinstance(q, dict) and is_old_ref(str(q.get("a", "")), a):
+            dropped.append(str(q.get("n") or "?"))
+            continue
+        kept.append(q)
+    if not dropped:
+        return v, []
+    return (json.dumps(kept, ensure_ascii=False) if was_str else kept), dropped
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="把新字典写回 Secret")
@@ -200,7 +264,7 @@ def main():
             print("!! PATHS_JSON_TD 解析失败: %s" % e)
 
     print("\n---- 命中 OneDrive2 的 key ----")
-    hits, quota_note = [], []
+    hits, text_notes = [], []
     for src, dic in (("PATHS_JSON", d), ("PATHS_JSON_TD", td)):
         for k in sorted(dic):
             v = dic[k]
@@ -211,18 +275,27 @@ def main():
                           % (src, ", ".join(x for x in (a.old_remote, a.old_mount) if x in w)))
                     hits.append((src, k, None))
                 continue
-            if k == "FS_QUOTA" and isinstance(v, list):
-                drop = [q for q in v if isinstance(q, dict) and str(q.get("a", "")).strip() in
-                        (a.old_remote, a.old_remote + ":", a.old_mount, a.old_mount.rstrip("/"))]
-                if drop:
-                    print("   %-22s FS_QUOTA 里 %d 行指向旧盘 -> 摘掉(%s)"
-                          % (src, len(drop), ", ".join(str(q.get("n")) for q in drop)))
-                    hits.append((src, k, len(drop)))
+            if k == "FS_QUOTA":
+                arr = json.loads(v) if is_json_str(v) else (v if isinstance(v, list) else [])
+                for i, q in enumerate(arr):
+                    if not isinstance(q, dict):
+                        continue
+                    aa = str(q.get("a", ""))
+                    print("   FS_QUOTA[%d] k=%-8s a=<r:%s>%s" % (i, q.get("k"), h8(aa),
+                                                                 "  ** 旧盘(将摘掉)" if is_old_ref(aa, a) else ""))
+                nv, dropped = drop_quota_rows(v, a)
+                if dropped:
+                    print("   %-22s FS_QUOTA 摘掉 %d 行" % (src, len(dropped)))
+                    hits.append((src, k, len(dropped)))
                 continue
-            nv, n = transform_value(v, a) if isinstance(v, str) else (v, 0)
+            nv, n = deep_transform(v, a)
             if n:
-                print("   %-22s %-16s %s  ->  %s" % (src, k, shape(v, a), shape(nv, a)))
+                print("   %-22s %-18s %s  ->  %s" % (src, k, shape(v, a), shape(nv, a)))
                 hits.append((src, k, n))
+            elif isinstance(v, str) and not is_json_str(v) and a.old_remote in v:
+                text_notes.append("%s.%s" % (src, k))          # 只是文案里提到旧盘名, 路径没变
+    if text_notes:
+        print("   (文案里提到旧盘名、路径未变的 key: %s)" % ", ".join(text_notes))
     if not hits:
         print("   (没有命中: 该盘在配置里已经没有引用了)")
 
@@ -230,19 +303,16 @@ def main():
     def rebuild(dic):
         out = {}
         for k, v in dic.items():
-            if k == "FS_QUOTA" and isinstance(v, list):
-                out[k] = [q for q in v if not (isinstance(q, dict) and
-                                               str(q.get("a", "")).strip() in (a.old_remote, a.old_remote + ":",
-                                                                               a.old_mount, a.old_mount.rstrip("/")))]
+            if k == "FS_QUOTA":
+                nv, _ = drop_quota_rows(v, a)
+                out[k] = nv
             elif k == "_WORDS" and isinstance(v, dict):
                 w = dict(v)
                 # 新目录名在公开日志里也要遮住
                 w.setdefault(a.new_prefix, "OD目录")
                 out[k] = w
-            elif isinstance(v, str):
-                out[k], _ = transform_value(v, a)
             else:
-                out[k] = v
+                out[k], _ = deep_transform(v, a)
         return out
 
     new_d = rebuild(d)
