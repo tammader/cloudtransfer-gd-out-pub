@@ -86,27 +86,42 @@ def human(b):
 # 所以这里所有进度都**带换行输出**, 每个文件每 GY_PROGRESS_SEC 秒报一行, 另开一个心跳线程
 # 每 GY_HB_SEC 秒报一次全局聚合速率 —— 并发跑的时候也能看清"总共在吃什么带宽"。
 SENT_LOCK = threading.Lock()
-SENT_BYTES = [0]          # 已写进 socket 的字节(会因本地缓冲虚高, 别当速率看)
-DONE_BYTES = [0]          # 已校验通过(真正落盘)的字节 —— 速率看这个
-INFLIGHT = {}             # 文件名 -> 开工时间(未校验完成的那些)
+SENT_BYTES = [0]          # 已写进 socket 的字节(本地缓冲会虚高, 只做参考)
+DONE_BYTES = [0]          # 已校验通过(真正落盘)的字节 —— 速率/进度都以它为准
+INFLIGHT = {}             # 文件名 -> (开工时间, 字节)
 SENT_T0 = [time.time()]
 STOP_HB = [False]
 
 
-def heartbeat(parallel, interval=None):
+def heartbeat(parallel, cap_gb, plan_bytes, daily, interval=None):
+    """每 interval 秒报一次: 本轮进度% + 在传文件(已跑/预计剩余) + 实测速率 + 预估总剩余"""
     interval = interval or float(os.environ.get("GY_HB_SEC", "30"))
     prev_t, prev_done = time.time(), 0
     while not STOP_HB[0]:
         time.sleep(interval)
         now = time.time()
         with SENT_LOCK:
-            cur, dn = SENT_BYTES[0], DONE_BYTES[0]
-            infl = ", ".join("%s(%.1f 分钟)" % (k[:34], (now - v) / 60)
-                             for k, v in list(INFLIGHT.items())[:6])
-        log("[心跳] 并发 %d | 已校验 %s | 在传 %d 个%s | 近 %.0fs 完成 %.2f MB/s | 累计 %.2f MB/s | %.1f 分钟"
-            % (parallel, human(dn), len(INFLIGHT), (" [" + infl + "]") if infl else "",
-               (dn - prev_done) / max(now - prev_t, 1e-6) / MB, interval,
-               dn / max(now - SENT_T0[0], 1e-6) / MB, (now - SENT_T0[0]) / 60))
+            dn = DONE_BYTES[0]
+            infl = [(k, v[0], v[1]) for k, v in list(INFLIGHT.items())]
+            dgb = daily.get("gb", 0.0)
+        dt = max(now - prev_t, 1e-6)
+        inst = (dn - prev_done) / dt / MB
+        el = max(now - SENT_T0[0], 1e-6)
+        avg = dn / el / MB
+        pct = 100.0 * dn / plan_bytes if plan_bytes else 0.0
+        eta_min = ((plan_bytes - dn) / (avg * MB) / 60) if avg > 0 and plan_bytes > dn else 0.0
+        det = []
+        for k, t0, sz in infl[:6]:
+            spent = (now - t0) / 60
+            if avg > 0 and sz:
+                left = max(sz / (avg * MB) / 60 - spent, 0.0)
+                det.append("%s(已 %.1f 分钟, 估剩 %.1f)" % (k[:28], spent, left))
+            else:
+                det.append("%s(已 %.1f 分钟)" % (k[:28], spent))
+        log("[心跳] 并发 %d | 本轮 %.2f/%.2f GB (%.1f%%) | 本日 %.2f/%.0f GB | 在传 %d: %s "
+            "| 近 %d 秒 %.2f MB/s | 本轮均 %.2f MB/s | 估剩 %.1f 分钟"
+            % (parallel, dn / GB, plan_bytes / GB, pct, dgb, cap_gb, len(infl),
+               "; ".join(det) or "-", int(dt), inst, avg, eta_min))
         prev_t, prev_done = now, dn
 
 
@@ -438,7 +453,7 @@ def main():
                 return ("fail", "下载失败/大小不符 %s" % (r.stderr or "")[:80], 0.0)
             log("   ⬆ 开始上传 %s (%s)" % (rel, human(size)))
             with SENT_LOCK:
-                INFLIGHT[rel] = time.time()
+                INFLIGHT[rel] = (time.time(), size)
             try:
                 els = alist_put(remote, lp, size, label=rel)
             finally:
@@ -459,7 +474,9 @@ def main():
         log("进度: 每个文件每 %s 秒报一行; 全局心跳每 %s 秒一行(GY_PROGRESS_SEC / GY_HB_SEC 可调)"
             % (os.environ.get("GY_PROGRESS_SEC", "15"), os.environ.get("GY_HB_SEC", "30")))
         SENT_T0[0] = time.time()
-        threading.Thread(target=heartbeat, args=(a.parallel,), daemon=True).start()
+        threading.Thread(target=heartbeat,
+                         args=(a.parallel, GY_DAILY_GB, sum(s for _, s in plan), daily),
+                         daemon=True).start()
         pending = list(plan)
         idx = [0]
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.parallel)) as ex:
