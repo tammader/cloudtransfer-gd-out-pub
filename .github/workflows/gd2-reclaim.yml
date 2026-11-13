@@ -1,0 +1,96 @@
+name: gd2-reclaim
+
+# 源盘冗余回收: 把「已经被 gd-backup 镜像到备份盘」的文件从源盘删掉, 腾出配额。
+#
+#   * 判据与 gd-backup 完全一致: 目标盘同名 + 字节数一致才算「已备份」 -> 只删这些
+#   * 目标缺失 / 大小不符 / 目标目录列不到(权限/配额/网络) -> 一个都不删
+#   * 默认跳过队列目录 out,out2(gd-out2 的输入队列: 文件走完流程才会被 move 到 out2)
+#   * 默认演练; --apply 才真删; 删除默认**跳过回收站**(Drive 回收站里的文件照样占配额)
+#   * 目录清单直接读 gd-backup 的 GB_DIRS, 不重复配置
+#
+# 需要 Secrets: RCLONE_CONF / PATHS_JSON / TG_TOKEN(可选) / TG_CHAT_ID(可选)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真删(腾配额); false=只演练看计划"
+        required: false
+        default: "false"
+      dirs:
+        description: "只处理这些目录(逗号分隔); 留空=用 GB_DIRS"
+        required: false
+        default: ""
+      include_queue:
+        description: "true=连队列目录(out,out2)也处理; 危险, 默认 false"
+        required: false
+        default: "false"
+      use_trash:
+        description: "true=删除进回收站(占配额30天); 默认 false=直接跳过回收站"
+        required: false
+        default: "false"
+      max_gb:
+        description: "本轮最多删多少 GB(0=不限)"
+        required: false
+        default: "0"
+      audit:
+        description: "true=顺带打印「还有谁在读这个源盘」的交叉核对"
+        required: false
+        default: "true"
+
+concurrency:
+  group: gd2-reclaim
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+  LOG_MASK: "1"
+
+jobs:
+  reclaim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+          df -h / | tail -1
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          test -s ~/.config/rclone/rclone.conf && echo "rclone 配置已写入"
+          echo "远端段数: $(grep -c '^\[' ~/.config/rclone/rclone.conf)"
+
+      - name: 跑回收(演练/执行)
+        run: |
+          set -x
+          ARGS=""
+          [ "${{ inputs.apply }}" = "true" ] && ARGS="$ARGS --apply"
+          [ "${{ inputs.include_queue }}" = "true" ] && ARGS="$ARGS --include-queue"
+          [ "${{ inputs.use_trash }}" = "true" ] && ARGS="$ARGS --use-trash"
+          [ "${{ inputs.audit }}" = "true" ] && ARGS="$ARGS --audit"
+          [ -n "${{ inputs.dirs }}" ] && ARGS="$ARGS --dirs ${{ inputs.dirs }}"
+          [ -n "${{ inputs.max_gb }}" ] && [ "${{ inputs.max_gb }}" != "0" ] && ARGS="$ARGS --max-gb ${{ inputs.max_gb }}"
+          python3 tools/gd_reclaim.py $ARGS
+
+      - name: 收尾(报磁盘/背景说明)
+        if: always()
+        run: |
+          df -h / | tail -1
+          echo "提示: 回收后如需让 in-pipeline/out-sync 的判重清单跟上, 手动跑一次 gen-manifest.yml;"
+          echo "      备份盘那侧不动任何文件, 所以 gd6 上的副本不受影响。"
