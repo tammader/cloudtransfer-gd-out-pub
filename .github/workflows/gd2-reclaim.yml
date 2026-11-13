@@ -37,6 +37,14 @@ on:
         description: "true=顺带打印「还有谁在读这个源盘」的交叉核对"
         required: false
         default: "true"
+      sync:
+        description: "true=先补镜像(源->目标 copy --size-only), 再按同名同大小删源"
+        required: false
+        default: "false"
+      sync_budget_min:
+        description: "补镜像步骤的时间预算(分钟); job 硬上限 350, 留够删除的余量"
+        required: false
+        default: "200"
 
 concurrency:
   group: gd2-reclaim
@@ -85,6 +93,7 @@ jobs:
           [ "${{ inputs.include_queue }}" = "true" ] && ARGS="$ARGS --include-queue"
           [ "${{ inputs.use_trash }}" = "true" ] && ARGS="$ARGS --use-trash"
           [ "${{ inputs.audit }}" = "true" ] && ARGS="$ARGS --audit"
+          [ "${{ inputs.sync }}" = "true" ] && ARGS="$ARGS --sync --sync-budget-min ${{ inputs.sync_budget_min }}"
           [ -n "${{ inputs.dirs }}" ] && ARGS="$ARGS --dirs ${{ inputs.dirs }}"
           [ -n "${{ inputs.max_gb }}" ] && [ "${{ inputs.max_gb }}" != "0" ] && ARGS="$ARGS --max-gb ${{ inputs.max_gb }}"
           python3 tools/gd_reclaim.py $ARGS
