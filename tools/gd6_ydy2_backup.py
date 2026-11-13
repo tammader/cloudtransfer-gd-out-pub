@@ -85,24 +85,25 @@ def human(b):
 # 所以这里所有进度都**带换行输出**, 每个文件每 GY_PROGRESS_SEC 秒报一行, 另开一个心跳线程
 # 每 GY_HB_SEC 秒报一次全局聚合速率 —— 并发跑的时候也能看清"总共在吃什么带宽"。
 SENT_LOCK = threading.Lock()
-SENT_BYTES = [0]
+SENT_BYTES = [0]          # 已写进 socket 的字节(会因本地缓冲虚高, 别当速率看)
+DONE_BYTES = [0]          # 已校验通过(真正落盘)的字节 —— 速率看这个
 SENT_T0 = [time.time()]
 STOP_HB = [False]
 
 
 def heartbeat(parallel, interval=None):
     interval = interval or float(os.environ.get("GY_HB_SEC", "30"))
-    prev_t, prev_b = time.time(), 0
+    prev_t, prev_done = time.time(), 0
     while not STOP_HB[0]:
         time.sleep(interval)
-        with SENT_LOCK:
-            cur = SENT_BYTES[0]
         now = time.time()
-        dt = max(now - prev_t, 1e-6)
-        log("[心跳] 并发 %d | 累计发出 %s | 瞬时 %.2f MB/s | 聚合 %.2f MB/s | 已用 %.1f 分钟"
-            % (parallel, human(cur), (cur - prev_b) / dt / MB,
-               cur / max(now - SENT_T0[0], 1e-6) / MB, (now - SENT_T0[0]) / 60))
-        prev_t, prev_b = now, cur
+        with SENT_LOCK:
+            cur, dn = SENT_BYTES[0], DONE_BYTES[0]
+        log("[心跳] 并发 %d | 已校验 %s | 在途 %s | 近 %.0fs 完成 %.2f MB/s | 累计 %.2f MB/s | %.1f 分钟"
+            % (parallel, human(dn), human(max(cur - dn, 0)),
+               (dn - prev_done) / max(now - prev_t, 1e-6) / MB, interval,
+               dn / max(now - SENT_T0[0], 1e-6) / MB, (now - SENT_T0[0]) / 60))
+        prev_t, prev_done = now, dn
 
 
 # ---------------- alist ----------------
@@ -426,6 +427,7 @@ def main():
                             sent += 1
                             sent_bytes += size
                             done[rel] = size
+                            DONE_BYTES[0] += size
                             sp = size / max(els, 0.001) / MB
                             speeds.append(sp)
                         log("   ✓ %s 用时 %.0fs (%.1f MB/s) | 校验 OK" % (rel, els, sp))
