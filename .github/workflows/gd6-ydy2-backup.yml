@@ -39,9 +39,9 @@ on:
         required: false
         default: ""
       parallel:
-        description: "并发传几个文件; 单流 0.45 / 3 并发按你定的来(4 并发实测过 3.79, 5 并发掉到 1.94)"
+        description: "并发传几个文件; 1=单线程(按你要求)"
         required: false
-        default: "3"
+        default: "1"
 
 concurrency:
   group: gd6-ydy2-backup
