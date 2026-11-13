@@ -121,24 +121,50 @@ def strip_remote(s):
     return s.split(":", 1)[0] if ":" in s else s
 
 
-def audit_cross(root):
-    """谁还在读同一个源盘? 只打印布尔/哈希, 不打印真名(公开仓库日志)"""
-    pairs = [
-        ("GD_SRC", "出口 gd-out2 的源(每 3 小时读 out, 处理完 move 到 out2)"),
-        ("GT_SRC", "gd2->teldrive 冷备的源(cron 已停)"),
-        ("GR_A_SRC", "in2-ydout 搬运源"),
-        ("GR_B_SRC", "ydout-in3 搬运源"),
-        ("GR_TG_SRC", "od2-tg-gd2 的 TG 目录源(送达后删源)"),
-        ("DBJM_SRC", "out2->豆瓣酱 的源"),
-        ("OT_SRC", "out2->天翼 的源"),
-        ("GB_DST_ROOT", "本流程的目标盘(备份盘)"),
-    ]
-    log("---- 交叉核对: 还有谁在读 %s ----" % strip_remote(root))
-    for k, why in pairs:
+AUDIT_KEYS = [
+    ("GD_SRC", "出口 gd-out2: 源(每 3 小时读 out, 处理完同盘 move 到 out2)"),
+    ("GD_DST", "出口 gd-out2: 目标(中转盘 out2)"),
+    ("GD_ARCH", "出口 gd-out2: 归档区"),
+    ("GR_A_SRC", "in2-ydout: 源(送达后删源)"),
+    ("GR_B_SRC", "ydout-in3: 源(送达后同盘 move 到归档)"),
+    ("GR_B_ARCH", "ydout-in3: 归档区"),
+    ("GR_TG_SRC", "od2-tg-gd2: TG 目录的源(送达后删源)"),
+    ("GR_TG_DST", "od2-tg-gd2: TG 目录的目标"),
+    ("GT_SRC", "gd2->teldrive 冷备: 源(cron 已停)"),
+    ("OT_SRC", "out2->目标网盘: 源"),
+    ("OT_ARCH", "out2->目标网盘: 归档区"),
+    ("DBJM_SRC", "out2->豆瓣酱: 源"),
+    ("HL_IN", "上游盘 /in"),
+]
+
+
+def audit_cross(root, targets):
+    """谁还在读/动这个源盘? 逐 key 比 remote 与目录, 只打印布尔(公开仓库日志不进真名)"""
+    r_root = strip_remote(root)
+    log("---- 交叉核对: 谁在动 %s 上的 %s ----" % (r_root, ",".join(targets)))
+    for k, why in AUDIT_KEYS:
         v = pathcfg.get(k)
         if not v:
             continue
-        log("   %-11s %s   %s" % (k, "同一盘" if strip_remote(v) == strip_remote(root) else "不同盘", why))
+        if ":" in v:
+            r, p = v.split(":", 1)
+            r, p = r.strip(), p.strip("/")
+        else:                       # 没带 remote = alist 挂载路径, 只认目录是否命中
+            r, p = "(alist)", v.strip("/")
+        same_disk = (r == r_root)
+        hit = [t for t in targets if p == t or p.startswith(t + "/")]
+        if same_disk:
+            log("   %-11s 同一盘  %s   %s" % (k, ("**目录命中 " + ",".join(hit) + "**") if hit else "目录不重叠", why))
+        elif hit:
+            log("   %-11s 别的盘 %s   %s" % (k, "**目录名同 " + ",".join(hit) + "**", why))
+        else:
+            log("   %-11s 不同盘  无重叠       %s" % (k, why))
+    # 各流程的 src/dst/arch 是不是同一盘(判断"这条链是不是以本盘为中转")
+    log("   -- 流程内比对 --")
+    for a, b in (("GD_SRC", "GD_ARCH"), ("GR_B_SRC", "GR_B_ARCH"), ("GR_TG_SRC", "GR_TG_DST")):
+        va, vb = pathcfg.get(a), pathcfg.get(b)
+        if va and vb:
+            log("   %s %s %s" % (a, "==" if strip_remote(va) == strip_remote(vb) else "!=", b))
 
 
 def tg_send(text):
@@ -175,11 +201,11 @@ def main():
 
     SRC_ROOT = pathcfg.require("GB_SRC_ROOT")
     DST_ROOT = pathcfg.require("GB_DST_ROOT")
-    dirs = [x.strip() for x in (a.dirs or pathcfg.require("GB_DIRS")).split(",") if x.strip()]
+    all_dirs = [x.strip() for x in (a.dirs or pathcfg.require("GB_DIRS")).split(",") if x.strip()]
     queues = {x.strip() for x in a.queue_dirs.split(",") if x.strip()}
     if a.include_queue:
         queues = set()
-    dirs = [d for d in dirs if d not in queues]
+    dirs = [d for d in all_dirs if d not in queues]
     report_path = pathcfg.get("GRC_REPORT", "")
     t0 = time.time()
 
@@ -188,7 +214,7 @@ def main():
     log("模式: %s | 删除%s进回收站" % ("真删(--apply)" if a.apply else "演练(只列表)",
                                       "" if a.use_trash else "不"))
     if a.audit:
-        audit_cross(SRC_ROOT)
+        audit_cross(SRC_ROOT, all_dirs)
 
     src_about = about(SRC_ROOT)
     if src_about:
