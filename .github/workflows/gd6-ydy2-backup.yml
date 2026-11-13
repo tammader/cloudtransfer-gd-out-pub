@@ -37,6 +37,10 @@ on:
         description: "只处理名字含该子串的文件(调试用)"
         required: false
         default: ""
+      parallel:
+        description: "并发传几个文件(1=单流)。单流实测约 0.45 MB/s, 并发用来吃满带宽"
+        required: false
+        default: "1"
 
 concurrency:
   group: gd6-ydy2-backup
@@ -132,6 +136,7 @@ jobs:
         run: |
           set -x
           ARGS="--max-files $MAX_FILES --max-total-gb $MAX_TOTAL_GB --budget-min $BUDGET_MIN"
+          ARGS="$ARGS --parallel ${{ inputs.parallel || '1' }}"
           if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; else echo "(演练模式)"; fi
           if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
           python3 tools/gd6_ydy2_backup.py $ARGS
