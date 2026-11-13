@@ -46,6 +46,16 @@ sys.path.insert(0, HERE)
 
 import pathcfg                                    # noqa: E402  路径真值: CI=Secret / 本机=paths.local.json
 
+# 冷备那条流程的 key(GT_*)单独放在第二个 Secret, 合并进来, 好做交叉核对
+_td = os.environ.get("PATHS_JSON_TD", "").strip()
+if _td:
+    try:
+        _merged = dict(pathcfg._load())
+        _merged.update(json.loads(_td))
+        pathcfg._cache = _merged
+    except Exception as e:
+        print("!! PATHS_JSON_TD 解析失败, 忽略: %s" % e, file=sys.stderr)
+
 try:
     import logmask                                # 公开仓库: 文件名/路径一律哈希化
     logmask.install()
@@ -109,6 +119,8 @@ def about(remote):
     """(总, 已用, 回收站, 剩) —— 拿不到返回 None"""
     r = rclone(["about", remote, "--json"], timeout=600)
     if r.returncode != 0:
+        log("   (about %s 失败: %s)" % (strip_remote(remote), (r.stderr or "").strip().splitlines()[-1][:120]
+                                       if (r.stderr or "").strip() else "?"))
         return None
     try:
         d = json.loads(r.stdout or "{}")
@@ -135,36 +147,57 @@ AUDIT_KEYS = [
     ("OT_ARCH", "out2->目标网盘: 归档区"),
     ("DBJM_SRC", "out2->豆瓣酱: 源"),
     ("HL_IN", "上游盘 /in"),
+    ("ID_OD_DIRS", "in-pipeline 判重**实时列**的目录(在这里=删完会被当成未归档, 可能回流重下)"),
+    ("ID_STEM_MANIFESTS", "in-pipeline 判重读的云端编号清单"),
+    ("GM_TY_TG", "gen-manifest: TG目录清单(alist 路径)"),
+    ("GM_TY_OUT", "gen-manifest: out2 清单(alist 路径)"),
+    ("GM_STEM_DIRS", "gen-manifest: 编号清单来源(alist 路径)"),
 ]
+
+
+def _entries(v):
+    """配置值可能是 'a,b,c' 这种多值 -> 拆开逐条核"""
+    return [x.strip() for x in (v or "").split(",") if x.strip()]
 
 
 def audit_cross(root, targets):
     """谁还在读/动这个源盘? 逐 key 比 remote 与目录, 只打印布尔(公开仓库日志不进真名)"""
     r_root = strip_remote(root)
     log("---- 交叉核对: 谁在动 %s 上的 %s ----" % (r_root, ",".join(targets)))
+    danger = []
     for k, why in AUDIT_KEYS:
         v = pathcfg.get(k)
         if not v:
             continue
-        if ":" in v:
-            r, p = v.split(":", 1)
-            r, p = r.strip(), p.strip("/")
-        else:                       # 没带 remote = alist 挂载路径, 只认目录是否命中
-            r, p = "(alist)", v.strip("/")
-        same_disk = (r == r_root)
-        hit = [t for t in targets if p == t or p.startswith(t + "/")]
-        if same_disk:
-            log("   %-11s 同一盘  %s   %s" % (k, ("**目录命中 " + ",".join(hit) + "**") if hit else "目录不重叠", why))
-        elif hit:
-            log("   %-11s 别的盘 %s   %s" % (k, "**目录名同 " + ",".join(hit) + "**", why))
-        else:
-            log("   %-11s 不同盘  无重叠       %s" % (k, why))
-    # 各流程的 src/dst/arch 是不是同一盘(判断"这条链是不是以本盘为中转")
-    log("   -- 流程内比对 --")
-    for a, b in (("GD_SRC", "GD_ARCH"), ("GR_B_SRC", "GR_B_ARCH"), ("GR_TG_SRC", "GR_TG_DST")):
+        for i, one in enumerate(_entries(v)):
+            name = k if len(_entries(v)) == 1 else "%s[%d]" % (k, i)
+            if ":" in one and not one.startswith("/"):
+                r, p = one.split(":", 1)
+                r, p = r.strip(), p.strip("/")
+            else:                       # 没带 remote = alist 挂载路径, 只认目录是否命中
+                r, p = "(alist)", one.strip("/")
+            same_disk = (r == r_root)
+            hit = [t for t in targets if p == t or p.startswith(t + "/")]
+            if same_disk and hit:
+                tag = "**同一盘 + 目录命中 " + ",".join(hit) + "**"
+                danger.append((name, hit))
+            elif same_disk:
+                tag = "同一盘  目录不重叠"
+            elif hit:
+                tag = "别的盘  目录名同 " + ",".join(hit)
+            else:
+                tag = "不同盘  无重叠"
+            log("   %-18s %-30s %s" % (name, tag, why))
+    log("   -- 流程内比对(只比 remote, 粗看) --")
+    for a, b in (("GD_SRC", "GD_ARCH"), ("GR_B_SRC", "GR_B_ARCH"), ("GR_TG_SRC", "GR_TG_DST"),
+                 ("GB_SRC_ROOT", "GB_DST_ROOT")):
         va, vb = pathcfg.get(a), pathcfg.get(b)
         if va and vb:
-            log("   %s %s %s" % (a, "==" if strip_remote(va) == strip_remote(vb) else "!=", b))
+            log("   %s %s %s" % (a, "同一盘" if strip_remote(va) == strip_remote(vb) else "不同盘", b))
+    if danger:
+        log("   !! 下面这些 key 指着我们要删的目录, 删之前先确认它们的角色: %s"
+            % ", ".join("%s->%s" % (n, ",".join(h)) for n, h in danger))
+    return danger
 
 
 def tg_send(text):
