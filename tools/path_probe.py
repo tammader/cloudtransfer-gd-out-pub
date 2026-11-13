@@ -65,6 +65,39 @@ CHAINS = [
 print("参照: <r:%s> = 旧盘(onedrive2)  <r:%s> = 新盘(gdrive2, gd2)  <r:%s> = 第三个远端"
       % (h8("onedrive2"), h8("gdrive2"), h8("gdrive6")))
 print("      gd2 上新建的根目录 = onedrive\n")
+
+
+def seg(v):
+    """逐段哈希: 远端/每一级目录都只给 sha1[:8], 便于本机拿候选名反查"""
+    if not v:
+        return "(未配置)"
+    out = []
+    for one in str(v).split(","):
+        s = one.strip()
+        if not s:
+            continue
+        if ":" in s and not s.startswith("/"):
+            r, p = s.split(":", 1)
+            out.append("<r:%s>:" % h8(r) + "/".join("<p:%s>" % h8(x) for x in p.split("/") if x))
+        elif s.startswith("/"):
+            out.append("<m:%s>/" % h8("/" + s.strip("/").split("/")[0])
+                       + "/".join("<p:%s>" % h8(x) for x in s.strip("/").split("/")[1:]))
+        else:
+            out.append("<r:%s>" % h8(s))
+    return ",".join(out)
+
+
+print("== DEST / 含 in2,in3 的 key(逐段哈希)")
+for k in sorted(pathcfg._load()):
+    v = pathcfg.get(k)
+    if not isinstance(v, str) or not v:
+        continue
+    if k.endswith("_DEST") or k in ("TT_COMPARE_REMOTES_LOCAL",) or "in2" in v or "in3" in v:
+        print("   %-24s %s" % (k, seg(v)))
+for k, _t in CHAINS:
+    pass
+print()
+
 for title, keys in CHAINS:
     print("== %s" % title)
     for k in keys:
