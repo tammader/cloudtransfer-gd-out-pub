@@ -25,6 +25,7 @@
 环境: ALIST_URL / ALIST_TOKEN / RCLONE_CONF_PATH / TG_TOKEN / TG_CHAT_ID
 """
 import argparse
+import concurrent.futures
 import configparser
 import io
 import json
@@ -250,6 +251,8 @@ def main():
     ap.add_argument("--max-total-gb", type=float, default=float(pathcfg.get("GY_MAX_TOTAL_GB", "50")))
     ap.add_argument("--budget-min", type=int, default=int(pathcfg.get("GY_BUDGET_MIN", "300")))
     ap.add_argument("--only", default="", help="只处理名字含该子串的文件(调试)")
+    ap.add_argument("--parallel", type=int, default=int(pathcfg.get("GY_PARALLEL", "1")),
+                    help="同时传几个文件(多文件并发)。单流实测约 0.45 MB/s, 并发用来吃满带宽")
     ap.add_argument("--no-tg", action="store_true")
     a = ap.parse_args()
 
@@ -336,40 +339,71 @@ def main():
 
     sent, sent_bytes, failed = 0, 0, []
     speeds = []
+    lock = __import__("threading").Lock()
+
+    def do_one(rel, size):
+        """一个文件的完整链路: 下载 -> alist PUT -> 回读校验。返回 (状态, 说明, 上传秒数)"""
+        lp = os.path.join(WORK, rel.replace("/", "_"))
+        remote = DST + "/" + rel
+        try:
+            r = rclone(["copyto", "%s/%s" % (SRC.rstrip("/"), rel), lp,
+                        "--retries", "3", "--low-level-retries", "10", "--stats", "0"], timeout=5400)
+            if r.returncode != 0 or not os.path.exists(lp) or os.path.getsize(lp) != size:
+                return ("fail", "下载失败/大小不符 %s" % (r.stderr or "")[:80], 0.0)
+            els = alist_put(remote, lp, size)
+            got = alist_get(remote, refresh=True)
+            if not got or got[0] != size:
+                return ("fail", "上传后校验不符(远端 %s / 本地 %s)" % (got[0] if got else "?", size), els)
+            return ("ok", "", els)
+        except Exception as e:
+            return ("fail", str(e)[:130], 0.0)
+        finally:
+            if os.path.exists(lp):
+                os.remove(lp)
+
     if a.apply:
-        for i, (rel, size) in enumerate(plan, 1):
-            if (time.time() - t0) / 60 > a.budget_min:
-                log("到时间预算, 收工(剩下下轮继续)")
-                break
-            lp = os.path.join(WORK, os.path.basename(rel))
-            remote = DST + "/" + rel
-            log("---- [%d/%d] %s (%s) ----" % (i, len(plan), rel, human(size)))
-            try:
-                r = rclone(["copyto", "%s/%s" % (SRC.rstrip("/"), rel), lp,
-                            "--retries", "3", "--low-level-retries", "10", "--stats", "0"], timeout=5400)
-                if r.returncode != 0 or not os.path.exists(lp) or os.path.getsize(lp) != size:
-                    failed.append("%s: 下载失败/大小不符 %s" % (rel, (r.stderr or "")[:80]))
-                    continue
-                els = alist_put(remote, lp, size)
-                got = alist_get(remote, refresh=True)
-                if not got or got[0] != size:
-                    failed.append("%s: 上传后校验不符(远端 %s / 本地 %s)"
-                                  % (rel, got[0] if got else "?", size))
-                    continue
-                sent += 1
-                sent_bytes += size
-                done[rel] = size
-                sp = size / max(els, 0.001) / MB
-                speeds.append(sp)
-                log("   ✓ 上传 %s 用时 %.0fs (%.1f MB/s) | 校验 OK" % (rel, els, sp))
-            except Exception as e:
-                failed.append("%s: %s" % (rel, str(e)[:120]))
-                log("   !! 失败: %s" % str(e)[:150])
-            finally:
-                if os.path.exists(lp):
-                    os.remove(lp)
-            if sent and sent % 5 == 0:
-                save_state(STATE, done)
+        log("并发数 %d (单流基线约 0.45 MB/s, 看聚合能不能近似线性)" % a.parallel)
+        pending = list(plan)
+        idx = [0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.parallel)) as ex:
+            running = {}
+
+            def submit_next():
+                if pending and (time.time() - t0) / 60 <= a.budget_min:
+                    rel, size = pending.pop(0)
+                    idx[0] += 1
+                    log("---- [%d/%d] %s (%s) 开工 ----" % (idx[0], len(plan), rel, human(size)))
+                    running[ex.submit(do_one, rel, size)] = (rel, size)
+
+            for _ in range(max(1, a.parallel)):
+                submit_next()
+            while running:
+                done_set, _ = concurrent.futures.wait(
+                    running, return_when=concurrent.futures.FIRST_COMPLETED)
+                for f in done_set:
+                    rel, size = running.pop(f)
+                    try:
+                        st, msg, els = f.result()
+                    except Exception as e:
+                        st, msg, els = "fail", str(e)[:130], 0.0
+                    if st == "ok":
+                        with lock:
+                            sent += 1
+                            sent_bytes += size
+                            done[rel] = size
+                            sp = size / max(els, 0.001) / MB
+                            speeds.append(sp)
+                        log("   ✓ %s 用时 %.0fs (%.1f MB/s) | 校验 OK" % (rel, els, sp))
+                        with lock:
+                            if sent % 5 == 0:
+                                save_state(STATE, done)
+                    else:
+                        with lock:
+                            failed.append("%s: %s" % (rel, msg))
+                        log("   !! %s 失败: %s" % (rel, msg))
+                    submit_next()
+            if (time.time() - t0) / 60 > a.budget_min and pending:
+                log("到时间预算, 收工(剩 %d 个下轮继续)" % len(pending))
     save_state(STATE, done)
 
     lines = ["# gd6:out3 -> ydy2/ycl 单向备份报告  %s  [%s]"
@@ -388,6 +422,10 @@ def main():
     if speeds:
         lines.append("单文件上传速度: 中位 %.1f MB/s | 最快 %.1f | 最慢 %.1f (n=%d)"
                      % (sorted(speeds)[len(speeds) // 2], max(speeds), min(speeds), len(speeds)))
+    if sent_bytes:
+        wall_min = max((time.time() - t0) / 60, 1e-6)
+        lines.append("聚合速率      : %.2f MB/s (并发 %d, 含下载/校验的端到端)"
+                     % (sent_bytes / (wall_min * 60) / MB, a.parallel))
     for f in failed[:40]:
         lines.append("!! %s" % f)
     if len(todo) > len(plan):
