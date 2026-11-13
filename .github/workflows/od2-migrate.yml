@@ -25,6 +25,14 @@ on:
         description: "true=打印几条搬运链的两端(远端脱敏, 目录名保留), 不写任何东西"
         required: false
         default: "false"
+      set_keys:
+        description: "要写进 PATHS_JSON 的 K=V(逗号分隔; 空=不改)"
+        required: false
+        default: ""
+      set_keys_apply:
+        description: "true=把 set_keys 真写回 Secret(默认只演练)"
+        required: false
+        default: "false"
       old_remote:
         description: "旧 rclone 远端名"
         required: false
@@ -84,6 +92,13 @@ jobs:
 
       - name: 装依赖(写 Secret 要 PyNaCl)
         run: pip install --quiet pynacl
+
+      - name: 改 PATHS_JSON 的 key(paths_set)
+        if: inputs.set_keys != ''
+        run: |
+          ARGS=$(echo "${{ inputs.set_keys }}" | tr ',' ' ')
+          if [ "${{ inputs.set_keys_apply }}" = "true" ]; then ARGS="$ARGS --apply"; fi
+          python3 tools/paths_set.py $ARGS
 
       - name: 打印搬运链两端(probe)
         if: inputs.probe == 'true'
