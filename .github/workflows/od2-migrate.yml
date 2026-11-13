@@ -78,6 +78,9 @@ jobs:
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
           echo "远端段数: $(grep -c '^\[' ~/.config/rclone/rclone.conf)"
 
+      - name: 装依赖(写 Secret 要 PyNaCl)
+        run: pip install --quiet pynacl
+
       - name: 跑迁移
         run: |
           set -x
