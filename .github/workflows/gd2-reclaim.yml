@@ -47,6 +47,7 @@ permissions:
 
 env:
   PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  PATHS_JSON_TD: ${{ secrets.PATHS_JSON_TD }}
   TG_TOKEN: ${{ secrets.TG_TOKEN }}
   TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
   LOG_MASK: "1"
