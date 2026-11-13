@@ -21,6 +21,10 @@ on:
         description: "true=只打印远端名/挂载名的脱敏探针"
         required: false
         default: "false"
+      probe:
+        description: "true=打印几条搬运链的两端(远端脱敏, 目录名保留), 不写任何东西"
+        required: false
+        default: "false"
       old_remote:
         description: "旧 rclone 远端名"
         required: false
@@ -81,7 +85,12 @@ jobs:
       - name: 装依赖(写 Secret 要 PyNaCl)
         run: pip install --quiet pynacl
 
+      - name: 打印搬运链两端(probe)
+        if: inputs.probe == 'true'
+        run: python3 tools/path_probe.py
+
       - name: 跑迁移
+        if: inputs.probe != 'true'
         run: |
           set -x
           ARGS=""
