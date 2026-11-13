@@ -12,9 +12,10 @@ name: gd6-ydy2-backup
 # 需要 Secrets: PATHS_JSON(GY_*) / RCLONE_CONF / ALIST_STORAGES_TY(含 /ydy2) / TG_TOKEN / TG_CHAT_ID
 
 on:
-  # 每 12 小时 (UTC 40 0/12 = 北京 8:40 / 20:40); 与 gd-backup(:30) 错开
+  # 每 4 小时一轮(北京 8/12/16/20/24/4 点), 单轮预算 300 分钟 -> 靠并发组串行排队 = 基本连轴转;
+  # 真正的刹车是「每日额度账本」(GY_DAILY_GB=500, 北京自然日), 到量后当天后续轮次直接空跑退出。
   schedule:
-    - cron: "40 */12 * * *"
+    - cron: "0 */4 * * *"
   workflow_dispatch:
     inputs:
       apply:
@@ -24,11 +25,11 @@ on:
       max_files:
         description: "本轮最多传几个文件"
         required: false
-        default: "200"
+        default: "240"
       max_total_gb:
-        description: "本轮总量上限(GB); 139 上传约 2~5MB/s, 默认 50"
+        description: "本轮总量上限(GB); 还会被'今日剩余额度'再卡一道"
         required: false
-        default: "50"
+        default: "100"
       budget_min:
         description: "本轮时间预算(分钟); job 硬上限 350"
         required: false
@@ -38,9 +39,9 @@ on:
         required: false
         default: ""
       parallel:
-        description: "并发传几个文件(1=单流)。单流实测约 0.45 MB/s, 并发用来吃满带宽"
+        description: "并发传几个文件; 5 并发实测聚合约 3.8~4.7 MB/s(单流只有 0.45)"
         required: false
-        default: "1"
+        default: "5"
 
 concurrency:
   group: gd6-ydy2-backup
