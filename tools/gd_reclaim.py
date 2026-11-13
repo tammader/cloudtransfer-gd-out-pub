@@ -133,6 +133,25 @@ def strip_remote(s):
     return s.split(":", 1)[0] if ":" in s else s
 
 
+def sync_dir(s_rem, t_rem, budget_min, transfers, checkers):
+    """先补镜像: 源 -> 目标 目录级 copy(--size-only, 同名同大小跳过, 目标端只增不删)。
+    跟 gd-backup 用同一套判据, 所以补完就能直接进删除判定。"""
+    args = ["copy", s_rem, t_rem, "--size-only",
+            "--transfers", str(transfers), "--checkers", str(checkers),
+            "--retries", "5", "--retries-sleep", "15s", "--low-level-retries", "10",
+            "--contimeout", "60s", "--stats", "60s", "--stats-one-line"]
+    if budget_min > 0:
+        args += ["--max-duration", "%dm" % int(budget_min)]
+    log(">>> 补镜像 %s -> %s (预算 %d 分钟)" % (s_rem, t_rem, budget_min))
+    r = rclone(args, timeout=7200)
+    tail = ((r.stdout or "").strip().splitlines() or [""])[-1][:160]
+    log("    退出码=%s%s | %s" % (r.returncode,
+                                " (max-duration 到点, 正常)" if r.returncode == 10 else "", tail))
+    if r.returncode not in (0, 10):
+        log("    !! 拷贝报错: %s" % (r.stderr or "").strip()[:200])
+    return r.returncode
+
+
 AUDIT_KEYS = [
     ("GD_SRC", "出口 gd-out2: 源(每 3 小时读 out, 处理完同盘 move 到 out2)"),
     ("GD_DST", "出口 gd-out2: 目标(中转盘 out2)"),
@@ -227,6 +246,11 @@ def main():
                     help="队列/流动目录: 默认跳过(这些没走完流程, 删了会丢料)")
     ap.add_argument("--include-queue", action="store_true", help="连队列目录一起处理(危险)")
     ap.add_argument("--use-trash", action="store_true", help="删除进回收站(默认跳过回收站)")
+    ap.add_argument("--sync", action="store_true",
+                    help="先补镜像(源->目标 rclone copy --size-only), 再按同名同大小删源")
+    ap.add_argument("--sync-budget-min", type=int, default=200, help="补镜像步骤的时间预算(分钟, 0=不限)")
+    ap.add_argument("--transfers", type=int, default=4, help="补镜像并发文件数")
+    ap.add_argument("--checkers", type=int, default=8)
     ap.add_argument("--audit", action="store_true", help="打印交叉核对")
     ap.add_argument("--max-gb", type=float, default=0.0, help="本轮最多删多少 GB(0=不限)")
     ap.add_argument("--no-tg", action="store_true", help="不发 Telegram")
@@ -255,6 +279,14 @@ def main():
             % tuple(human(x) for x in src_about))
 
     plan, leftovers, skipped, per_dir = [], [], [], []
+    sync_info = []
+    if a.sync:
+        log("---- 第 1 步: 补镜像(源 -> 目标) ----")
+        for d in dirs:
+            rc = sync_dir("%s:%s" % (SRC_ROOT, d), "%s:%s" % (DST_ROOT, d),
+                          a.sync_budget_min, a.transfers, a.checkers)
+            sync_info.append((d, rc))
+        log("---- 第 2 步: 现场重列两侧, 只删同名同字节的 ----")
     for d in dirs:
         s_rem, t_rem = "%s:%s" % (SRC_ROOT, d), "%s:%s" % (DST_ROOT, d)
         try:
@@ -364,6 +396,8 @@ def main():
              "# 源 %s -> 目标 %s | 目录: %s | 跳过队列: %s"
              % (SRC_ROOT, DST_ROOT, ",".join(dirs), ",".join(sorted(queues)) or "无"),
              "# 判据: 目标盘同名 + 字节数一致 才删; 目标为空/列不到 -> 整目录跳过"]
+    for d, rc in sync_info:
+        lines.append("补镜像 %s: 退出码 %s%s" % (d, rc, " (到时间预算, 下轮继续)" if rc == 10 else ""))
     for e in per_dir:
         lines.append("%-14s 源 %d 个 %s | 目标 %d 个 %s | 可删 %d 个 %s | 源独有 %d 个 %s"
                      % (e["d"], e["src_n"], human(e["src_b"]), e["dst_n"], human(e["dst_b"]),
