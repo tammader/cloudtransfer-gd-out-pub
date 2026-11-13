@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -77,6 +78,31 @@ def human(b):
     if not b:
         return "0 MB"
     return "%.1f MB" % (b / MB) if b < GB else "%.2f GB" % (b / GB)
+
+
+# ---------------- 进度 / 速度(给 Actions 日志看) ----------------
+# 为什么不用 \r 覆盖式进度: Actions 日志是按行抓的, \r 那行会被吞掉/覆盖, 看不到东西。
+# 所以这里所有进度都**带换行输出**, 每个文件每 GY_PROGRESS_SEC 秒报一行, 另开一个心跳线程
+# 每 GY_HB_SEC 秒报一次全局聚合速率 —— 并发跑的时候也能看清"总共在吃什么带宽"。
+SENT_LOCK = threading.Lock()
+SENT_BYTES = [0]
+SENT_T0 = [time.time()]
+STOP_HB = [False]
+
+
+def heartbeat(parallel, interval=None):
+    interval = interval or float(os.environ.get("GY_HB_SEC", "30"))
+    prev_t, prev_b = time.time(), 0
+    while not STOP_HB[0]:
+        time.sleep(interval)
+        with SENT_LOCK:
+            cur = SENT_BYTES[0]
+        now = time.time()
+        dt = max(now - prev_t, 1e-6)
+        log("[心跳] 并发 %d | 累计发出 %s | 瞬时 %.2f MB/s | 聚合 %.2f MB/s | 已用 %.1f 分钟"
+            % (parallel, human(cur), (cur - prev_b) / dt / MB,
+               cur / max(now - SENT_T0[0], 1e-6) / MB, (now - SENT_T0[0]) / 60))
+        prev_t, prev_b = now, cur
 
 
 # ---------------- alist ----------------
@@ -129,24 +155,29 @@ def alist_mkdir(path):
 
 
 class _Progress(object):
-    """给 http.client 当 body: 边发边报进度 + 算速度"""
+    """给 http.client 当 body: 边发边报进度 + 瞬时/均值速度(Actions 日志能看, 带换行)"""
 
     def __init__(self, fh, total, label):
         self.fh, self.total, self.label = fh, total, label
-        self.n, self.t0, self.last = 0, time.time(), 0.0
+        self.n, self.t0 = 0, time.time()
+        self.last, self.last_n = self.t0, 0
+        self.every = float(os.environ.get("GY_PROGRESS_SEC", "15"))
 
     def read(self, n=-1):
         b = self.fh.read(n)
         if b:
             self.n += len(b)
+            with SENT_LOCK:
+                SENT_BYTES[0] += len(b)
             now = time.time()
-            if now - self.last >= 8:
-                self.last = now
-                el = max(now - self.t0, 0.001)
-                sys.stdout.write("\r    ⬆ %s  %5.1f%%  %s/%s  %.1f MB/s   "
-                                 % (self.label, 100.0 * self.n / max(self.total, 1),
-                                    human(self.n), human(self.total), self.n / el / MB))
-                sys.stdout.flush()
+            if now - self.last >= self.every:
+                dt = max(now - self.last, 1e-6)
+                ins = (self.n - self.last_n) / dt / MB
+                avg = self.n / max(now - self.t0, 1e-6) / MB
+                self.last, self.last_n = now, self.n
+                print("    ⬆ %-30s %5.1f%%  %s/%s | 瞬时 %.2f MB/s | 均值 %.2f MB/s | %.1f 分钟"
+                      % (self.label[:30], 100.0 * self.n / max(self.total, 1),
+                         human(self.n), human(self.total), ins, avg, (now - self.t0) / 60), flush=True)
         return b
 
     @property
@@ -154,16 +185,15 @@ class _Progress(object):
         return time.time() - self.t0
 
 
-def alist_put(remote_path, local_file, size):
+def alist_put(remote_path, local_file, size, label=None):
     with open(local_file, "rb") as fh:
-        body = _Progress(fh, size, os.path.basename(remote_path)[:26])
+        body = _Progress(fh, size, label or os.path.basename(remote_path)[:30])
         req = urllib.request.Request(ALIST + "/api/fs/put", data=body, method="PUT",
                                      headers={"Authorization": TOKEN,
                                               "File-Path": urllib.parse.quote(remote_path),
                                               "Content-Type": "application/octet-stream",
                                               "Content-Length": str(size)})
         d = json.loads(OP.open(req, timeout=7200).read().decode("utf-8", "replace"))
-    sys.stdout.write("\n")
     if d.get("code") != 200:
         raise RuntimeError("上传失败: %s %s" % (d.get("code"), d.get("message")))
     return body.secs
@@ -339,7 +369,7 @@ def main():
 
     sent, sent_bytes, failed = 0, 0, []
     speeds = []
-    lock = __import__("threading").Lock()
+    lock = threading.Lock()
 
     def do_one(rel, size):
         """一个文件的完整链路: 下载 -> alist PUT -> 回读校验。返回 (状态, 说明, 上传秒数)"""
@@ -350,7 +380,8 @@ def main():
                         "--retries", "3", "--low-level-retries", "10", "--stats", "0"], timeout=5400)
             if r.returncode != 0 or not os.path.exists(lp) or os.path.getsize(lp) != size:
                 return ("fail", "下载失败/大小不符 %s" % (r.stderr or "")[:80], 0.0)
-            els = alist_put(remote, lp, size)
+            log("   ⬆ 开始上传 %s (%s)" % (rel, human(size)))
+            els = alist_put(remote, lp, size, label=rel)
             got = alist_get(remote, refresh=True)
             if not got or got[0] != size:
                 return ("fail", "上传后校验不符(远端 %s / 本地 %s)" % (got[0] if got else "?", size), els)
@@ -363,6 +394,10 @@ def main():
 
     if a.apply:
         log("并发数 %d (单流基线约 0.45 MB/s, 看聚合能不能近似线性)" % a.parallel)
+        log("进度: 每个文件每 %s 秒报一行; 全局心跳每 %s 秒一行(GY_PROGRESS_SEC / GY_HB_SEC 可调)"
+            % (os.environ.get("GY_PROGRESS_SEC", "15"), os.environ.get("GY_HB_SEC", "30")))
+        SENT_T0[0] = time.time()
+        threading.Thread(target=heartbeat, args=(a.parallel,), daemon=True).start()
         pending = list(plan)
         idx = [0]
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.parallel)) as ex:
@@ -404,7 +439,14 @@ def main():
                     submit_next()
             if (time.time() - t0) / 60 > a.budget_min and pending:
                 log("到时间预算, 收工(剩 %d 个下轮继续)" % len(pending))
+        STOP_HB[0] = True
     save_state(STATE, done)
+
+    # ---- 汇总 ----
+    if a.apply:
+        wall = max((time.time() - t0) / 60, 1e-6)
+        log("==== 本轮汇总: 成功 %d 个 / %s | 失败 %d | 耗时 %.1f 分钟 | 聚合 %.2f MB/s (并发 %d) ===="
+            % (sent, human(sent_bytes), len(failed), wall, sent_bytes / (wall * 60) / MB, a.parallel))
 
     lines = ["# gd6:out3 -> ydy2/ycl 单向备份报告  %s  [%s]"
              % (time.strftime("%Y-%m-%d %H:%M:%S"), "执行" if a.apply else "演练"),
