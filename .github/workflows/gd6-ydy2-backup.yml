@@ -52,6 +52,8 @@ permissions:
 
 env:
   PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  # 139 个人云 OpenAPI 授权: 校验+列目录优先走它(alist 的 139Yun 驱动列子目录会报 object not found)
+  YDY_AUTHORIZATION: ${{ secrets.YDY_AUTHORIZATION }}
   TG_TOKEN: ${{ secrets.TG_TOKEN }}
   TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
