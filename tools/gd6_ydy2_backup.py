@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -359,20 +360,40 @@ def save_state(path, done):
     log("   清单写回: %s" % ("OK" if r.returncode == 0 else (r.stderr or "")[:100]))
 
 
+def _sigterm(signum, frame):
+    """GitHub 到 350 分钟会 SIGTERM; 别静悄悄死掉, 先把进度摘要推出去(状态/账本已逐个落盘)。"""
+    log("!! 收到 SIGTERM(大概率是 job 350 分钟上限), 推一份进度摘要后退出")
+    try:
+        tg_send("⚠️ gd6:out3/字幕版 → ydy2/ycl 被系统中断(350 分钟上限)\n本次已完成 %d 个 / %s\n"
+                "状态/账本已落盘, 下一轮自动续" % (DONE_N[0], human(DONE_BYTES[0])))
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def tg_send(text):
     tok = os.environ.get("TG_TOKEN", "")
     chat = os.environ.get("TG_CHAT_ID", "")
     if not (tok and chat):
+        log("   !! TG 没发: 缺 TG_TOKEN/TG_CHAT_ID (token %d 字节 / chat %d 字节)"
+            % (len(tok), len(chat)))
         return False
     data = urllib.parse.urlencode({"chat_id": chat, "text": text[:3900],
                                    "disable_web_page_preview": "true"}).encode()
     try:
         req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % tok, data=data,
                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
-        json.loads(OP.open(req, timeout=60).read().decode())
-        return True
+        d = json.loads(OP.open(req, timeout=60).read().decode())
+        log("   Telegram -> ok=%s%s" % (d.get("ok"),
+                                        "" if d.get("ok") else ("  " + str(d.get("description"))[:80])))
+        return bool(d.get("ok"))
     except Exception as e:
-        log("   TG 发送失败: %s" % str(e)[:100])
+        body = ""
+        try:
+            body = e.read().decode()[:160]
+        except Exception:
+            pass
+        log("   !! Telegram 发送失败: %s %s" % (str(e)[:90], body))
         return False
 
 
@@ -612,6 +633,15 @@ def main():
         threading.Thread(target=heartbeat,
                          args=(a.parallel, GY_DAILY_GB, sum(s for _, s in plan), len(plan), daily),
                          daemon=True).start()
+        try:
+            signal.signal(signal.SIGTERM, _sigterm)
+        except Exception:
+            pass
+        if not a.no_tg:
+            tg_send("🚚 gd6:out3/字幕版 → ydy2/ycl 开跑\n计划 %d 个 / %s | 今日已用 %.2f/%.0f GB | 并发 %d\n"
+                    "(预计 %.1f 小时; 每传完 1 个都会落账)" % (
+                        len(plan), human(sum(s for _, s in plan)), daily["gb"], GY_DAILY_GB, a.parallel,
+                        sum(s for _, s in plan) / MB / PRIOR[0] / max(a.parallel, 1) / 60))
         pending = list(plan)
         idx = [0]
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.parallel)) as ex:
@@ -641,6 +671,7 @@ def main():
                             sent_bytes += size
                             done[rel] = size
                             DONE_BYTES[0] += size
+                            DONE_N[0] += 1
                             daily["gb"] += size / GB
                             sp = size / max(els, 0.001) / MB
                             speeds.append(sp)
@@ -705,9 +736,14 @@ def main():
         r = rclone(["copyto", rp, REPORT, "--retries", "3"], timeout=900)
         log("报告 -> %s: %s" % (REPORT, "OK" if r.returncode == 0 else (r.stderr or "")[:120]))
     if not a.no_tg:
-        head = "📦 gd6:out3 → ydy2/ycl %s\n源 %d 个 / %s | 本轮传 %d 个 / %s\n失败 %d"
-        tg_send(head % ("· 演练" if not a.apply else "· 已执行", len(src),
-                        human(sum(src.values())), sent, human(sent_bytes), len(failed)))
+        left = len(todo) - len(plan)
+        msg = ("📦 gd6:out3/字幕版 → ydy2/ycl  %s\n"
+               "源 %d 个 / %s | 本轮传 %d 个 / %s | 失败 %d\n"
+               "今日额度 %.2f / %.0f GB | 队列剩 %d 个 | 并发 %d")
+        tg_send(msg % ("· 演练" if not a.apply else "· 已执行", len(src), human(sum(src.values())),
+                       sent, human(sent_bytes), len(failed), daily["gb"], GY_DAILY_GB, left, a.parallel))
+        for f in failed[:3]:
+            tg_send("!! " + f[:200])
     return 0 if not failed else 1
 
 
