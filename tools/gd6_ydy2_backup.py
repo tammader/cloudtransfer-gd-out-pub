@@ -510,7 +510,11 @@ def main():
         else:
             log("!! 目标目录 %s 读不到(演练不创建; 真跑会自动 mkdir)" % DST)
 
-    src_path = (SRC.rstrip("/") + "/" + SUBDIR) if SUBDIR else SRC
+    # 源可能是 "gdrive6:out3"(带目录) 也可能是 "gdrive6:"(裸远端) —— 分别拼, 别拼成 "gdrive6/xxx"
+    if SUBDIR:
+        src_path = (SRC + SUBDIR) if SRC.endswith(":") else (SRC.rstrip("/") + "/" + SUBDIR)
+    else:
+        src_path = SRC
     if SUBDIR:
         log("范围: 只处理 %s (目标端镜像成 %s/%s/)" % (src_path, DST, SUBDIR))
     src = src_list(src_path)
