@@ -7,16 +7,6 @@
   3) 目标端已有且同名同大小的文件跳过; 整个目录都齐了就跳过这个目录
   4) 按本轮总量预算(--max-transfer-gb)挑若干个目录, 到量收工下次继续
   5) 目标端保持原目录结构: teldrive:gd2-backup/<原目录相对路径>/...
-  6) 单文件超过 --max-file-gb(默认 1.5) 的直接跳过并列进报告 —— 见下方说明
-
-为什么要有单文件上限(2026-10-30):
-  这条 Teldrive 管道实测 ~125 KiB/s, 单文件传完所需时间 = 大小 / 125KiB/s:
-      1.5 GB -> 3.4h(能完)   2 GB -> 4.7h(超预算)   3 GB -> 7.0h(永远传不完)
-  而每轮预算只有 270~330 分钟。传不完不会"下次接着传": rclone 每轮都是全新
-  copy, 半截 session 被 clear_open_sessions() 清掉, 下轮 --size-only 又不匹配,
-  于是从第 0 字节重来。更糟的是 pending 按待传量降序, 这种大文件所在目录会
-  一直排最前, 每轮把预算吃光, 小文件永远轮不到。
-  所以超限文件必须跳过并显式列出, 不能让它悄悄占着队首。
 
 为什么必须用 tgdrive/rclone fork:
   官方 rclone **没有** teldrive backend。fork 是官方版的超集, 同一个二进制
@@ -41,7 +31,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -76,25 +65,6 @@ MB = 1024 ** 2
 RCLONE = os.environ.get("RCLONE_BIN") or shutil.which("rclone") or "rclone"
 WORK = os.environ.get("GT_WORK", "/tmp/gd2teldrive")
 STAGE = os.path.join(WORK, "stage")
-
-# ---- 预算硬截止(run #41 之后加的) ----
-# _DEADLINE = t0 + budget_sec 的绝对时间戳; _rclone 每次调用都按它现算配额,
-# 这样就算调用方传了个过期的 budget_sec, 也不会让单条 rclone 超时跑飞。
-_DEADLINE = None
-# timeout 先发 SIGTERM 等这么久, 还不走就 SIGKILL
-KILL_AFTER_SEC = 60
-# ⚠️ 只当「到点之后的收尾宽限」用, **绝不要拿去封顶 rclone 的总时长**。
-# run #44 就是这么翻车的: 用 min(sec, HARD_GRACE_SEC) 封顶, 把本该跑 240 分钟的
-# 上传砍成 45 分钟, 一批 9.5GB 传 4% 就被切断, 整轮新增 0 个文件。
-# 现在它只参与 hard_stop = sec + KILL_AFTER_SEC + 30 的计算。
-HARD_GRACE_SEC = 45 * 60
-# Windows 上没有 SIGKILL(Python 只有 SIGTERM/SIGINT/SIGBREAK), CI 是 Linux 无所谓,
-# 但本机调试时不能因此崩掉 —— 缺就退回 SIGTERM。
-_SIG_HARD = getattr(signal, "SIGKILL", signal.SIGTERM)
-
-# --no-fast-list 的开关(默认 False = 用 --fast-list)。在 main() 里按参数设置,
-# lsjson() 读它。必须给个模块级默认值, 否则 lsjson 先于 main 赋值被调用会 NameError。
-_NO_FAST = False
 
 # 视频扩展名(判到「末尾」, 所以 xxx.part001.mp4 这种切分名也算)
 VIDEO_RE = re.compile(
@@ -213,38 +183,20 @@ def clear_open_sessions(limit=2000):
     return n
 
 
-def lsjson(remote, allow_missing=False, soft=False):
-    """列远端清单。
-
-    allow_missing=True 时, 目标目录还不存在不算错误(首次备份就是这种情况), 返回空清单。
-
-    soft=True 时**失败不抛 SystemExit, 而是返回 None** —— 给「收尾复核」用。
-    2026-11-02 run #47 的教训: 备份本身完全成功(3 批 / 54 个文件 / 28.62 GB),
-    上传跑满 270 分钟后立刻做收尾复核, 此时 Teldrive API 刚被 4.5 小时高频写入
-    轰炸过, /api/v1/me 直接 connection refused。旧代码在这里 raise SystemExit,
-    把一次**完全成功的备份**打成 job failure, stats.json 也没写出来,
-    于是 Telegram 收到的是"异常卡片" —— 实际数据一个没丢。
-    收尾复核只是个统计口径, 它挂了不该否定前面几小时的成果。
-    """
-    cmd = [RCLONE, "lsjson", remote, "-R", "--files-only", "--no-modtime"]
-    if not _NO_FAST:
-        cmd.append("--fast-list")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+def lsjson(remote, allow_missing=False):
+    """allow_missing=True 时, 目标目录还不存在不算错误(首次备份就是这种情况), 返回空清单"""
+    r = subprocess.run(
+        [RCLONE, "lsjson", remote, "-R", "--files-only", "--fast-list", "--no-modtime"],
+        capture_output=True, text=True)
     if r.returncode != 0:
         err = r.stderr.strip()
         if allow_missing and ("directory not found" in err or "not found" in err):
             log("目标端 %s 还不存在 -> 当作空清单(首次备份会自动创建)" % remote)
             return []
-        if soft:
-            log("!! 列目录失败(软失败, 不中断) %s: %s" % (remote, err[:300]))
-            return None
         raise SystemExit("!! 列目录失败 %s: %s" % (remote, err[:400]))
     try:
         return json.loads(r.stdout)
     except Exception as e:
-        if soft:
-            log("!! 解析 lsjson 失败(软失败, 不中断): %s" % e)
-            return None
         raise SystemExit("!! 解析 lsjson 失败: %s" % e)
 
 
@@ -285,142 +237,15 @@ def _rclone(args, budget_sec, tag):
     """跑一条 rclone(参数里已含子命令), 用 timeout 包住, 输出经 Python stdout 过脱敏。
 
     返回 rclone 退出码; 124/130 = 时间到被 timeout 收走(不算失败)。
-
-    ⚠️ 2026-11-01 run #41 的教训(288 分钟被 runner 判"lost communication"):
-
-    `timeout --signal=INT` 只是**发信号**, 不是保证结束。rclone 收 INT 后要
-    优雅收尾(写完当前分片、flush 状态、退上传 session), 在 40~50 KiB/s 的
-    Telegram 管道上, 一次 flush 就能磨十几分钟; `--kill-after=120s` 期间
-    子进程还在吐输出, 我们又在 `for line in p.stdout` 里同步读 —— 只要
-    rclone 的孙进程还握着管道, readline 就永远不返回, `p.wait()` 根本轮不到。
-    结果: 脚本自以为"到点收工", 实际卡在读取上, 一路拖到 runner 看门狗
-    把整台机器判失联。
-
-    修法两层, 缺一不可:
-      1) 外层从"信任 timeout 的秒数"改成"按 deadline 现算" —— 传进来的
-         budget_sec 可能已经是几分钟前的旧值, 每次都拿当前时间重新截断;
-      2) 读取循环改成非阻塞 + 绝对硬截止: 到点先 SIGTERM, 再 SIGKILL,
-         然后**主动关掉管道**, 不管孙进程死活都返回, 绝不把 wait() 挂在
-         一个不吐数据的管道上。
     """
-    # ---- 1) 按绝对 deadline 现算配额, 不信任调用方传的时间 ----
-    global _DEADLINE
-    sec = max(0, int(budget_sec))
-    if _DEADLINE is not None:
-        sec = min(sec, max(0, int(_DEADLINE - time.time())))
-
-    # ⚠️ 2026-11-02 run #44 的教训: 这里**不能**再按 HARD_GRACE_SEC 封顶。
-    # HARD_GRACE_SEC 的语义是「到点之后还允许拖多久收尾」, 不是「单条 rclone
-    # 最多跑多久」。我一开始写成 sec = min(sec, HARD_GRACE_SEC), 结果上传那条
-    # 本该跑 240 分钟的 rclone 被硬砍到 45 分钟(日志 "(上限 2700s)"),
-    # 一批 9.5GB 传了 4% 就"优雅收工", 整轮新增 0 个文件。
-    # 真正的时长约束只有两个: deadline(整轮预算) 和调用方传的 budget_sec。
-
-    if sec <= 0:
-        log("%s: 已到预算硬截止, 直接跳过(不启动 rclone)" % tag)
-        return 124
-
-    cmd = ["timeout", "--signal=TERM", "--kill-after=%ds" % KILL_AFTER_SEC,
-           "%ds" % sec, RCLONE] + args
-    log("%s: %s ... (上限 %ds)" % (tag, " ".join(args[:2]), sec))
-
-    # ---- 2) 硬截止用**绝对时间**算, 不能用 time.time() 再滚一遍 ----
-    # 旧写法 hard_stop = time.time() + sec + KILL_AFTER_SEC + 30 有两个毛病:
-    #   a) 双重宽限: 有 _DEADLINE 时 sec 已经是"到 deadline 还剩多少", 再加
-    #      90 秒就等于允许超出整轮预算 90 秒; 每批都多 90 秒, 攒起来可观。
-    #   b) 真正的死点不在这里(见下面的读取循环), 光算对不算数。
-    hard_stop = time.time() + sec + KILL_AFTER_SEC
-    if _DEADLINE is not None:
-        # 有整轮 deadline 时, 单条 rclone 的收尾绝不能越过它 —— 收尾宽限
-        # 只允许在"这一条自己的预算用完"后发生, 不允许把整轮拖长。
-        hard_stop = min(hard_stop, _DEADLINE + KILL_AFTER_SEC)
-
+    cmd = ["timeout", "--signal=INT", "--kill-after=120s",
+           "%ds" % max(60, int(budget_sec)), RCLONE] + args
+    log("%s: %s ..." % (tag, " ".join(args[:2])))
     p = subprocess.Popen(cmd, cwd=WORK, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, bufsize=1,
-                         start_new_session=True)
-
-    def _kill(sig):
-        try:
-            os.killpg(os.getpgid(p.pid), sig)
-        except Exception:
-            try:
-                p.send_signal(sig)
-            except Exception:
-                pass
-
-    # ---- 3) 读取循环必须**可被打断**, 否则 run #41 会重演 ----
-    # 旧写法 while True: line = p.stdout.readline() 的致命问题:
-    #   readline() 是阻塞的。rclone 只要还没死但也不吐数据(卡在 TCP 重传 /
-    #   服务端 hang 住), readline 就永远不返回, 循环里 time.time() > hard_stop
-    #   那一行**根本执行不到**, 硬截止形同虚设。
-    # 改成: 独立线程只负责 readline 塞进队列, 主线程用 queue.get(timeout=)
-    # 带超时地取。这样主线程每隔一小会儿就能醒来看一次表, 到点必定能强杀。
-    # (不用 select: Windows 的 select 不支持管道, 本机调试会直接报错。)
-    import queue as _queue
-    import threading
-
-    q = _queue.Queue()
-    _EOF = object()
-
-    def _reader():
-        try:
-            for line in p.stdout:
-                q.put(line)
-        except Exception:
-            pass
-        finally:
-            q.put(_EOF)
-
-    th = threading.Thread(target=_reader, daemon=True)
-    th.start()
-
-    hard_stopped = False
-    try:
-        while True:
-            try:
-                item = q.get(timeout=1.0)
-            except _queue.Empty:
-                # 没新输出, 但进程可能还活着 —— 这正是要检查硬截止的时刻
-                if time.time() > hard_stop:
-                    log("!! %s: 超过硬截止仍未结束(且无输出), 强杀进程组并断开管道" % tag)
-                    _kill(signal.SIGTERM)
-                    time.sleep(3)
-                    _kill(_SIG_HARD)
-                    hard_stopped = True
-                    break
-                continue
-            if item is _EOF:
-                break
-            print(item.rstrip("\n"), flush=True)
-            if time.time() > hard_stop:
-                log("!! %s: 超过硬截止仍未结束, 强杀进程组并断开管道" % tag)
-                _kill(signal.SIGTERM)
-                time.sleep(3)
-                _kill(_SIG_HARD)
-                hard_stopped = True
-                break
-    finally:
-        try:
-            p.stdout.close()
-        except Exception:
-            pass
-
-    try:
-        rc = p.wait(timeout=max(1, int(hard_stop - time.time()) + 30))
-    except subprocess.TimeoutExpired:
-        log("!! %s: wait 超时, 强杀" % tag)
-        _kill(_SIG_HARD)
-        hard_stopped = True
-        try:
-            rc = p.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            rc = 124
-    # 硬截止是我们**主动**杀掉的 —— 语义上就是"预算到点", 必须归一化成 124。
-    # 否则 p.wait() 会返回负数信号码(Linux 上是 -9/-15), 调用方 rc in (124, 130)
-    # 判不到, 把"优雅收工"当成崩溃报进 stats(budget_hit=False), Telegram 图也会标失败。
-    if hard_stopped:
-        return 124
-    return rc
+                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in p.stdout:
+        print(line.rstrip("\n"), flush=True)
+    return p.wait()
 
 
 def _download_args(a, files_from):
@@ -477,59 +302,6 @@ def _prune_empty(root):
             pass          # 非空/被占用都无所谓
 
 
-def _stage_files(root):
-    """列出 stage 里的文件: [(绝对路径, 大小, mtime)], 按 mtime 从旧到新。"""
-    out = []
-    for d, _, fs in os.walk(root):
-        for f in fs:
-            p = os.path.join(d, f)
-            try:
-                st = os.stat(p)
-            except OSError:
-                continue
-            out.append((p, st.st_size, st.st_mtime))
-    out.sort(key=lambda x: x[2])
-    return out
-
-
-def _trim_stage(a):
-    """按磁盘压力清理 stage 里上一轮留下的本地副本。
-
-    为什么不"收工就清"(2026-10-30 定论, 方案 Y):
-      run 40982196440 里 0791ebde.mkv 传到 80% 时预算到点, 旧代码把整批
-      `os.remove` 掉 —— 59 分钟的下载白做, 下轮还得从 Google Drive 重下。
-      而 Teldrive 的半截 session 本来就不可续(clear_open_sessions 会清掉),
-      所以"保留本地文件"救不回远端进度, 但能省掉一次完整重下, 而且让
-      下轮 --size-only 对已传完的文件直接跳过, 不做无意义的重复上传。
-
-    清理规则(只在真正紧张时动手):
-      * 可用磁盘 >= KEEP_LOW_GB   -> 什么都不做
-      * 否则从最旧的文件开始删, 直到可用磁盘回到 KEEP_TARGET_GB
-    这样常态下文件会留到下一轮被复用, 只有磁盘吃紧时才牺牲最旧的那批。
-    """
-    KEEP_LOW_GB = 20.0
-    KEEP_TARGET_GB = 30.0
-    free = shutil.disk_usage(WORK).free
-    if free >= KEEP_LOW_GB * GB:
-        return
-    files = _stage_files(STAGE)
-    if not files:
-        return
-    log("磁盘只剩 %s (< %.0fGB), 清理 stage 旧文件"
-        % (human(free), KEEP_LOW_GB))
-    freed = 0
-    for p, sz, _ in files:
-        if shutil.disk_usage(WORK).free >= KEEP_TARGET_GB * GB:
-            break
-        try:
-            os.remove(p)
-            freed += sz
-        except OSError:
-            pass
-    _prune_empty(STAGE)
-    log("  清掉 %s, 磁盘剩 %s" % (human(freed), human(shutil.disk_usage(WORK).free)))
-
-
 def run_staged(a, plan, budget_sec, t0):
     """落地模式主循环: 分批 下载 -> 上传 -> 删本地。返回 (退出码, 批数, 实做量)。
 
@@ -541,12 +313,6 @@ def run_staged(a, plan, budget_sec, t0):
     实际只做几十 GB, 进度永远停在 5% 附近, 看着像卡死。
     """
     os.makedirs(STAGE, exist_ok=True)
-    # 先看上一轮留下了什么: 常态下不动它(下轮直接复用), 磁盘吃紧才清旧的
-    kept = _stage_files(STAGE)
-    if kept:
-        log("stage 里有上一轮留下的 %d 个文件 / %s"
-            % (len(kept), human(sum(x[1] for x in kept))))
-    _trim_stage(a)
     todo_all = [(p, s) for _, todo, _ in plan for p, s in todo]
     deadline = t0 + budget_sec
     rc_all, n_batch, i = 0, 0, 0
@@ -610,54 +376,16 @@ def run_staged(a, plan, budget_sec, t0):
             % (n_batch, len(batch), human(acc), human(free)))
 
         # 1) 下载: 给三成剩余时间(实测 Google -> runner 比 Teldrive 写快一个量级)
-        #    本地已经有的(上一轮留下的)不再重复下载 —— 那是纯粹的时间浪费。
-        #    大小对得上才算可复用: 半截文件不能直接传, 会让 Teldrive 收到残缺数据。
-        have, miss = [], []
-        for p, s in batch:
-            full = os.path.join(STAGE, p)
-            try:
-                ok = os.path.isfile(full) and os.path.getsize(full) == s
-            except OSError:
-                ok = False
-            (have if ok else miss).append(p)
-        if have:
-            have_set = set(have)
-            have_bytes = sum(sz for p, sz in batch if p in have_set)
-            log("   本地已有 %d/%d 个完整文件, 跳过下载: %s"
-                % (len(have), len(batch), human(have_bytes)))
-        if miss:
-            with open(bf, "w", encoding="utf-8") as f:
-                for p in miss:
-                    f.write(p + "\n")
-            dl_budget = min(left * 0.35, max(300.0, acc / GB * 8))
-            rc1 = _rclone(_download_args(a, bf), dl_budget, "下载")
-            if rc1 not in (0, 124, 130):
-                log("!! 下载退出码 %d, 照旧往下传(已落地的会传, 没落地的下轮重来)" % rc1)
-        else:
-            log("   这批全部在本地, 不用下载")
+        dl_budget = min(left * 0.35, max(300.0, acc / GB * 8))
+        rc1 = _rclone(_download_args(a, bf), dl_budget, "下载")
+        if rc1 not in (0, 124, 130):
+            log("!! 下载退出码 %d, 照旧往下传(已落地的会传, 没落地的下轮重来)" % rc1)
 
         # 2) 上传 —— 只为真正落地的文件构造清单: 下载失败的那些不在里面,
         #    免得 rclone 对着不存在的源文件报 error reading source, 把退出码搞脏。
-        #
-        # ⚠️ 2026-11-02 审计: 旧写法只判 os.path.isfile(), 不判大小。下载被
-        # timeout 收走(rc1=124)时会留下**半截文件**, 半截文件也会通过 isfile(),
-        # 于是被塞进上传清单, 把残缺数据推给 Teldrive。上面 have/miss 的判定
-        # 明明用了 getsize() == s, 这里却没用 —— 同一个判据两处不一致。
-        # 现在统一成「存在 且 大小完全相等」才算落地; 半截的留到下一轮重新下载
-        # (rclone copy --size-only 会把它补齐)。
-        landed, partial = [], []
-        for p, s in batch:
-            full = os.path.join(STAGE, p)
-            try:
-                ok = os.path.isfile(full) and os.path.getsize(full) == s
-            except OSError:
-                ok = False
-            (landed if ok else partial).append(p)
-        if partial:
-            log("   有 %d 个文件未完整落地(半截/缺失), 本轮不上传: 下轮重新下载"
-                % len(partial))
+        landed = [p for p, _ in batch if os.path.isfile(os.path.join(STAGE, p))]
         if not landed:
-            log("!! 这批一个文件都没完整落地(下载全失败), 跳过上传")
+            log("!! 这批一个文件都没落地(下载全失败), 跳过上传")
             _prune_empty(STAGE)
             continue
         uf = os.path.join(WORK, "up_%03d.txt" % n_batch)
@@ -676,19 +404,21 @@ def run_staged(a, plan, budget_sec, t0):
         rc2 = _rclone(_upload_args(a, uf), left2, "上传")
         if rc2 in (124, 130):
             log("上传到点, 优雅收工(下次继续) —— 这不是失败")
-            log("本地副本全部保留(%d 个), 下轮直接复用, 不重复下载"
-                % len(batch))
             rc_all = rc2
             break
         if rc2 != 0:
             rc_all = rc2
 
-        # 3) 不再删本地副本 —— 见 _trim_stage 的说明(方案 Y, 2026-10-30)。
-        #    已传完的: 下轮 --size-only 会跳过, 不做重复上传;
-        #    没传完的: 下轮重新传, 但省掉一次从 Google Drive 的完整下载。
-        #    真正需要腾磁盘时由下次开跑的 _trim_stage 按压力统一处理。
-        log("本批完成, 本地保留 %d 个(下轮复用), 磁盘剩 %s"
-            % (len(batch), human(shutil.disk_usage(WORK).free)))
+        # 3) 清掉这批的本地副本(传成的没必要留, 没传成的下轮重下, 留着只会撑爆磁盘)
+        drop = 0
+        for p, _ in batch:
+            try:
+                os.remove(os.path.join(STAGE, p))
+                drop += 1
+            except OSError:
+                pass
+        _prune_empty(STAGE)
+        log("本地已清 %d 个, 磁盘剩 %s" % (drop, human(shutil.disk_usage(WORK).free)))
 
     return rc_all, n_batch, {"bytes": did_bytes, "files": did_files}
 
@@ -734,12 +464,6 @@ def run_stream(a, plan, budget_sec):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="不加=只演练看计划")
-    ap.add_argument("--max-file-gb", type=float, default=1.5,
-                    help="单文件大小上限(GB), 默认 1.5。超过的直接跳过并写进报告。"
-                         "依据: 实测管道 ~125KiB/s, 1.5GB 需 3.4h(能传完), "
-                         "2GB 需 4.7h(超过 270min 预算传不完), 3GB 需 7h(永远传不完)。"
-                         "超限文件每轮都会重传且必然失败, 还会占住队首吃光预算, "
-                         "所以宁可跳过。设 0 = 不限制(不推荐)")
     ap.add_argument("--max-transfer-gb", type=float, default=150.0,
                     help="本轮总量上限(GB); 实测 ~8MiB/s, 270 分钟约 130GB, 默认 150 够用")
     ap.add_argument("--budget-min", type=int, default=270,
@@ -750,19 +474,9 @@ def main():
                     help="并发文件数。求稳默认 3(Telegram 侧并发高容易 504/限流)")
     ap.add_argument("--checkers", type=int, default=8)
     ap.add_argument("--chunk-mb", type=int, default=4,
-                    help="Teldrive 分片(MB)。默认 4。"
-                         "硬上限是 Unikraft 网关: 8MiB 是请求体上限(9Mi 起 413),"
-                         "但真正的杀手是**60 秒无数据超时** —— 一片必须在 60s 内传完,"
-                         "否则边缘网关回 504、rclone 从第 0 字节重传整个文件。"
-                         "换算: 需要的最低速率 = 分片MiB * 1024 / 60 KiB/s,"
-                         "即 4Mi 需 68 KiB/s、6Mi 需 102 KiB/s、8Mi 需 136 KiB/s。"
-                         "2026-10-30 实测: 8Mi 在 ~133 KiB/s 下每个文件都死在 ~22MiB(4%%)"
-                         "反复 504, 整轮 12 个文件成 0; 同一条管道同一天改 4Mi 后"
-                         "单文件连续推进 17 分钟无一次 504。"
-                         "所以 8Mi 在这条管道上不是'临界'而是'必挂', 6Mi 只剩 1.3 倍余量"
-                         "也会抖; 4Mi 有 2 倍余量。"
-                         "注意调小不会变慢: 瓶颈是 Telegram 管道的带宽, 不是分片大小,"
-                         "4Mi 时每片只需 30s, 远没到超时, 放大分片省不到时间只增加风险。")
+                    help="Teldrive 分片(MB)。实测 Unikraft 网关单请求体上限 8MiB"
+                         " (8Mi OK / 9Mi 起 413 Request Entity Too Large), 默认 4(4MiB 片 ~22-37s, 稳过 60s 网关超时);"
+                         " 调大必炸, 调小只会更慢")
     ap.add_argument("--retries", type=int, default=5,
                     help="失败重试次数; 求稳可以调大(默认 5, 配 30s 间隔)")
     ap.add_argument("--tpslimit", type=float, default=10.0,
@@ -812,12 +526,6 @@ def main():
     # 为什么要降序: 以前是按字母序, 一个 263 GiB 的大目录排在零碎小目录后面,
     # 小目录先占满 plan 之后, 大目录因为「塞不下」被整段跳过 —— 于是每轮只啃几 GB 零头,
     # 大头永远排队等下一轮, 等于饿死。降序让大目录每轮第一个吃预算, 稳步收敛。
-    # 单文件上限: 超过 max_file_bytes 的直接跳过, 并单独记下来列进报告。
-    # 这些文件在这条管道上永远传不完(见文件头说明), 留着只会每轮重传、吃光预算、
-    # 还把 pending 排序顶到最前, 让小文件饿死。
-    max_file_bytes = int(a.max_file_gb * GB) if a.max_file_gb and a.max_file_gb > 0 else 0
-    skipped_big = []          # [(path, size)] 本轮因超限被跳过的文件
-
     pending = []
     for d in video_dirs:
         if a.only and d != a.only:
@@ -825,28 +533,10 @@ def main():
         e = video_dirs[d]
         files = e["files"] if not a.video_only else [x for x in e["files"] if is_video(x[0])]
         todo = [(p, s) for p, s in files if dst_map.get(p) != s]
-        if max_file_bytes:
-            kept = []
-            for p, s in todo:
-                if s > max_file_bytes:
-                    skipped_big.append((p, s))
-                else:
-                    kept.append((p, s))
-            todo = kept
         if not todo:
             continue                       # 这个文件夹已经全备份过了
         pending.append((d, todo, sum(s for _, s in todo)))
     pending.sort(key=lambda x: (-x[2], x[0]))
-
-    if skipped_big:
-        skipped_big.sort(key=lambda x: -x[1])
-        log("!! 单文件超过 %.2f GB 而跳过 %d 个 / %s (这段速率下传不完, 列进报告)"
-            % (a.max_file_gb, len(skipped_big),
-               human(sum(s for _, s in skipped_big))))
-        for p, s in skipped_big[:a.preview]:
-            log("   - %s (%s)" % (mask_dir(p), human(s)))
-        if len(skipped_big) > a.preview:
-            log("   ... 其余 %d 个省略" % (len(skipped_big) - a.preview))
 
     plan, planned_bytes = [], 0
     for d, todo, need in pending:
@@ -929,12 +619,6 @@ def main():
 
     # ---- 真跑 ----
     budget_sec = a.budget_min * 60
-    # 绝对硬截止: 从这里开始,_rclone 每一次调用都按它现算配额(run #41 的修法)。
-    # 注意 t0 是 main 刚进来时打的点, 它前面还有 源端列目录 / 目标端列目录 /
-    # 删空壳 / 清 session 这几步 —— 那些步骤本身也吃时间, 所以 deadline 必须
-    # 基于 t0 而不是"现在 + budget", 否则整轮总时长 = 预算 + 前面那几步。
-    global _DEADLINE
-    _DEADLINE = t0 + budget_sec
     did = {"bytes": 0, "files": 0}
     if a.no_stage:
         rc = run_stream(a, plan, budget_sec)
@@ -944,33 +628,20 @@ def main():
             % (n_batch, did["files"], human(did["bytes"])))
 
     # ---- 复核 + 报告 ----
-    # 收尾复核用 soft=True: 备份已经跑完了, 这一步只是为了算"本轮新增/还剩多少",
-    # 它挂了不能反过来否定前面的成果(run #47 就是这么被判 failure 的)。
-    dst_map2 = None
-    lst2 = lsjson(DST, allow_missing=True, soft=True)
-    if lst2 is not None:
-        dst_map2 = {}
-        for it in lst2:
-            if not it.get("IsDir"):
-                dst_map2[it["Path"]] = int(it.get("Size", 0) or 0)
-    else:
-        log("!! 收尾复核列目录失败 —— 跳过增量统计, 但备份结果不受影响")
+    dst_map2 = {}
+    for it in lsjson(DST, allow_missing=True):
+        if not it.get("IsDir"):
+            dst_map2[it["Path"]] = int(it.get("Size", 0) or 0)
 
     done_dirs, todo_left = [], []
-    if dst_map2 is None:
-        # 复核不可用: 不能假装"全部完成", 也不能假装"全部残留"。
-        # 用本批实切量如实汇报, 目录级结论留到下一轮复核时再定。
-        log("!! 复核跳过: 本轮实切 %d 个文件 / %s, 目录级完成数本轮未知"
-            % (did["files"], human(did["bytes"])))
-    else:
-        for d, todo, need in plan:
-            ok = [(p, s) for p, s in todo if dst_map2.get(p) == s]
-            miss = [(p, s) for p, s in todo if dst_map2.get(p) != s]
-            if miss:
-                todo_left.append((d, len(miss), sum(s for _, s in miss)))
-            else:
-                done_dirs.append(d)
-        log("本轮整目录完成 %d 个, 仍有残留 %d 个" % (len(done_dirs), len(todo_left)))
+    for d, todo, need in plan:
+        ok = [(p, s) for p, s in todo if dst_map2.get(p) == s]
+        miss = [(p, s) for p, s in todo if dst_map2.get(p) != s]
+        if miss:
+            todo_left.append((d, len(miss), sum(s for _, s in miss)))
+        else:
+            done_dirs.append(d)
+    log("本轮整目录完成 %d 个, 仍有残留 %d 个" % (len(done_dirs), len(todo_left)))
 
     lines = []
     lines.append("gdrive2 -> Teldrive 备份报告 (含视频文件夹)")
@@ -982,14 +653,6 @@ def main():
     lines.append("整目录完成: %d 个" % len(done_dirs))
     lines.append("仍有残留  : %d 个目录" % len(todo_left))
     lines.append("耗时      : %.1f 分钟" % ((time.time() - t0) / 60))
-    lines.append("")
-    if skipped_big:
-        lines.append("")
-        lines.append("---- 超限跳过(> %.2f GB, 当前速率下传不完) ----" % a.max_file_gb)
-        for p, s in skipped_big[:100]:
-            lines.append("%s  (%s)" % (p, human(s)))
-        if len(skipped_big) > 100:
-            lines.append("... 其余 %d 个省略" % (len(skipped_big) - 100))
     lines.append("")
     lines.append("---- 未完成明细(下次会重挑) ----")
     for d, n, s in todo_left[:300]:
@@ -1007,23 +670,15 @@ def main():
     #     真值会被当成新增(假涨); 空壳删掉后本轮没覆盖到的, 会从 lst 里消失,
     #     dst_files 反而下降(假跌)。两个假象一起把差值压到只剩 1 个。
     #   - 排除 size == 0: 本轮没传完的 0 字节壳不算"新增"。
-    #   - 复核失败(dst_map2 is None)时: 增量统计无意义, 置 None 并在 note 里写明,
-    #     让报告图显示"复核失败但已实传 X", 而不是整轮判失败。
-    if dst_map2 is None:
-        new_files, new_bytes = [], 0
-        dst_delta, lost = None, []
-        log("本轮新增 (复核失败, 无法统计); 本轮实传 %d 个 / %s"
-            % (did["files"], human(did["bytes"])))
-    else:
-        new_files = [p for p in dst_map2
-                     if dst_map2[p] > 0 and base_map.get(p, -1) != dst_map2[p]]
-        new_bytes = sum(dst_map2[p] for p in new_files)
-        # 顺带把"目标端累计"跟基准分开报, 涨跌一眼能看出来
-        dst_delta = len(dst_map2) - len(base_map)
-        lost = [p for p in base_map if p not in dst_map2]
-        log("本轮新增 %d 个 / %s; 目标端 %d -> %d (%+d); 消失 %d 个"
-            % (len(new_files), human(new_bytes), len(base_map), len(dst_map2),
-               dst_delta, len(lost)))
+    new_files = [p for p in dst_map2
+                 if dst_map2[p] > 0 and base_map.get(p, -1) != dst_map2[p]]
+    new_bytes = sum(dst_map2[p] for p in new_files)
+    # 顺带把"目标端累计"跟基准分开报, 涨跌一眼能看出来
+    dst_delta = len(dst_map2) - len(base_map)
+    lost = [p for p in base_map if p not in dst_map2]
+    log("本轮新增 %d 个 / %s; 目标端 %d -> %d (%+d); 消失 %d 个"
+        % (len(new_files), human(new_bytes), len(base_map), len(dst_map2),
+           dst_delta, len(lost)))
     dump_stats({
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "mode": ("真跑-流式" if a.no_stage else "真跑-落地"), "apply": True,
@@ -1033,16 +688,12 @@ def main():
         "plan_dirs": len(plan), "plan_bytes": planned_bytes,
         "plan_detail": [{"dir": d or "(根目录)",
                          "n": len(todo), "bytes": need} for d, todo, need in plan[:8]],
-        "dst_files": (len(dst_map2) if dst_map2 is not None else None),
-        "dst_bytes": (sum(dst_map2.values()) if dst_map2 is not None else None),
+        "dst_files": len(dst_map2), "dst_bytes": sum(dst_map2.values()),
         "base_files": len(base_map), "dst_delta": dst_delta, "lost_files": len(lost),
         "new_files": len(new_files), "new_bytes": new_bytes,
-        "review_ok": dst_map2 is not None,
         # 进度条分母: 本轮真正切进批的量, 不是 plan 的全量(2912 GB)。
         # 旧版拿 plan_bytes 当分母, 实际只做几十 GB, 进度永远停 5%。
         "run_files": did["files"], "run_bytes": did["bytes"],
-        "skipped_big": len(skipped_big),
-        "skipped_big_bytes": sum(s for _, s in skipped_big),
         "done_dirs": len(done_dirs), "left_dirs": len(todo_left),
         "left_detail": [{"dir": d or "(根目录)", "n": n, "bytes": s}
                         for d, n, s in todo_left[:8]],
@@ -1052,9 +703,6 @@ def main():
         "src": SRC, "dst": DST,
         "note": ("时间预算到点, 优雅收工(下次继续)" if rc in (124, 130)
                  else ("rclone 退出码 %d" % rc if rc != 0 else "")),
-        "review_note": ("" if dst_map2 is not None
-                        else "收尾复核列目录失败, 增量统计缺失; 本轮实传 %d 个 / %s"
-                             % (did["files"], human(did["bytes"]))),
     })
 
 
