@@ -1,0 +1,172 @@
+name: gd6-ydy2-tgvideo
+
+# gd6:TelegramVideos -> ydy2/TelegramVideos 单向备份(增量, 源端只读)
+#
+# 和 gd6-ydy2-backup(字幕版) 同一个脚本, 只靠环境变量换源/目标/账本 ——
+#   GY_SRC=gdrive6 + GY_SRC_SUBDIR=TelegramVideos  ->  源 = gdrive6:TelegramVideos
+#   GY_DST_DIR=/ydy2                               ->  目标 = /ydy2/TelegramVideos/<文件>
+# Telegram 视频现在由 tamd258/telegram-video-uploader 直投 gd6:TelegramVideos(每 6h),
+# 这条负责把它们再冷备一份到移动个人云。
+#
+#   * 源 = rclone 远端 gd6:out3 (GoogleDrive6 的归档区); 目标 = runner 里 OpenList 挂的 /ydy2/ycl
+#   * 上传走 alist 原生 PUT /api/fs/put (File-Path 头 + 原始 body) —— 跟 ty-upload-test /
+#     out2-ty-sync / od2-dbjm 同一套已验证实现; 上传后 POST /api/fs/get 校验字节数
+#   * 单向: 源端只读不删; 目标端只新增, 同名同字节跳过, 同名不同字节记冲突**绝不覆盖**
+#   * 增量: alist 实时列(refresh 穿透 30 分钟缓存) + 报告区的已完成清单兜底
+#   * 手动触发默认演练(apply=false); schedule 触发自动真跑
+#
+# 需要 Secrets: PATHS_JSON(GY_*) / RCLONE_CONF / ALIST_STORAGES_TY(含 /ydy2) / TG_TOKEN / TG_CHAT_ID
+
+on:
+  # 每 4 小时一轮(北京 8/12/16/20/24/4 点), 单轮预算 300 分钟 -> 靠并发组串行排队 = 基本连轴转;
+  # 真正的刹车是「每日额度账本」(GY_DAILY_GB=500, 北京自然日), 到量后当天后续轮次直接空跑退出。
+  schedule:
+    - cron: "15 */4 * * *"   # 与字幕版(:00)错开
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true=真传; false=只演练(默认)"
+        required: false
+        default: "false"
+      max_files:
+        description: "本轮最多传几个文件"
+        required: false
+        default: "240"
+      max_total_gb:
+        description: "本轮总量上限(GB); 还会被'今日剩余额度'再卡一道"
+        required: false
+        default: "100"
+      budget_min:
+        description: "本轮时间预算(分钟); job 硬上限 350"
+        required: false
+        default: "300"
+      only:
+        description: "只处理名字含该子串的文件(调试用)"
+        required: false
+        default: ""
+      parallel:
+        description: "并发传几个文件; 1=单线程(默认, 你定的)"
+        required: false
+        default: "1"
+
+concurrency:
+  group: gd6-ydy2-tgvideo
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PATHS_JSON: ${{ secrets.PATHS_JSON }}
+  # 流程标识(同脚本跑多条链): 字幕版
+  GY_FLOW: "tgv"
+  GY_LABEL: "gd6:TelegramVideos → ydy2/TelegramVideos"
+  # ---- 本条链的源/目标/账本(覆盖 PATHS_JSON 里的同名键) ----
+  GY_SRC: "gdrive6"
+  GY_SRC_SUBDIR: "TelegramVideos"
+  GY_DST_DIR: "/ydy2"
+  GY_STATE: "gdrive2:onedrive/dbqd/gd6_tgvideo_done.tsv"
+  GY_REPORT: "gdrive2:onedrive/dbqd/gd6_tgvideo_report.txt"
+  GY_DAILY: "gdrive2:onedrive/dbqd/gd6_tgvideo_daily.json"
+  GY_DAILY_GB: "500"
+  GY_MAX_FILES: "240"
+  GY_MAX_TOTAL_GB: "100"
+  GY_MAX_FILE_MB: "4096"
+  GY_VIDEO_ONLY: "0"
+  # 139 个人云 OpenAPI 授权: 校验+列目录优先走它(alist 的 139Yun 驱动列子目录会报 object not found)
+  YDY_AUTHORIZATION: ${{ secrets.YDY_AUTHORIZATION }}
+  TG_TOKEN: ${{ secrets.TG_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+
+      - name: 装 rclone
+        run: |
+          curl -s https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/r.zip
+          unzip -q -o /tmp/r.zip -d /tmp
+          cp /tmp/rclone-*/rclone /usr/local/bin/
+          rclone version | head -1
+          df -h / | tail -1
+
+      - name: 装 OpenList(挂 /ydy2)
+        run: |
+          V="${{ inputs.openlist_version || 'v4.2.6' }}"
+          curl -sL "https://github.com/OpenListTeam/OpenList/releases/download/$V/openlist-linux-amd64.tar.gz" -o /tmp/ol.tar.gz
+          mkdir -p /opt/openlist && tar -xzf /tmp/ol.tar.gz -C /opt/openlist
+          chmod +x /opt/openlist/openlist
+          /opt/openlist/openlist version 2>&1 | head -3 || true
+
+      - name: 初始化 OpenList(设管理员密码)
+        run: |
+          cd /opt/openlist
+          PW="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          echo "ALIST_PW=$PW" >> $GITHUB_ENV
+          ./openlist admin set "$PW" --data /opt/openlist/data 2>&1 | tail -3
+
+      - name: 启动 OpenList
+        run: |
+          cd /opt/openlist
+          nohup ./openlist server --data /opt/openlist/data > /opt/openlist/alist.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -s -m 3 http://127.0.0.1:5244/api/public/settings >/dev/null; then echo "alist 已就绪 (第 ${i} 次探测)"; break; fi
+            sleep 2
+          done
+
+      - name: 灌入存储配置(含 /ydy2)
+        env:
+          ALIST_STORAGES_TY: ${{ secrets.ALIST_STORAGES_TY }}
+        run: |
+          printf '%s' "$ALIST_STORAGES_TY" > /tmp/storages.json
+          echo "存储定义大小: $(wc -c < /tmp/storages.json) 字节"
+          python3 tools/alist_bootstrap.py --data-dir /opt/openlist/data \
+            --password "$ALIST_PW" --storages-file /tmp/storages.json --emit-env
+          if [ "$(grep -c ALIST_TOKEN $GITHUB_ENV 2>/dev/null || echo 0)" = "0" ]; then
+            echo "== 直写数据库的路子, 重启 alist 再登录 =="
+            pkill -f 'openlist server' || true
+            sleep 3
+            cd /opt/openlist && nohup ./openlist server --data /opt/openlist/data >> /opt/openlist/alist.log 2>&1 &
+            sleep 5
+            python3 tools/alist_bootstrap.py --login-only --password "$ALIST_PW" --emit-env
+          fi
+
+      - name: 确认 /ydy2 挂上了
+        run: |
+          curl -s -X POST http://127.0.0.1:5244/api/fs/list \
+            -H "Authorization: $ALIST_TOKEN" -H "Content-Type: application/json" \
+            -d '{"path":"/ydy2","page":1,"per_page":0,"refresh":false}' \
+            | head -c 300; echo
+
+      - name: 写 rclone 配置
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: 跑备份 gd6:out3 -> ydy2/ycl
+        env:
+          APPLY: ${{ inputs.apply || 'true' }}
+          MAX_FILES: ${{ inputs.max_files || '200' }}
+          MAX_TOTAL_GB: ${{ inputs.max_total_gb || '50' }}
+          BUDGET_MIN: ${{ inputs.budget_min || '300' }}
+          ONLY: ${{ inputs.only || '' }}
+          ALIST_URL: "http://127.0.0.1:5244"
+        run: |
+          set -x
+          ARGS="--max-files $MAX_FILES --max-total-gb $MAX_TOTAL_GB --budget-min $BUDGET_MIN"
+          ARGS="$ARGS --parallel ${{ inputs.parallel || '1' }}"
+          if [ "$APPLY" = "true" ]; then ARGS="$ARGS --apply"; else echo "(演练模式)"; fi
+          if [ -n "$ONLY" ]; then ARGS="$ARGS --only $ONLY"; fi
+          python3 tools/gd6_ydy2_backup.py $ARGS
+
+      - name: 收尾(盘/日志)
+        if: always()
+        run: |
+          df -h / | tail -1
+          tail -5 /opt/openlist/alist.log 2>/dev/null || true
