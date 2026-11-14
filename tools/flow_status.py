@@ -62,8 +62,9 @@ WATCH = [
     ("tammader/cloudtransfer-gd-out-pub", "out2-ty-sync.yml", "out2-ty-sync", 3, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "od2-tg-gd2.yml", "od2-tg-gd2", 6, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "gd-backup.yml", "gd-backup", 12, "A"),
-    # gd6:out3 -> ydy2/ycl 单向备份(2026-11-13 新增): 公开仓库, 每 12h
-    ("tammader/cloudtransfer-gd-out-pub", "gd6-ydy2-backup.yml", "gd6-ydy2-backup", 12, "A"),
+    # gd6 -> ydy2 单向备份(2026-11-13/14 新增): 公开仓库, 每 4h
+    ("tammader/cloudtransfer-gd-out-pub", "gd6-ydy2-backup.yml", "gd6-ydy2-backup", 4, "A"),
+    ("tammader/cloudtransfer-gd-out-pub", "gd6-ydy2-tgvideo.yml", "gd6-ydy2-tgvideo", 4, "A"),
     # teldrive 冷备两条(2026-10-20 纳入总览): 都跑在公开仓库, 周期 6h
     ("tammader/cloudtransfer-gd-out-pub", "yd2-teldrive.yml", "yd2-teldrive", 6, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "gd2-teldrive.yml", "gd2-teldrive", 6, "A"),
@@ -112,6 +113,7 @@ DESC_DEFAULT = {
     "yd2-teldrive": "移动云盘 → teldrive 冷备",
     "gd2-teldrive": "gdrive2 → teldrive 冷备",
     "gd6-ydy2-backup": "gd6 归档区 → 移动个人云 单向备份",
+    "gd6-ydy2-tgvideo": "gd6 的 Telegram 视频 → 移动个人云 单向备份",
 }
 
 
@@ -126,6 +128,7 @@ ADVICE_DEFAULT = {
     "yd2-teldrive": ("移动云盘/家庭云的冷备停了", "看 run 日志里的 401/504；先确认 139 token 是否过期"),
     "gd2-teldrive": ("gdrive2 的冷备停了", "看 run 日志里的 409/504；确认 teldrive 实例是否正常"),
     "gd6-ydy2-backup": ("gd6→移动个人云的备份停了", "看日志: alist PUT 401/403 多半是 139 授权过期(约 30 天一轮)"),
+    "gd6-ydy2-tgvideo": ("Telegram 视频的冷备停了", "看日志: 139 授权过期 或 上游 telegram-video-uploader 没在投"),
 }
 
 # ---- 网盘容量区 ----
