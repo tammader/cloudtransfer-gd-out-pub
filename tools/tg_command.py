@@ -82,6 +82,7 @@ def cmd_help():
             "/status —— 立即查一遍当前状态\n"
             "/javdb —— JavDB 评论区 magnet/ed2k 报告（带重跑按钮）\n"
             "/offline —— JavDB 离线→下载→传gd6 流程进度（带触发按钮）\n"
+            "/gdy2 —— gd6→ydy2 两条备份（字幕版 / TelegramVideos）进度（带触发按钮）\n"
             "/run <流程> [k=v ...] —— 触发, 例:\n"
             "    /run gd-out2\n"
             "    /run gd-out2 only=AGMX-050 apply=true\n"
@@ -201,6 +202,33 @@ def cmd_offline():
     return "❌ 发送失败：%s" % str(d.get("err", ""))[:180]
 
 
+def _gdy2_info(flow):
+    """(显示名, workflow 文件, 说明)"""
+    if flow == "tgv":
+        return ("gd6:TelegramVideos → ydy2/TelegramVideos", "gd6-ydy2-tgvideo.yml",
+                "Telegram 视频直投 gd6 后, 再单向备份到移动个人云")
+    return ("gd6:out3/字幕版 → ydy2/ycl", "gd6-ydy2-backup.yml",
+            "字幕版整片备份到移动个人云")
+
+
+def cmd_gdy2(flow="subt"):
+    """gd6 → ydy2 两条备份的进度(带快捷按钮)"""
+    name, wf, why = _gdy2_info(flow)
+    repo = os.environ.get("GDY2_REPO", "tammader/cloudtransfer-gd-out-pub")
+    tok = tokens().get("A") or os.environ.get("GH_TOKEN", "")
+    st, d = gh_api("GET", "/repos/%s/actions/workflows/%s/runs?per_page=1" % (repo, wf), tok)
+    lines = ["📦 %s" % name, why]
+    if st == 200 and (d.get("workflow_runs") or []):
+        r = d["workflow_runs"][0]
+        concl = r.get("conclusion") or r.get("status")
+        lines.append("最近一轮: %s (%s)" % (concl, (r.get("created_at") or "")[:16].replace("T", " ")))
+        lines.append(r.get("html_url") or "")
+    else:
+        lines.append("(还没跑过 / 查不到运行记录)")
+    lines.append("\n点下面按钮可以就地触发或刷新")
+    return "\n".join(lines)
+
+
 def tg_answer_cb(cb_id, text=""):
     fs.tg_call("answerCallbackQuery", {"callback_query_id": cb_id, "text": text[:180]})
 
@@ -225,6 +253,25 @@ def handle_callback(cb):
             if st2 == 200 and (d2.get("workflow_runs") or []):
                 url = d2["workflow_runs"][0].get("html_url") or ""
             return "⚡ 已触发离线+搬运流程（每天各盘30额度，自动跑批次）\n%s" % url
+        return "❌ 触发失败(%s)：%s" % (st, str(d.get("_err", ""))[:180])
+    if data in ("gdy2_subt_refresh", "gdy2_tgv_refresh"):
+        flow = "subt" if "subt" in data else "tgv"
+        return cmd_gdy2(flow)
+    if data in ("gdy2_subt_rerun", "gdy2_tgv_rerun"):
+        flow = "subt" if "subt" in data else "tgv"
+        repo = os.environ.get("GDY2_REPO", "tammader/cloudtransfer-gd-out-pub")
+        wf = "gd6-ydy2-backup.yml" if flow == "subt" else "gd6-ydy2-tgvideo.yml"
+        tok = tokens().get("A") or os.environ.get("GH_TOKEN", "")
+        st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (repo, wf), tok,
+                       {"ref": "main", "inputs": {"apply": "true"}})
+        if st in (204, 200, 201):
+            time.sleep(6)
+            st2, d2 = gh_api("GET", "/repos/%s/actions/workflows/%s/runs?per_page=1" % (repo, wf), tok)
+            url = ""
+            if st2 == 200 and (d2.get("workflow_runs") or []):
+                url = d2["workflow_runs"][0].get("html_url") or ""
+            return ("⚡ 已触发 %s 备份（真传一轮）\n%s"
+                    % ("字幕版" if flow == "subt" else "TelegramVideos", url))
         return "❌ 触发失败(%s)：%s" % (st, str(d.get("_err", ""))[:180])
     if data == "javdb_rerun":
         # 触发 javdb-comment-links workflow（如果已在 WATCH，或按仓库/文件名直接触发）
@@ -260,6 +307,12 @@ def handle(text):
     if c in ("/javdb", "/报告"):
         tg_send("⏳ 正在生成 JavDB 报告…")
         return cmd_javdb()
+    if c in ("/gdy2", "/备份"):
+        tg_send("⏳ 正在查 gd6→ydy2 备份进度…")
+        return cmd_gdy2("subt")
+    if c in ("/gdy2t", "/tgvideo"):
+        tg_send("⏳ 正在查 TelegramVideos 备份进度…")
+        return cmd_gdy2("tgv")
     if c in ("/offline", "/离线"):
         tg_send("⏳ 正在查离线流程进度…")
         return cmd_offline()
