@@ -630,7 +630,11 @@ def main():
         lp = os.path.join(WORK, rel.replace("/", "_"))
         remote = DST + "/" + rel
         try:
-            r = rclone(["copyto", "%s/%s" % (SRC.rstrip("/"), rel), lp,
+            # 源路径: rel 里已拼了 SUBDIR 前缀, 必须用 src_path(含冒号/子目录) 且剥掉前缀。
+            # 旧写法 SRC.rstrip("/") + "/" + rel 在 SUBDIR 非空时会拼成
+            # "gdrive6/TelegramVideos/x.mp4"(缺冒号) -> rclone 当本地路径 -> 下载必失败。
+            _rel_src = rel[len(SUBDIR) + 1:] if (SUBDIR and rel.startswith(SUBDIR + "/")) else rel
+            r = rclone(["copyto", "%s/%s" % (src_path.rstrip("/"), _rel_src), lp,
                         "--retries", "3", "--low-level-retries", "10", "--stats", "0"], timeout=5400)
             if r.returncode != 0 or not os.path.exists(lp) or os.path.getsize(lp) != size:
                 return ("fail", "下载失败/大小不符 %s" % (r.stderr or "")[:80], 0.0)
