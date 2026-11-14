@@ -8,7 +8,7 @@ name: gd6-ydy2-tgvideo
 # Telegram 视频现在由 tamd258/telegram-video-uploader 直投 gd6:TelegramVideos(每 6h),
 # 这条负责把它们再冷备一份到移动个人云。
 #
-#   * 源 = rclone 远端 gd6:out3 (GoogleDrive6 的归档区); 目标 = runner 里 OpenList 挂的 /ydy2/ycl
+#   * 源 = rclone 远端 gd6:TelegramVideos; 目标 = runner 里 OpenList 挂的 /ydy2/TelegramVideos
 #   * 上传走 alist 原生 PUT /api/fs/put (File-Path 头 + 原始 body) —— 跟 ty-upload-test /
 #     out2-ty-sync / od2-dbjm 同一套已验证实现; 上传后 POST /api/fs/get 校验字节数
 #   * 单向: 源端只读不删; 目标端只新增, 同名同字节跳过, 同名不同字节记冲突**绝不覆盖**
@@ -149,7 +149,7 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
 
-      - name: 跑备份 gd6:out3 -> ydy2/ycl
+      - name: 跑备份 gd6:TelegramVideos -> ydy2
         env:
           APPLY: ${{ inputs.apply || 'true' }}
           MAX_FILES: ${{ inputs.max_files || '200' }}
