@@ -16,6 +16,14 @@ on:
         description: "分片大小(MiB), 8=绕开 Unikraft 边缘 8MiB 上限"
         required: false
         default: "8"
+      host:
+        description: "覆盖 TELDRIVE_API_HOST(留空=用 Secret); 换 metro 对比时填新实例域名"
+        required: false
+        default: ""
+      api_key:
+        description: "覆盖 TELDRIVE_API_KEY(留空=用 Secret)"
+        required: false
+        default: ""
       cleanup:
         description: "true=只清空 teldrive:probe 目录(不传文件)"
         required: false
@@ -44,8 +52,8 @@ jobs:
 
       - name: 配 teldrive 远端 + 连通性自检
         env:
-          TELDRIVE_API_KEY: ${{ secrets.TELDRIVE_API_KEY }}
-          TELDRIVE_API_HOST: ${{ secrets.TELDRIVE_API_HOST }}
+          TELDRIVE_API_KEY: ${{ inputs.api_key || secrets.TELDRIVE_API_KEY }}
+          TELDRIVE_API_HOST: ${{ inputs.host || secrets.TELDRIVE_API_HOST }}
         run: |
           set -euo pipefail
           echo "HOST=[$TELDRIVE_API_HOST]"
