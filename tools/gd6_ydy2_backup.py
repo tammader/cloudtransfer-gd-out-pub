@@ -510,9 +510,14 @@ def main():
         else:
             log("!! 目标目录 %s 读不到(演练不创建; 真跑会自动 mkdir)" % DST)
 
-    # 源可能是 "gdrive6:out3"(带目录) 也可能是 "gdrive6:"(裸远端) —— 分别拼, 别拼成 "gdrive6/xxx"
+    # 源的三种写法都要认: "gdrive6:"(裸远端) / "gdrive6"(裸远端名) / "gdrive6:out3"(带目录)
     if SUBDIR:
-        src_path = (SRC + SUBDIR) if SRC.endswith(":") else (SRC.rstrip("/") + "/" + SUBDIR)
+        if SRC.endswith(":"):
+            src_path = SRC + SUBDIR
+        elif ":" in SRC:
+            src_path = SRC.rstrip("/") + "/" + SUBDIR
+        else:
+            src_path = SRC + ":" + SUBDIR
     else:
         src_path = SRC
     if SUBDIR:
