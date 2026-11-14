@@ -13,9 +13,9 @@ on:
         required: false
         default: "5"
       chunk_mb:
-        description: "分片大小(MiB), 8=绕开 Unikraft 边缘 8MiB 上限"
+        description: "分片大小(MiB), 默认 4: 一片必须在网关 60s 超时内传完, 速率低时 8Mi 必超时"
         required: false
-        default: "8"
+        default: "4"
       host:
         description: "覆盖 TELDRIVE_API_HOST(留空=用 Secret); 换 metro 对比时填新实例域名"
         required: false
