@@ -364,22 +364,33 @@ def _sigterm(signum, frame):
     """GitHub 到 350 分钟会 SIGTERM; 别静悄悄死掉, 先把进度摘要推出去(状态/账本已逐个落盘)。"""
     log("!! 收到 SIGTERM(大概率是 job 350 分钟上限), 推一份进度摘要后退出")
     try:
-        tg_send("⚠️ gd6:out3/字幕版 → ydy2/ycl 被系统中断(350 分钟上限)\n本次已完成 %d 个 / %s\n"
-                "状态/账本已落盘, 下一轮自动续" % (DONE_N[0], human(DONE_BYTES[0])))
+        tg_send("⚠️ %s 被系统中断(job 时间上限)\n本次已完成 %d 个 / %s\n状态/账本已落盘, 下一轮自动续"
+                % (LABEL[0], DONE_N[0], human(DONE_BYTES[0])), markup=tg_buttons(FLOW[0]))
     except Exception:
         pass
     os._exit(0)
 
 
-def tg_send(text):
+def tg_buttons(flow):
+    """快捷方式(和 tg_offline_report 一样): 两个 inline 按钮, 回调由 tools/tg_command.py 接。
+    回调命名: gdy2_<flow>_rerun / gdy2_<flow>_refresh   (flow = subt=字幕版 / tgv=TelegramVideos)"""
+    return {"inline_keyboard": [[
+        {"text": "⚡ 立即跑一轮", "callback_data": "gdy2_%s_rerun" % flow},
+        {"text": "🔄 刷新状态", "callback_data": "gdy2_%s_refresh" % flow},
+    ]]}
+
+
+def tg_send(text, markup=None):
     tok = os.environ.get("TG_TOKEN", "")
     chat = os.environ.get("TG_CHAT_ID", "")
     if not (tok and chat):
         log("   !! TG 没发: 缺 TG_TOKEN/TG_CHAT_ID (token %d 字节 / chat %d 字节)"
             % (len(tok), len(chat)))
         return False
-    data = urllib.parse.urlencode({"chat_id": chat, "text": text[:3900],
-                                   "disable_web_page_preview": "true"}).encode()
+    payload = {"chat_id": chat, "text": text[:3900], "disable_web_page_preview": "true"}
+    if markup:
+        payload["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    data = urllib.parse.urlencode(payload).encode()
     try:
         req = urllib.request.Request("https://api.telegram.org/bot%s/sendMessage" % tok, data=data,
                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -395,6 +406,11 @@ def tg_send(text):
             pass
         log("   !! Telegram 发送失败: %s %s" % (str(e)[:90], body))
         return False
+
+
+# 流程标识: 同一个脚本跑多条链(字幕版 / TelegramVideos), 靠 GY_FLOW + GY_LABEL 区分
+FLOW = ["subt"]
+LABEL = ["gd6:out3/字幕版 → ydy2/ycl"]
 
 
 # ---------------- 每日额度账本(北京自然日) ----------------
@@ -460,6 +476,8 @@ def main():
     STATE = pathcfg.get("GY_STATE", "")
     GY_DAILY = pathcfg.get("GY_DAILY", "")
     GY_DAILY_GB = float(pathcfg.get("GY_DAILY_GB", "500"))
+    FLOW[0] = pathcfg.get("GY_FLOW", "subt")
+    LABEL[0] = pathcfg.get("GY_LABEL", "gd6:out3/字幕版 → ydy2/ycl")
     t0 = time.time()
     os.makedirs(WORK, exist_ok=True)
 
@@ -638,10 +656,11 @@ def main():
         except Exception:
             pass
         if not a.no_tg:
-            tg_send("🚚 gd6:out3/字幕版 → ydy2/ycl 开跑\n计划 %d 个 / %s | 今日已用 %.2f/%.0f GB | 并发 %d\n"
+            tg_send("🚚 %s 开跑\n计划 %d 个 / %s | 今日已用 %.2f/%.0f GB | 并发 %d\n"
                     "(预计 %.1f 小时; 每传完 1 个都会落账)" % (
-                        len(plan), human(sum(s for _, s in plan)), daily["gb"], GY_DAILY_GB, a.parallel,
-                        sum(s for _, s in plan) / MB / PRIOR[0] / max(a.parallel, 1) / 60))
+                        LABEL[0], len(plan), human(sum(s for _, s in plan)), daily["gb"], GY_DAILY_GB,
+                        a.parallel, sum(s for _, s in plan) / MB / PRIOR[0] / max(a.parallel, 1) / 60),
+                    markup=tg_buttons(FLOW[0]))
         pending = list(plan)
         idx = [0]
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.parallel)) as ex:
@@ -737,13 +756,15 @@ def main():
         log("报告 -> %s: %s" % (REPORT, "OK" if r.returncode == 0 else (r.stderr or "")[:120]))
     if not a.no_tg:
         left = len(todo) - len(plan)
-        msg = ("📦 gd6:out3/字幕版 → ydy2/ycl  %s\n"
+        msg = ("📦 %s  %s\n"
                "源 %d 个 / %s | 本轮传 %d 个 / %s | 失败 %d\n"
                "今日额度 %.2f / %.0f GB | 队列剩 %d 个 | 并发 %d")
-        tg_send(msg % ("· 演练" if not a.apply else "· 已执行", len(src), human(sum(src.values())),
-                       sent, human(sent_bytes), len(failed), daily["gb"], GY_DAILY_GB, left, a.parallel))
+        tg_send(msg % (LABEL[0], "· 演练" if not a.apply else "· 已执行", len(src),
+                       human(sum(src.values())), sent, human(sent_bytes), len(failed),
+                       daily["gb"], GY_DAILY_GB, left, a.parallel),
+                markup=tg_buttons(FLOW[0]))
         for f in failed[:3]:
-            tg_send("!! " + f[:200])
+            tg_send("!! " + f[:200], markup=tg_buttons(FLOW[0]))
     return 0 if not failed else 1
 
 
