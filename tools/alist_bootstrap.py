@@ -185,7 +185,8 @@ def main():
     for st in storages:
         try:
             d = api("POST", "/api/fs/list",
-                    {"path": st["mount_path"], "page": 1, "per_page": 0, "refresh": True})
+                    {"path": st["mount_path"], "page": 1, "per_page": 0, "refresh": True},
+                    token=token)
             n = len((d.get("data") or {}).get("content") or [])
             print("   挂载点 %s: %d 个条目 %s"
                   % (st["mount_path"], n, "OK" if d.get("code") == 200 else d.get("message")))
@@ -197,7 +198,8 @@ def main():
     if vm:
         try:
             d = api("POST", "/api/fs/list",
-                    {"path": vm, "page": 1, "per_page": 0, "refresh": True})
+                    {"path": vm, "page": 1, "per_page": 0, "refresh": True},
+                    token=token)
             got = (d.get("data") or {}).get("content") or []
             print("[验证] 挂载点 -> %d 个条目 (code=%s)" % (len(got), d.get("code")))
         except Exception as e:
