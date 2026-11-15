@@ -24,6 +24,8 @@
 可选(有默认值): GY_MAX_FILE_MB=2048 GY_MAX_FILES=200 GY_MAX_TOTAL_GB=50 GY_BUDGET_MIN=300
   GY_VIDEO_ONLY=1   只备份视频(按扩展名), 非视频一律跳过
   GY_FLAT=1         目标端压平: 不建任何子目录, 所有文件直接落在 GY_DST_DIR 下
+  GY_TOP_ONLY=1     源端只取根目录文件, 任何子目录(如 字幕版/)里的文件一律不备份
+  GY_SRC_SUBDIR=-   写成 "-" 表示源端根目录(用于显式压掉 PATHS_JSON 里的同名键)
   GY_SKIP_SUBDIR=a,b 源端整体跳过的子目录前缀(逗号分隔)
 环境: ALIST_URL / ALIST_TOKEN / RCLONE_CONF_PATH / TG_TOKEN / TG_CHAT_ID
 """
@@ -512,8 +514,11 @@ def main():
     DST = pathcfg.require("GY_DST_DIR").rstrip("/")
     # 只备份这个子目录; 目标端按同名目录镜像。用 cfg_raw: 空串 = 显式清空(PATHS_JSON 里可能有值)
     SUBDIR = cfg_raw("GY_SRC_SUBDIR", "").strip("/")
+    if SUBDIR in ("-", "."):
+        SUBDIR = ""            # 显式要根目录: 压掉 PATHS_JSON 里的同名键
     VIDEO_ONLY = cfg_raw("GY_VIDEO_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
     FLAT = cfg_raw("GY_FLAT", "0").strip().lower() in ("1", "true", "yes", "on")
+    TOP_ONLY = cfg_raw("GY_TOP_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
     SKIP_SUBDIRS = [s.strip().strip("/") for s in
                     (cfg_raw("GY_SKIP_SUBDIR", "") or "").split(",") if s.strip().strip("/")]
     _mount, _, DST_INNER = DST.strip("/").partition("/")      # /ydy2/ycl -> 挂载名 ydy2 + 内路径 ycl
@@ -573,6 +578,10 @@ def main():
     src = src_list(src_path)
     if SUBDIR:                                                 # 把子目录名拼进相对路径 -> 目标端保持同名目录
         src = {SUBDIR + "/" + k: v for k, v in src.items()}
+    if TOP_ONLY:
+        _before = len(src)
+        src = {k: v for k, v in src.items() if "/" not in k}
+        log("只取根目录: 丢掉 %d 个位于子目录里的文件, 剩 %d 个" % (_before - len(src), len(src)))
     if SKIP_SUBDIRS:
         _before = len(src)
         src = {k: v for k, v in src.items()
@@ -817,6 +826,7 @@ def main():
                                               ("  例: " + ", ".join("%s(%s)" % (x[0], human(x[1])) for x in oversize[:3])) if oversize else ""),
              "非视频跳过    : %d 个%s" % (len(nonvideo), "  (GY_VIDEO_ONLY=1 时生效)" if nonvideo else ""),
              "目标结构      : %s" % ("压平(不建子目录, 全部平铺在 %s)" % DST if FLAT else "按源端目录镜像"),
+             "源端范围      : %s" % ("只取根目录(子目录一律不备份)" if TOP_ONLY else "递归全部子目录"),
              "重名跳过      : %d 个%s" % (len(dup), ("  例: " + ", ".join(x[0] for x in dup[:3])) if dup else ""),
              "空文件跳过    : %d 个" % len(empty),
              "本轮计划      : %d 个 / %s (上限 %.0f GB)" % (len(plan), human(sum(s for _, s in plan)), cap_gb),
