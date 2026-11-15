@@ -22,6 +22,9 @@
   GY_REPORT    报告落点(rclone 路径)
   GY_STATE     已完成清单(rclone 路径, TSV: 名字<TAB>字节)
 可选(有默认值): GY_MAX_FILE_MB=2048 GY_MAX_FILES=200 GY_MAX_TOTAL_GB=50 GY_BUDGET_MIN=300
+  GY_VIDEO_ONLY=1   只备份视频(按扩展名), 非视频一律跳过
+  GY_FLAT=1         目标端压平: 不建任何子目录, 所有文件直接落在 GY_DST_DIR 下
+  GY_SKIP_SUBDIR=a,b 源端整体跳过的子目录前缀(逗号分隔)
 环境: ALIST_URL / ALIST_TOKEN / RCLONE_CONF_PATH / TG_TOKEN / TG_CHAT_ID
 """
 import argparse
@@ -456,6 +459,16 @@ def save_daily(path, d):
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
+def dst_rel(rel, flat):
+    """目标相对路径。
+
+    flat=True  -> 只取文件名(不建子目录, 全部平铺在目标目录下)
+    flat=False -> 保留源端目录结构
+    两种都过 safe_name 清洗(139 会拒 * ? " < > | 之类)。
+    """
+    return safe_name(rel.rsplit("/", 1)[-1] if flat else rel)
+
+
 def safe_name(rel):
     """目标端路径清洗: 逐段替换非法字符, 保持目录结构。
 
@@ -487,6 +500,9 @@ def main():
     DST = pathcfg.require("GY_DST_DIR").rstrip("/")
     SUBDIR = pathcfg.get("GY_SRC_SUBDIR", "").strip("/")        # 只备份这个子目录; 目标端按同名目录镜像
     VIDEO_ONLY = pathcfg.get("GY_VIDEO_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+    FLAT = pathcfg.get("GY_FLAT", "0").strip().lower() in ("1", "true", "yes", "on")
+    SKIP_SUBDIRS = [s.strip().strip("/") for s in
+                    (pathcfg.get("GY_SKIP_SUBDIR", "") or "").split(",") if s.strip().strip("/")]
     _mount, _, DST_INNER = DST.strip("/").partition("/")      # /ydy2/ycl -> 挂载名 ydy2 + 内路径 ycl
     DST_INNER = DST_INNER.strip("/")
     REPORT = pathcfg.get("GY_REPORT", "")
@@ -542,10 +558,33 @@ def main():
     src = src_list(src_path)
     if SUBDIR:                                                 # 把子目录名拼进相对路径 -> 目标端保持同名目录
         src = {SUBDIR + "/" + k: v for k, v in src.items()}
+    if SKIP_SUBDIRS:
+        _before = len(src)
+        src = {k: v for k, v in src.items()
+               if not any(k == s or k.startswith(s + "/") for s in SKIP_SUBDIRS)}
+        log("跳过子目录 %s: 少 %d 个文件" % (",".join(SKIP_SUBDIRS), _before - len(src)))
     log("源文件 %d 个 / %s" % (len(src), human(sum(src.values()))))
     if not src:
         log("源端是空的, 收工")
         return 0
+
+    # 压平模式: 目标端不建任何子目录, 全部平铺在 DST 下。
+    # 不同子目录里的同名文件会撞到同一个目标名 -> 按源路径排序只留第一个,
+    # 其余记 dup 跳过(绝不覆盖已存在/已上传的那个)。
+    dup, dup_set = [], set()
+    if FLAT:
+        seen = {}
+        for rel in sorted(src):
+            name = dst_rel(rel, True)
+            if name in seen:
+                dup.append((rel, seen[name]))
+                dup_set.add(rel)
+            else:
+                seen[name] = rel
+        log("压平模式: 不建子目录, %d 个文件 -> %d 个目标文件名 (重名跳过 %d)"
+            % (len(src), len(seen), len(dup)))
+        for r, keep in dup[:5]:
+            log("   重名跳过: %s (保留 %s)" % (r.rsplit("/", 1)[-1][:40], keep.rsplit("/", 1)[-1][:40]))
 
     done = load_state(STATE)
     log("已完成清单 %d 条" % len(done))
@@ -593,6 +632,8 @@ def main():
     for rel, size in sorted(src.items()):
         if a.only and a.only not in rel:
             continue
+        if rel in dup_set:
+            continue
         if VIDEO_ONLY and not VIDEO_RE.search(rel):
             nonvideo.append((rel, size))
             continue
@@ -605,7 +646,7 @@ def main():
         if done.get(rel) == size:
             skip_done.append((rel, size))
             continue
-        hit = target_has(safe_name(rel))   # 目标端用清洗后的名字查重
+        hit = target_has(dst_rel(rel, FLAT))   # 目标端用清洗(并可能压平)后的名字查重
         if hit and hit[0] == size and not hit[1]:
             skip_done.append((rel, size))
             done[rel] = size
@@ -645,7 +686,7 @@ def main():
     def do_one(rel, size):
         """一个文件的完整链路: 下载 -> alist PUT -> 回读校验。返回 (状态, 说明, 上传秒数)"""
         lp = os.path.join(WORK, rel.replace("/", "_"))
-        _srel = safe_name(rel)
+        _srel = dst_rel(rel, FLAT)
         remote = DST + "/" + _srel
         if _srel != rel:
             log("   文件名已清洗: %s -> %s" % (rel.split("/")[-1][:40], _srel.split("/")[-1][:40]))
@@ -760,6 +801,8 @@ def main():
              "超单文件上限  : %d 个(> %d MB)%s" % (len(oversize), a.max_file_mb,
                                               ("  例: " + ", ".join("%s(%s)" % (x[0], human(x[1])) for x in oversize[:3])) if oversize else ""),
              "非视频跳过    : %d 个%s" % (len(nonvideo), "  (GY_VIDEO_ONLY=1 时生效)" if nonvideo else ""),
+             "目标结构      : %s" % ("压平(不建子目录, 全部平铺在 %s)" % DST if FLAT else "按源端目录镜像"),
+             "重名跳过      : %d 个%s" % (len(dup), ("  例: " + ", ".join(x[0] for x in dup[:3])) if dup else ""),
              "空文件跳过    : %d 个" % len(empty),
              "本轮计划      : %d 个 / %s (上限 %.0f GB)" % (len(plan), human(sum(s for _, s in plan)), cap_gb),
              "本轮实传      : %d 个 / %s" % (sent, human(sent_bytes)),
