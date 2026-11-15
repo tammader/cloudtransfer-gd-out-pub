@@ -453,6 +453,23 @@ def save_daily(path, d):
 
 
 # ---------------- 主流程 ----------------
+_BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def safe_name(rel):
+    """目标端路径清洗: 逐段替换非法字符, 保持目录结构。
+
+    天翼/139 会拒绝含 : * ? " < > | 等的文件名, 报 "500 文件名称不符合标准";
+    这类文件不改名就永远传不上去。源文件名不动, 只影响目标端。
+    """
+    parts = []
+    for seg in rel.split("/"):
+        s = _BAD_NAME.sub("_", seg).strip()
+        s = s.rstrip(".")                      # 结尾的点在不少网盘/系统上非法
+        parts.append(s or "_")
+    return "/".join(parts)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="真传; 不加=只演练")
@@ -588,7 +605,7 @@ def main():
         if done.get(rel) == size:
             skip_done.append((rel, size))
             continue
-        hit = target_has(rel)
+        hit = target_has(safe_name(rel))   # 目标端用清洗后的名字查重
         if hit and hit[0] == size and not hit[1]:
             skip_done.append((rel, size))
             done[rel] = size
@@ -628,7 +645,10 @@ def main():
     def do_one(rel, size):
         """一个文件的完整链路: 下载 -> alist PUT -> 回读校验。返回 (状态, 说明, 上传秒数)"""
         lp = os.path.join(WORK, rel.replace("/", "_"))
-        remote = DST + "/" + rel
+        _srel = safe_name(rel)
+        remote = DST + "/" + _srel
+        if _srel != rel:
+            log("   文件名已清洗: %s -> %s" % (rel.split("/")[-1][:40], _srel.split("/")[-1][:40]))
         try:
             # 源路径: rel 里已拼了 SUBDIR 前缀, 必须用 src_path(含冒号/子目录) 且剥掉前缀。
             # 旧写法 SRC.rstrip("/") + "/" + rel 在 SUBDIR 非空时会拼成
@@ -646,7 +666,7 @@ def main():
             finally:
                 with SENT_LOCK:
                     INFLIGHT.pop(rel, None)
-            got, vsrc = verify_target(rel)
+            got, vsrc = verify_target(_srel)   # 回读也用清洗名
             if not got or got != size:
                 return ("fail", "上传后校验不符(远端 %s / 本地 %s, 来源 %s)" % (got if got else "?", size, vsrc), els)
             return ("ok", vsrc, els)
@@ -778,7 +798,15 @@ def main():
                 markup=tg_buttons(FLOW[0]))
         for f in failed[:3]:
             tg_send("!! " + f[:200], markup=tg_buttons(FLOW[0]))
-    return 0 if not failed else 1
+    # ③ 个别文件失败不判整轮失败: 超过 max(5, 计划数*5%) 才 exit 1
+    _max_fail = max(5, int(len(plan) * 0.05))
+    if failed and len(failed) > _max_fail:
+        log("!! 失败 %d 个 > 阈值 %d, 本轮判失败" % (len(failed), _max_fail))
+        return 1
+    if failed:
+        log("注: %d 个文件失败, 未达阈值 %d, 本轮仍算成功(下轮会重试)"
+            % (len(failed), _max_fail))
+    return 0
 
 
 if __name__ == "__main__":
