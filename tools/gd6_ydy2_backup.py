@@ -459,6 +459,18 @@ def save_daily(path, d):
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
 
+def cfg_raw(key, default=""):
+    """配置读取: 环境变量**在场**就听它的(空串也算在场), 否则回落到 PATHS_JSON。
+
+    pathcfg.get() 用的是 `if v:`, 空串等于没设 —— 对"显式清空 Secret 里的同名键"不够用。
+    本函数只给需要清空语义的键用(GY_SRC_SUBDIR / GY_SKIP_SUBDIR / GY_FLAT / GY_VIDEO_ONLY)。
+    """
+    v = os.environ.get(key)
+    if v is not None:
+        return v
+    return pathcfg.get(key, default)
+
+
 def dst_rel(rel, flat):
     """目标相对路径。
 
@@ -498,11 +510,12 @@ def main():
 
     SRC = pathcfg.require("GY_SRC")
     DST = pathcfg.require("GY_DST_DIR").rstrip("/")
-    SUBDIR = pathcfg.get("GY_SRC_SUBDIR", "").strip("/")        # 只备份这个子目录; 目标端按同名目录镜像
-    VIDEO_ONLY = pathcfg.get("GY_VIDEO_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
-    FLAT = pathcfg.get("GY_FLAT", "0").strip().lower() in ("1", "true", "yes", "on")
+    # 只备份这个子目录; 目标端按同名目录镜像。用 cfg_raw: 空串 = 显式清空(PATHS_JSON 里可能有值)
+    SUBDIR = cfg_raw("GY_SRC_SUBDIR", "").strip("/")
+    VIDEO_ONLY = cfg_raw("GY_VIDEO_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+    FLAT = cfg_raw("GY_FLAT", "0").strip().lower() in ("1", "true", "yes", "on")
     SKIP_SUBDIRS = [s.strip().strip("/") for s in
-                    (pathcfg.get("GY_SKIP_SUBDIR", "") or "").split(",") if s.strip().strip("/")]
+                    (cfg_raw("GY_SKIP_SUBDIR", "") or "").split(",") if s.strip().strip("/")]
     _mount, _, DST_INNER = DST.strip("/").partition("/")      # /ydy2/ycl -> 挂载名 ydy2 + 内路径 ycl
     DST_INNER = DST_INNER.strip("/")
     REPORT = pathcfg.get("GY_REPORT", "")
@@ -555,6 +568,8 @@ def main():
         src_path = SRC
     if SUBDIR:
         log("范围: 只处理 %s (目标端镜像成 %s/%s/)" % (src_path, DST, SUBDIR))
+    else:
+        log("范围: 整个 %s (不限定子目录)" % src_path)
     src = src_list(src_path)
     if SUBDIR:                                                 # 把子目录名拼进相对路径 -> 目标端保持同名目录
         src = {SUBDIR + "/" + k: v for k, v in src.items()}
