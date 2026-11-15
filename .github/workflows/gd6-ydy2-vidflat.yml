@@ -64,6 +64,9 @@ env:
   # ---- 本条链的源/目标/形态/账本(覆盖 PATHS_JSON 里的同名键) ----
   GY_SRC: "gdrive6:out3"
   GY_DST_DIR: "/ydy2/ycl"
+  # 只扫 out3 根目录: "-" 显式压掉 PATHS_JSON 里给字幕链留的 GY_SRC_SUBDIR
+  GY_SRC_SUBDIR: "-"
+  GY_TOP_ONLY: "1"
   GY_FLAT: "1"
   GY_VIDEO_ONLY: "1"
   GY_SKIP_SUBDIR: ""
