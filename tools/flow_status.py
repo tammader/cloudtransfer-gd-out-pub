@@ -68,6 +68,7 @@ WATCH = [
     # teldrive 冷备两条(2026-10-20 纳入总览): 都跑在公开仓库, 周期 6h
     ("tammader/cloudtransfer-gd-out-pub", "yd2-teldrive.yml", "yd2-teldrive", 6, "A"),
     ("tammader/cloudtransfer-gd-out-pub", "gd2-teldrive.yml", "gd2-teldrive", 6, "A"),
+("tammader/cloudtransfer-gd-out-pub", "gd2-od2-copy.yml", "gd2-od2-copy", 6, "A"),
     # JavDB 抓取 + 离线搬运(2026-11-12 纳入总览): 公开仓库
     ("tammader/javdb-comment-links", "javdb-comment-links.yml", "javdb-crawl", 0, "A"),
     ("tammader/javdb-offline-gd6", "offline-download-gd6.yml", "javdb-offline", 0, "A"),
@@ -112,6 +113,7 @@ DESC_FALLBACK = "（未配置说明）"
 DESC_DEFAULT = {
     "yd2-teldrive": "移动云盘 → teldrive 冷备",
     "gd2-teldrive": "gdrive2 → teldrive 冷备",
+    "gd2-od2-copy": "迁移盘 onedrive 目录 → 目标远端 拷贝(还原)",
     "gd6-ydy2-backup": "gd6 归档区 → 移动个人云 单向备份",
     "gd6-ydy2-tgvideo": "gd6 的 Telegram 视频 → 移动个人云 单向备份",
 }
@@ -127,6 +129,7 @@ ADVICE_FALLBACK = ("该环节停摆，下游会缺料", "点开该 run 看完整
 ADVICE_DEFAULT = {
     "yd2-teldrive": ("移动云盘/家庭云的冷备停了", "看 run 日志里的 401/504；先确认 139 token 是否过期"),
     "gd2-teldrive": ("gdrive2 的冷备停了", "看 run 日志里的 409/504；确认 teldrive 实例是否正常"),
+    "gd2-od2-copy": ("数据没拷回目标盘, 还原进度停住", "看 run 日志里的 rclone 报错；确认 RCLONE_CONF 里两端 token 都能刷新、GO_SRC/GO_DST 指对了"),
     "gd6-ydy2-backup": ("gd6→移动个人云的备份停了", "看日志: alist PUT 401/403 多半是 139 授权过期(约 30 天一轮)"),
     "gd6-ydy2-tgvideo": ("Telegram 视频的冷备停了", "看日志: 139 授权过期 或 上游 telegram-video-uploader 没在投"),
 }
