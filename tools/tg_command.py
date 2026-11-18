@@ -8,6 +8,8 @@
   /run <流程> [k=v ...] 触发某个流程(可带参数), 例: /run gd-out2 only=AGMX-050
   /stop <流程>          取消正在跑的那次
   /disable <流程>       停用   /enable <流程>  启用
+  /sub [N]              触发字幕转写一批(默认 3 组, 真跑)
+  /subd                 立刻跑一次字幕调度器(补满并行)
 
 只响应 TG_CHAT_ID 的消息; 其他人发的一律忽略且不回复。
 用法: python3 tg_command.py --minutes 340     (跑够分钟数就优雅退出, 由下一个 job 接上)
@@ -87,6 +89,8 @@ def cmd_help():
             "    /run gd-out2\n"
             "    /run gd-out2 only=AGMX-050 apply=true\n"
             "    /run ydout-in3 apply=false   (只想演练时用)\n"
+            "/sub [N] —— 触发字幕转写一批（默认 3 组）\n"
+            "/subd —— 立刻补满字幕并行批次\n"
             "/stop <流程> —— 取消正在跑的那次\n"
             "/disable <流程>  /enable <流程> —— 停用 / 启用")
 
@@ -135,6 +139,42 @@ def cmd_run(args):
         return ("✅ 已触发 %s%s\n%s" % (disp, ("  参数 " + json.dumps(inputs, ensure_ascii=False))
                                        if inputs else "", url))
     return "❌ 触发失败 (%s)：%s" % (st, d.get("_err", "")[:220])
+
+
+SUB_REPO = os.environ.get("SUB_REPO", "tamd258/cloudtransfer-subtitle")
+
+
+def _dispatch_sub(wf, inputs, disp):
+    """触发字幕仓库的某个 workflow(token 键 B = tamd258 的 PAT)"""
+    tok = tokens().get("B") or ""
+    if not tok:
+        return "❌ 没配 GH_TOKEN_TAM(tamd258 侧 PAT), 无法操作 %s" % disp
+    st, d = gh_api("POST", "/repos/%s/actions/workflows/%s/dispatches" % (SUB_REPO, wf), tok,
+                   {"ref": "main", "inputs": inputs})
+    if st in (200, 201, 204):
+        time.sleep(6)
+        st2, d2 = gh_api("GET", "/repos/%s/actions/workflows/%s/runs?per_page=1" % (SUB_REPO, wf), tok)
+        url = ""
+        if st2 == 200 and (d2.get("workflow_runs") or []):
+            url = d2["workflow_runs"][0].get("html_url") or ""
+        return "✅ 已触发 %s%s\n%s" % (disp, ("  参数 " + json.dumps(inputs, ensure_ascii=False))
+                                       if inputs else "", url)
+    return "❌ 触发失败 (%s)：%s" % (st, str(d.get("_err", ""))[:220])
+
+
+def cmd_sub(args):
+    """/sub [N] —— 真跑字幕转写 N 组(默认 3)"""
+    n = (args[0] if args else "3").strip() or "3"
+    if not n.isdigit():
+        return "用法: /sub [组数]    例: /sub 3"
+    return _dispatch_sub("subtitle-translate.yml",
+                         {"apply": "true", "limit_groups": n, "budget_min": "300",
+                          "whisper_model": "large-v3"}, "字幕转写 %s 组" % n)
+
+
+def cmd_subd(args):
+    """/subd —— 手动跑一次字幕调度器(补满并行)"""
+    return _dispatch_sub("subtitle-dispatch.yml", {}, "字幕调度器(补满并行)")
 
 
 def cmd_stop(args):
@@ -318,6 +358,11 @@ def handle(text):
         return cmd_offline()
     if c == "/run":
         return cmd_run(a)
+    if c in ("/sub", "/字幕"):
+        tg_send("⏳ 正在触发字幕转写…")
+        return cmd_sub(a)
+    if c in ("/subd", "/字幕补满"):
+        return cmd_subd(a)
     if c == "/stop":
         return cmd_stop(a)
     if c == "/disable":
