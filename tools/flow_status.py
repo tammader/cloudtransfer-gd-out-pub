@@ -126,7 +126,7 @@ DESC_DEFAULT = {
     "gd2-od2-copy": "迁移盘 onedrive 目录 → 目标远端 拷贝(还原)",
     "gd6-ydy2-backup": "gd6 归档区 → 移动个人云 单向备份",
     "gd6-ydy2-tgvideo": "gd6 的 Telegram 视频 → 移动个人云 单向备份",
-    "subtitle-translate": "日文视频 → 日文 SRT 转写(whisper large-v3)",
+    "subtitle-translate": "日文视频 → SRT 转写(large-v3)",
     "subtitle-dispatch": "转写批次补满(每 10 分钟)",
 }
 
