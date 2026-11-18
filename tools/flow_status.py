@@ -72,6 +72,10 @@ WATCH = [
     # JavDB 抓取 + 离线搬运(2026-11-12 纳入总览): 公开仓库
     ("tammader/javdb-comment-links", "javdb-comment-links.yml", "javdb-crawl", 0, "A"),
     ("tammader/javdb-offline-gd6", "offline-download-gd6.yml", "javdb-offline", 0, "A"),
+    # 字幕流水线(2026-11-18 整条从 tammader 账户迁到 tamd258): 转写主线 + 每 10 分钟补发调度器
+    # token 键用 B(= GH_TOKEN_TAM, 也就是 tamd258 那一侧的 PAT) —— 它才能对这个仓库 dispatch
+    ("tamd258/cloudtransfer-subtitle", "subtitle-translate.yml", "subtitle-translate", 2, "B"),
+    ("tamd258/cloudtransfer-subtitle", "subtitle-dispatch.yml", "subtitle-dispatch", 0.34, "B"),
 ]
 
 NAMES = [e[2] for e in WATCH]
@@ -106,6 +110,12 @@ if _extra:
     GROUPS = list(GROUPS)
     GROUPS[-1] = (_t, list(_ns) + _extra)
 
+# 字幕流水线单独一列(它不在配置的 FS_GROUPS 里, 也不该塞进「落地/备份」)
+_SUB = [n for n in NAMES if n.startswith("subtitle-")]
+if _SUB:
+    GROUPS = [(t, [n for n in ns if n not in _SUB]) for t, ns in GROUPS]
+    GROUPS = [g for g in GROUPS if g[1]] + [("⑤ 字幕 / 转写", _SUB)]
+
 # 每个流程的功能说明(卡片里那一行)
 DESC = _meta("DESC", {})
 DESC_FALLBACK = "（未配置说明）"
@@ -116,6 +126,8 @@ DESC_DEFAULT = {
     "gd2-od2-copy": "迁移盘 onedrive 目录 → 目标远端 拷贝(还原)",
     "gd6-ydy2-backup": "gd6 归档区 → 移动个人云 单向备份",
     "gd6-ydy2-tgvideo": "gd6 的 Telegram 视频 → 移动个人云 单向备份",
+    "subtitle-translate": "日文视频 → 日文 SRT 转写(whisper large-v3)",
+    "subtitle-dispatch": "转写批次补满(每 10 分钟)",
 }
 
 
@@ -132,6 +144,8 @@ ADVICE_DEFAULT = {
     "gd2-od2-copy": ("数据没拷回目标盘, 还原进度停住", "看 run 日志里的 rclone 报错；确认 RCLONE_CONF 里两端 token 都能刷新、GO_SRC/GO_DST 指对了"),
     "gd6-ydy2-backup": ("gd6→移动个人云的备份停了", "看日志: alist PUT 401/403 多半是 139 授权过期(约 30 天一轮)"),
     "gd6-ydy2-tgvideo": ("Telegram 视频的冷备停了", "看日志: 139 授权过期 或 上游 telegram-video-uploader 没在投"),
+    "subtitle-translate": ("字幕转写停摆, 待办组会一直攒着", "看 run 日志里的 rclone 401/403(源盘 token)或 whisper 装包失败"),
+    "subtitle-dispatch": ("补发停了, 并行批次会跑空", "看日志里的 422(workflow 被禁用) / 404(仓库或文件名变了)"),
 }
 
 # ---- 网盘容量区 ----
@@ -408,11 +422,11 @@ def collect_quotas():
     return rows
 
 
-COL_X = [16, 186, 356, 526]
+COL_X = [16, 186, 356, 526, 696]
 ROW_STEP = 64
 ROW_Y0 = 108
 # 原来固定 3 行; 现在按最长那一列算行数(流程加进来不会挤掉/越界)
-ROW_Y = [ROW_Y0 + i * ROW_STEP for i in range(10)]
+ROW_Y = [ROW_Y0 + i * ROW_STEP for i in range(20)]
 NODE_W, NODE_H = 150, 56
 STATE_STYLE = {
     "ok":      ("#dcfce7", "#16a34a", "#14532d", "#15803d"),
@@ -606,10 +620,10 @@ def render_svg(items, ts, quotas=None):
     pitch = 28
     H = (y_rows + len(quotas) * pitch + 36) if quotas else (box_y + box_h + 60)
     L = []
-    L.append('<svg viewBox="0 0 680 %d" xmlns="http://www.w3.org/2000/svg" '
+    L.append('<svg viewBox="0 0 850 %d" xmlns="http://www.w3.org/2000/svg" '
              'font-family="Noto Sans CJK SC, Source Han Sans SC, WenQuanYi Zen Hei, sans-serif">'
              % H)
-    L.append('<rect x="0" y="0" width="680" height="%d" fill="#ffffff"/>' % H)
+    L.append('<rect x="0" y="0" width="850" height="%d" fill="#ffffff"/>' % H)
     L.append('<text x="16" y="26" font-size="15" font-weight="700" fill="#1f2937">'
              '云流程状态总览 · 每 6 小时刷新</text>')
     n_fail = sum(1 for i in items if i["state"] == "fail")
@@ -661,13 +675,13 @@ def render_svg(items, ts, quotas=None):
     if fails:
         f = fails[0]
         imp, fix = ADVICE.get(f["name"], ADVICE_FALLBACK)
-        L.append('<rect x="16" y="%d" width="648" height="156" rx="10" fill="#fef2f2" '
+        L.append('<rect x="16" y="%d" width="818" height="156" rx="10" fill="#fef2f2" '
                  'stroke="#fca5a5" stroke-width="1.5"/>' % box_y)
         L.append('<text x="32" y="%d" font-size="12.5" font-weight="700" fill="#991b1b">'
                  '【失败】%s · %s · run %s%s</text>'
                  % (box_y + 26, esc(f["name"]), esc(f["time"]), f["run_id"],
                     "" if len(fails) == 1 else "（另有 %d 个失败）" % (len(fails) - 1)))
-        L.append('<line x1="32" y1="%d" x2="648" y2="%d" stroke="#fecaca"/>'
+        L.append('<line x1="32" y1="%d" x2="800" y2="%d" stroke="#fecaca"/>'
                  % (box_y + 36, box_y + 36))
         y = box_y + 54
         L.append('<text x="32" y="%d" font-size="10.5" fill="#7f1d1d">'
@@ -685,7 +699,7 @@ def render_svg(items, ts, quotas=None):
         L.append('<text x="32" y="%d" font-size="10.5" fill="#7f1d1d">处置：%s</text>'
                  % (y, esc(fix)))
     else:
-        L.append('<rect x="16" y="%d" width="648" height="60" rx="10" fill="#f0fdf4" '
+        L.append('<rect x="16" y="%d" width="818" height="60" rx="10" fill="#f0fdf4" '
                  'stroke="#bbf7d0"/>' % box_y)
         L.append('<text x="32" y="%d" font-size="12.5" font-weight="700" fill="#166534">'
                  '【全部正常】没有失败流程</text>' % (box_y + 28))
@@ -694,11 +708,11 @@ def render_svg(items, ts, quotas=None):
                  % (box_y + 48))
     # ---- 网盘容量 ----
     if quotas:
-        L.append('<line x1="16" y1="%d" x2="664" y2="%d" stroke="#e2e8f0"/>'
+        L.append('<line x1="16" y1="%d" x2="834" y2="%d" stroke="#e2e8f0"/>'
                  % (y_sec - 30, y_sec - 30))
         L.append('<text x="16" y="%d" font-size="12.5" font-weight="700" fill="#1f2937">'
                  '网盘容量</text>' % y_sec)
-        L.append('<text x="664" y="%d" font-size="9.5" fill="#94a3b8" '
+        L.append('<text x="834" y="%d" font-size="9.5" fill="#94a3b8" '
                  'text-anchor="end">已用 / 总量 · 剩余</text>' % y_sec)
         for i, q in enumerate(quotas):
             y = y_rows + i * pitch
@@ -715,10 +729,10 @@ def render_svg(items, ts, quotas=None):
                 col = "#dc2626"
             L.append('<text x="20" y="%d" font-size="10.5" fill="#334155" '
                      'dominant-baseline="middle">%s</text>' % (cy, esc(q["n"])))
-            L.append('<rect x="146" y="%d" width="320" height="14" rx="7" fill="#e2e8f0"/>' % y)
+            L.append('<rect x="146" y="%d" width="470" height="14" rx="7" fill="#e2e8f0"/>' % y)
             if pct is not None:
                 L.append('<rect x="146" y="%d" width="%d" height="14" rx="7" fill="%s"/>'
-                         % (y, max(6, int(320 * min(pct, 1.0))), col))
+                         % (y, max(6, int(470 * min(pct, 1.0))), col))
                 txt = "已用 %s / 总 %s · 剩 %d%%" % (
                     fmt_size(used), fmt_size(total), max(0, int(round((1 - pct) * 100))))
             elif used:
@@ -732,7 +746,7 @@ def render_svg(items, ts, quotas=None):
                 txt = q["note"][:26]          # 卡片位置窄, 原因只留头一段
             else:
                 txt = "未取到"
-            L.append('<text x="478" y="%d" font-size="10" fill="%s" '
+            L.append('<text x="628" y="%d" font-size="10" fill="%s" '
                      'dominant-baseline="middle">%s</text>'
                      % (cy, col if pct is not None else "#94a3b8", esc(txt)))
         if QUOTA_NOTE:
