@@ -50,32 +50,20 @@ GH_OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # GitHub 
 # 一律不进源码 —— 它们放在 PATHS_JSON(CI) / paths.local.json(本机) 的
 # FS_DESC / FS_GROUPS / FS_ADVICE 三个键里(JSON 字符串), 见 _meta()。
 WATCH = [
-    ("tammader/cloudtransfer-gd-out-pub", "in-pipeline.yml", "in-pipeline", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "gen-manifest.yml", "gen-manifest", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "in2-ydout.yml", "in2-ydout", 6, "A"),
-    ("tammader/ty-transfer-pub", "ty-transfer.yml", "ty-transfer", 12, "A"),
-    ("tammader/ty-transfer-pub", "ydy2-transfer.yml", "ydy2-transfer", 12, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "ydout-in3.yml", "ydout-in3", 0, "A"),
-    ("tamd258/cloudtransfer-speedtest", "out-sync.yml", "out-sync", 12, "B"),
-    ("tammader/cloudtransfer-gd-out-pub", "gd-out2.yml", "gd-out2", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "od2-dbjm.yml", "od2-dbjm", 6, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "out2-ty-sync.yml", "out2-ty-sync", 3, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "od2-tg-gd2.yml", "od2-tg-gd2", 6, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "gd-backup.yml", "gd-backup", 12, "A"),
-    # gd6 -> ydy2 单向备份(2026-11-13/14 新增): 公开仓库, 每 4h
-    ("tammader/cloudtransfer-gd-out-pub", "gd6-ydy2-backup.yml", "gd6-ydy2-backup", 4, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "gd6-ydy2-tgvideo.yml", "gd6-ydy2-tgvideo", 4, "A"),
-    # teldrive 冷备两条(2026-10-20 纳入总览): 都跑在公开仓库, 周期 6h
-    ("tammader/cloudtransfer-gd-out-pub", "yd2-teldrive.yml", "yd2-teldrive", 6, "A"),
-    ("tammader/cloudtransfer-gd-out-pub", "gd2-teldrive.yml", "gd2-teldrive", 6, "A"),
-("tammader/cloudtransfer-gd-out-pub", "gd2-od2-copy.yml", "gd2-od2-copy", 6, "A"),
-    # JavDB 抓取 + 离线搬运(2026-11-12 纳入总览): 公开仓库
-    ("tammader/javdb-comment-links", "javdb-comment-links.yml", "javdb-crawl", 0, "A"),
-    ("tammader/javdb-offline-gd6", "offline-download-gd6.yml", "javdb-offline", 0, "A"),
-    # 字幕流水线(2026-11-18 整条从 tammader 账户迁到 tamd258): 转写主线 + 每 10 分钟补发调度器
-    # token 键用 B(= GH_TOKEN_TAM, 也就是 tamd258 那一侧的 PAT) —— 它才能对这个仓库 dispatch
+    # 2026-11-18 清理: 只留"workflow=active + 最近真有跑"的流程。
+    # 被摘掉的那批(in-pipeline/gen-manifest/in2-ydout/ydout-in3/gd-out2/od2-dbjm/
+    # out2-ty-sync/od2-tg-gd2/gd-backup/gd6-ydy2-*/yd2-teldrive/ty-transfer/ydy2-transfer)
+    # 在 GitHub 上都是 disabled_manually(已迁到别的账户或已停); gd2-teldrive 虽 active
+    # 但最后一轮是 11-09 cancelled, 9 天没动 —— 留着只会天天报"超期"。
+    # 要恢复某条: 把对应行按格式加回来即可(仓库, workflow 文件, 显示名, 周期小时(0=手动), token 键)
+    # ---- 字幕流水线(tamd258 账户): 转写主线 + 每 10 分钟补发调度器 ----
     ("tamd258/cloudtransfer-subtitle", "subtitle-translate.yml", "subtitle-translate", 2, "B"),
     ("tamd258/cloudtransfer-subtitle", "subtitle-dispatch.yml", "subtitle-dispatch", 0.34, "B"),
+    # ---- 其余还在跑的 ----
+    ("tamd258/cloudtransfer-speedtest", "out-sync.yml", "out-sync", 12, "B"),
+    ("tammader/cloudtransfer-gd-out-pub", "gd2-od2-copy.yml", "gd2-od2-copy", 6, "A"),
+    ("tammader/javdb-comment-links", "javdb-comment-links.yml", "javdb-crawl", 0, "A"),
+    ("tammader/javdb-offline-gd6", "offline-download-gd6.yml", "javdb-offline", 0, "A"),
 ]
 
 NAMES = [e[2] for e in WATCH]
@@ -116,6 +104,15 @@ if _SUB:
     GROUPS = [(t, [n for n in ns if n not in _SUB]) for t, ns in GROUPS]
     GROUPS = [g for g in GROUPS if g[1]] + [("⑤ 字幕 / 转写", _SUB)]
 
+# WATCH 精简后, 配置里的旧分类列会整列空掉(标题还在、格子全没) —— 剔掉;
+# 剩下的普通流程只剩一列时换个中性标题, 免得顶着「④ 落地 / 备份」装一堆不相干的东西
+GROUPS = [(t, [n for n in ns if n in NAMES]) for t, ns in GROUPS]   # 列里没有在跑的流程就整列去掉
+GROUPS = [(t, ns) for t, ns in GROUPS if ns]
+_plain = [g for g in GROUPS if not g[0].startswith("⑤")]
+if len(_plain) == 1:
+    _sub_g = [g for g in GROUPS if g[0].startswith("⑤")]
+    GROUPS = [("① 还在跑的流程", _plain[0][1])] + _sub_g
+
 # 每个流程的功能说明(卡片里那一行)
 DESC = _meta("DESC", {})
 DESC_FALLBACK = "（未配置说明）"
@@ -128,6 +125,8 @@ DESC_DEFAULT = {
     "gd6-ydy2-tgvideo": "gd6 的 Telegram 视频 → 移动个人云 单向备份",
     "subtitle-translate": "日文视频 → SRT 转写(large-v3)",
     "subtitle-dispatch": "转写批次补满(每 10 分钟)",
+    "javdb-crawl": "评论区 magnet/ed2k 抓取",
+    "javdb-offline": "离线 → 下载 → gd6 搬运",
 }
 
 
@@ -146,6 +145,8 @@ ADVICE_DEFAULT = {
     "gd6-ydy2-tgvideo": ("Telegram 视频的冷备停了", "看日志: 139 授权过期 或 上游 telegram-video-uploader 没在投"),
     "subtitle-translate": ("字幕转写停摆, 待办组会一直攒着", "看 run 日志里的 rclone 401/403(源盘 token)或 whisper 装包失败"),
     "subtitle-dispatch": ("补发停了, 并行批次会跑空", "看日志里的 422(workflow 被禁用) / 404(仓库或文件名变了)"),
+    "javdb-crawl": ("新片源清单不再更新", "看日志: 站点改版/风控(403 5xx)、cookie 失效"),
+    "javdb-offline": ("离线任务不再提交, 下载队列断供", "看日志: 每日额度用尽 或 网盘离线接口报错"),
 }
 
 # ---- 网盘容量区 ----
